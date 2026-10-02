@@ -39,6 +39,10 @@ jobs:
         with:
           name: programs
           path: target/deploy
+      - uses: actions/download-artifact@v7
+        with:
+          name: test-programs
+          path: target/deploy
       - run: cargo test --workspace
       - run: cd crates/rome-zk-prover-input && cargo test --locked
       - run: cd crates/rome-zk-prover && cargo test --locked
@@ -60,11 +64,41 @@ jobs:
         run: |
           set -e
           for p in programs/*/; do cargo build-sbf --manifest-path "$p/Cargo.toml" --sbf-out-dir target/deploy --arch v3; done
-          ./scripts/check-sbpf-v3.sh target/deploy/*.so
+          ./scripts/check-sbpf-v3.sh target/deploy/zk_inbox.so target/deploy/zk_settlement.so target/deploy/veritas.so target/deploy/zk_bridge.so
       - uses: actions/upload-artifact@v7
         with:
           name: programs
           path: target/deploy/*.so
+          if-no-files-found: error
+      # The programs the tests load besides Rome's own. They go in a separate artifact, so the programs artifact above
+      # holds only what is deployed.
+      - name: Test-only and third-party programs
+        run: |
+          set -e
+          out=target/test-deploy
+          # A test-only stub bridge that the zk-settlement exit tests load as a second program. It is never deployed.
+          cargo build-sbf --manifest-path programs/zk-settlement/tests/fixtures/stub-bridge/Cargo.toml --sbf-out-dir "$out" --arch v3
+          ./scripts/check-sbpf-v3.sh "$out/zk_exit_stub_bridge.so"
+          # SPL Token, built from the pinned spl-token 9.0.0 crate's own source. spl-token is not a dependency of this
+          # workspace, so a throwaway manifest in a temp dir fetches it.
+          tmp=$(mktemp -d)
+          mkdir -p "$tmp/src" && echo '' > "$tmp/src/lib.rs"
+          printf '[package]\nname = "spl-token-fetch"\nversion = "0.0.0"\nedition = "2021"\npublish = false\n[dependencies]\nspl-token = "=9.0.0"\n' > "$tmp/Cargo.toml"
+          manifest=$(cd "$tmp" && cargo metadata --format-version=1 | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(p["manifest_path"] for p in d["packages"] if p["name"]=="spl-token" and p["version"]=="9.0.0"))')
+          cargo build-sbf --manifest-path "$manifest" --sbf-out-dir "$out"
+          rm -rf "$tmp"
+          # The Associated Token Account program does not build from a fresh source resolve, so it is copied from
+          # devnet and checked against a pinned hash: a silent redeploy fails here instead of changing the tests.
+          for try in 1 2 3; do
+            solana program dump ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL "$out/spl_associated_token_account.so" --url https://api.devnet.solana.com && break
+            [ "$try" = 3 ] && exit 1
+            sleep 10
+          done
+          echo "6804554e69fd3a58caa191dc4a58f4c67223d30ca28ab8987f39fc18d2f7374d  $out/spl_associated_token_account.so" | sha256sum --check
+      - uses: actions/upload-artifact@v7
+        with:
+          name: test-programs
+          path: target/test-deploy/*.so
           if-no-files-found: error
   rollup-tests:
     runs-on: ubuntu-latest
