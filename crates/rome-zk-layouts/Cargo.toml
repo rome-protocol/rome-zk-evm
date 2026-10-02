@@ -1,0 +1,50 @@
+[package]
+name = "rome-zk-layouts"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+# Shared byte layouts (the batch account "ZKBT" and the root account "ZKRT"), the accumulator's
+# `acc` commitment formula, the forced-lane empty-root domain constant, and — one owner
+# per primitive — every account's PDA seeds and derivation. Pubkeys are raw
+# `[u8; 32]` in every layout struct (a caller that wants a typed `Pubkey` wraps the bytes itself), but
+# PDA derivation needs the real type, so this crate depends on `solana-program` (pinned, SBF-compatible)
+# for that alone — gated behind the default-on `solana` feature so every
+# `pda()`/`seeds()` helper that needs `Pubkey` (11 modules, 31 sites) compiles out on `--no-default-features`,
+# leaving every byte-level constant/`read`/`write`/`acc`/`forced_empty_root`/`frame`/`chunk` header/
+# `public_values`/`chainid` unconditional and pure — that is what lets a ZisK guest depend on this crate
+# (`rome-zk-bench-decode`, `guest/README.md`) without `solana-program`'s `getrandom 0.1.16` blocking the
+# `riscv64ima-zisk-zkvm-elf` target. `programs/zk-inbox` (on-chain, syscall keccak) and
+# `crates/zk-inbox-client` (off-chain, software keccak) both consume this so the byte offsets and the
+# commitment formula are defined exactly once; zk-settlement consumes the
+# root/registry/pending/chain_config/global_config/perm_nonce/reserved_allow layouts and PDAs — both keep
+# the default `solana` feature on (Cargo default features are on unless a consumer opts out).
+
+# The PDA example and the PDA pin test need `Pubkey`; without `solana` they are not built, so
+# `cargo check --all-targets --no-default-features` proves the whole crate is zkVM-clean.
+[[example]]
+name = "print_pdas"
+required-features = ["solana"]
+
+[[test]]
+name = "pda_pins"
+required-features = ["solana"]
+
+[dependencies]
+rome-zk-merkle = { path = "../rome-zk-merkle" }
+solana-program = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Exit tests only: pinning `ExitMessage`'s ABI preimage/hash/storage-slot against
+# `fixtures/exit/message_hash.json`'s hex fields.
+hex = "0.4"
+
+[features]
+default = ["solana"]
+# PDA derivation (`pda()`/`seeds()` where seeds need a `Pubkey`, i.e. `perm_nonce::seeds`) — every other
+# item in this crate is unconditional. Off for the ZisK guest target (`--no-default-features`).
+solana = ["dep:solana-program"]
+
+[lints]
+workspace = true

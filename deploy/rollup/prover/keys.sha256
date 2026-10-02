@@ -1,0 +1,7 @@
+# Pinned aggregate sha256 of the ZisK proving keys (see check-keys.sh for the format and the hash recipe;
+# the file names are sorted bytewise, LC_ALL=C, so a pin does not depend on the locale of the host that made it).
+# This file ships unpinned: the public release replaces the placeholders with the hashes of the key set it was tested
+# with. Until then, pin the keys you downloaded yourself:
+#   ZISK_HOME=/opt/zisk MANIFEST=./prover/keys.sha256 bash ./prover/check-keys.sh --write
+UNPINNED_PENDING_FIRST_BOOTSTRAP  provingKey
+UNPINNED_PENDING_FIRST_BOOTSTRAP  provingKeySnark

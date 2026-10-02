@@ -1,0 +1,9 @@
+{
+  "programVK": "0xe5ea5c144f19aba3e8a72f897dcb565c1b18bc335b54fd93e06b06689c53cb03",
+  "rootCVadcopFinal": "0x564c2b1bcbd5932c81cfad1fa786a98372eb3d6495257c2d944544334f84382f",
+  "elf_sha256": "ac5bf47fe0703059401651acdb73b53f6d6cc9bff1cd252ede08f8ea5200c021",
+  "chain_id": 200101,
+  "layout_id": 1,
+  "zisk": "1.2.0-alpha",
+  "source": "the stateless-validator-rome guest of the ZisK Ethereum client fork, built reproducibly with its build-elf.sh, then cargo-zisk prove --plonk -y -i fixtures/prover-input/txv1-dev-batch-3930.bin (596486 steps, SNARK proof verified)"
+}

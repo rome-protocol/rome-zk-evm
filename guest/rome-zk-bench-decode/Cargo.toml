@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["lib", "bin"]
+
+# Standalone workspace (a measurement lane — not the production guest). Lives under `guest/`, a directory the root
+# rome-zk workspace's `members = ["programs/*", "crates/*"]` glob never matches; declaring `[workspace]` here also
+# stops cargo's own upward-directory walk from reattaching this tree to the root workspace, so the root's `cargo
+# metadata --locked` is unaffected. Two crates: `lib` (host-testable — the real accumulator/reassemble/decode logic,
+# no ziskos dependency) and `bin` (the ZisK guest entrypoint, `ziskos`-only, built exclusively via `cargo-zisk build
+# --release` on a build machine, never natively).
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

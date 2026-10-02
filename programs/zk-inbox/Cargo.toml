@@ -1,0 +1,32 @@
+[package]
+name = "zk-inbox"
+version = "0.1.0"
+edition = "2021"
+publish = false
+# The data-availability program: rollup transaction data published to Solana, one PDA per (chain, batch, idx)
+# chunk, reduced to one Merkle commitment per batch. See README.md.
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+no-entrypoint = []
+default = []
+
+[dependencies]
+borsh = { version = "1.5.1", features = ["derive"] }
+solana-program.workspace = true
+solana-system-interface = { workspace = true, features = ["bincode"] }
+rome-zk-merkle = { path = "../../crates/rome-zk-merkle" }
+rome-zk-layouts = { path = "../../crates/rome-zk-layouts" }
+rome-zk-pda = { path = "../../crates/rome-zk-pda" }
+
+[dev-dependencies]
+solana-program-test.workspace = true
+solana-sdk.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+zk-inbox-client = { path = "../../crates/zk-inbox-client" }
+rome-zk-testkit = { path = "../../crates/rome-zk-testkit" }
+
+[lints]
+workspace = true

@@ -1,0 +1,32 @@
+[package]
+name = "rome-zk-merkle"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+# Shared, hash-agnostic binary Merkle reduction, plus this workspace's one keccak256 (dispatches to the syscall
+# on-chain, `sha3` off-chain). No heap allocation beyond what the caller already holds, so the reduction itself
+# drops into the zk-inbox on-chain program and into off-chain clients/tests alike. Mirrors the construction in
+# crates/rome-zk-sequencer/src/merkle.rs; a golden test pins that both agree (the sequencer still keeps its own copy in
+# crates/rome-zk-sequencer/src/merkle.rs).
+
+[dependencies]
+
+# `solana-program` backs keccak256's ON-CHAIN (syscall) path only — the only place this crate's code ever references
+# it (`#[cfg(target_os = "solana")]` in src/lib.rs). Target-gated: before this it was an unconditional dependency,
+# so every non-solana target — including the ZisK guest (`riscv64ima-zisk-zkvm-elf`) — had to compile it anyway, and
+# it does not: `solana-program` pulls `solana-secp256k1-recover` -> `libsecp256k1` -> `rand 0.7`/`rand_core 0.5` ->
+# `getrandom 0.1.16`, which has no backend for that target (`error: target is not supported`, getrandom's own
+# message). Gating this to exactly the cfg its own code needs removes a real, previously-unnecessary build cost from
+# every other target too, with no behavior change on-chain.
+[target.'cfg(target_os = "solana")'.dependencies]
+solana-program.workspace = true
+
+# `sha3` backs keccak256's off-chain (non-SBF) path only — target-gated so `cargo build-sbf` never even
+# resolves it for the BPF target; the on-chain path is the syscall via `solana-program` above.
+[target.'cfg(not(target_os = "solana"))'.dependencies]
+sha3 = { version = "0.10", default-features = false }
+
+[lints]
+workspace = true

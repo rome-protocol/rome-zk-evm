@@ -1,0 +1,24 @@
+# Keep the Docker build context small. Without this file the Dockerfile's `COPY . .` sends the ENTIRE
+# `target/` directory on any host with a built workspace (every dev machine, and any CI runner that caches
+# target/ between runs): tens of GB, all of it irrelevant, since the builder stage runs its own
+# `cargo build --release` from scratch.
+target/
+.git/
+
+# Solana program build artifacts (irrelevant to this image — see the Dockerfile's own header
+# comment: scoped to `-p rome-zk-sequencer`, not `programs/*`, which need `cargo build-sbf`'s own
+# toolchain).
+programs/*/target/
+
+# Local-only, never meant to reach an image.
+*.log
+.DS_Store
+
+# The operator's own state under deploy/rollup: payer and sequencer keys, rendered configs (database password, jwt
+# secret), .env, chain.toml, the verification key and the guest ELF. The image copies none of it.
+deploy/rollup/keys/
+deploy/rollup/rendered/
+deploy/rollup/.env
+deploy/rollup/chain.toml
+deploy/rollup/vkey.json
+deploy/rollup/elf/

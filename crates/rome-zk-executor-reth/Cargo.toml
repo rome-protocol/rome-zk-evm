@@ -1,0 +1,85 @@
+[package]
+name = "rome-zk-executor-reth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "in-process reth 2.5.2 Executor — sub-block execution over a persisted revm State, real block sealing via reth's BlockBuilder/trie"
+
+[dependencies]
+# `reth` publishes no crates to crates.io (every reth-* name on crates.io is a reserved 0.0.0
+# placeholder: `curl https://crates.io/api/v1/crates/reth-evm` answers "crate
+# `reth-evm` does not exist"). A git dependency pinned to the exact release tag is reth's own
+# documented consumption model; every reth-* dep below pins `tag = "v2.5.2"` to match this
+# workspace's stock-reth interop target.
+reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-chain-state = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-db = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-db-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-db-common = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-nippy-jar = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-static-file-types = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-provider = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-storage-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-evm = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-evm-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-execution-types = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-execution-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-node-types = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-revm = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-trie = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-trie-common = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-trie-db = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-tasks = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+
+# Real crates.io releases at the exact versions reth v2.5.2's own Cargo.lock pins (verified against
+# the tag's lockfile) — these ARE published, unlike the reth-* internal crates above.
+# reth-primitives-traits is the one reth-* name that IS a real, independently-versioned crates.io
+# library (reth's own Cargo.toml depends on it the same way, at "0.6.0" — not a workspace member of
+# the git repo at all, which is why a git+tag dependency on it 404s).
+reth-primitives-traits = { version = "0.6.0", default-features = false }
+# Same pattern as reth-primitives-traits above: reth-codecs is the one reth-* crate published
+# independently to crates.io at the version reth v2.5.2's own Cargo.lock pins (verified against the
+# tag's lockfile) — it is where `Compact for alloy_consensus::Header`/`B256` live.
+reth-codecs = { version = "0.6.0", default-features = false }
+alloy-evm = { version = "0.38.0", default-features = false }
+alloy-consensus = { version = "2.3", default-features = false }
+alloy-eips = { version = "2.3", default-features = false }
+alloy-primitives = { version = "1.6", default-features = false }
+alloy-genesis = { version = "2.3", default-features = false }
+alloy-trie = { version = "0.9", default-features = false }
+alloy-rpc-types-engine = { version = "2.3", default-features = false }
+revm = { version = "42.0", default-features = false, features = ["std"] }
+
+rome-zk-executor-api = { path = "../rome-zk-executor-api" }
+
+eyre = "0.6"
+hex = "0.4"
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "sync"] }
+tracing = "0.1"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+reth-e2e-test-utils = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-node-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-node-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-node-core = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-rpc-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-rpc-server-types = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+alloy-rpc-types-eth = { version = "2.3", default-features = false }
+alloy-signer = { version = "2.3", default-features = false }
+alloy-signer-local = { version = "2.3", default-features = false }
+jsonrpsee = { version = "0.26", features = ["client", "http-client"] }
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Ties the genesis-gas-limit fixture to a real `Profile::effective_block_gas_limit()`
+# product instead of a hand-picked literal pair — see `executor.rs`'s own test module.
+rome-zk-profile = { path = "../rome-zk-profile" }

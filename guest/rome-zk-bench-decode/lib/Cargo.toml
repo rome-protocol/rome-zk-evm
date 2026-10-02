@@ -1,0 +1,93 @@
+[package]
+name = "rome-zk-bench-decode-lib"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "The measured guest logic — keccak+merkle+acc, reassemble, ruzstd decode, RLP decode — host-testable, no ziskos dependency. The bin/ crate is the thin ZisK entrypoint over this."
+
+[[bin]]
+name = "gen_input"
+required-features = ["host-tools"]
+
+[[bin]]
+name = "fetch_real_batch"
+required-features = ["host-tools"]
+
+[dependencies]
+# Always needed, and zisk-target-safe after a fix in rome-zk-merkle/Cargo.toml (solana-program is
+# target-gated to cfg(target_os = "solana"), the only place its own code references it).
+rome-zk-merkle = { path = "../../../crates/rome-zk-merkle" }
+
+# Also zisk-target-safe now that rome-zk-layouts gates solana-program behind a default-on `solana` feature (11
+# modules' `pda()` needed `Pubkey` unconditionally before this) and rome-zk-channel follows (it only ever touched
+# `frame::*`, never a `Pubkey`). Both are now plain, non-optional dependencies with default features off — the ZisK
+# guest build (`bin/Cargo.toml`, `default-features = false` on its dependency on this lib) gets them
+# unconditionally, with no `getrandom 0.1.16` in the graph. `stage_hash`/`stage_reassemble_and_decompress`/`run`
+# call them directly — no shim, one definition per fact.
+rome-zk-layouts = { path = "../../../crates/rome-zk-layouts", default-features = false }
+# `decode-pure` (ruzstd, always on) is what the guest itself decodes with; `zstd-c` (the C encoder) is
+# additive, needed only by `gen_input`'s synthetic-fixture generator and by this crate's own tests
+# (`chunk_bodies_for`, `encode_stream`/`decode_stream`) — turned on via the `host-tools` feature below
+# rather than unconditionally, so the ZisK guest build never sees the C dependency.
+rome-zk-channel = { path = "../../../crates/rome-zk-channel", default-features = false, features = [
+  "decode-pure",
+] }
+
+# Used directly by the zisk-safe path (never through rome-zk-channel, which is blocked) — same crate,
+# same version as rome-zk-channel's own `decode-pure` feature. Always needed (both the guest and the host
+# reference/tools use these).
+ruzstd = "0.9"
+alloy-rlp = { version = "0.3", features = ["derive"] }
+alloy-primitives = { version = "1", default-features = false, features = ["rlp"] }
+serde = { version = "1", features = ["derive"] }
+
+# ---- host-only tooling (src/bin/gen_input.rs, src/bin/fetch_real_batch.rs) ----------------------------
+# ALL optional, gated behind "host-tools" (see [features] below) — the ZisK guest build
+# (`default-features = false` on this lib dependency, `bin/Cargo.toml`) must never need any of these; the
+# one that would actually break that build is `ureq` (pulls `ring`, which tries to compile C via `cc-rs`
+# for the zisk target and fails — confirmed while building this crate).
+bincode = { version = "2.0", default-features = false, features = [
+  "serde",
+  "std",
+], optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+hex = { version = "0.4", optional = true }
+serde_json = { version = "1", optional = true }
+ureq = { version = "2", default-features = false, features = [
+  "tls",
+  "json",
+], optional = true }
+base64 = { version = "0.22", optional = true }
+# For Pubkey (PDA derivation) in fetch_real_batch.rs — same version rome-zk-layouts itself uses. This is its own
+# standalone `[workspace]` (this directory's own Cargo.toml doc comment), so it cannot inherit the root rome-zk
+# workspace's `[workspace.dependencies]` via `workspace = true` — the version is repeated here literally and MUST be
+# kept numerically identical to the root's `solana-program` pin by hand (checked by neither workspace's own
+# Cargo.lock: a drift here would give `host-tools`'s own `rome-zk-layouts/solana` path dependency and this crate's
+# direct `solana-program` two semver-incompatible Pubkey types in the same build graph, a bug class already removed
+# from the main workspace).
+solana-program = { version = "=4.1.0", optional = true }
+
+[features]
+# `host-tools`: everything `gen_input`/`fetch_real_batch` need and nothing else does — including turning
+# on `rome-zk-layouts`'s `solana` feature (both binaries derive PDAs: `cursor::pda`/`batch::pda`/
+# `chunk::pda`) and `rome-zk-channel`'s `zstd-c` (the real C encoder `gen_input` needs, and this crate's
+# own tests use to build fixtures). The ZisK guest build (`bin/Cargo.toml`, `default-features = false`)
+# never enables this feature, so it never sees `solana-program` or the C zstd dependency.
+#
+# Cumulative stage flags: none set = keccak+merkle+acc only; +stage_ruzstd = + reassemble/ ruzstd decompress;
+# +stage_rlp (implies stage_ruzstd) = + RLP decode = the full pipeline. Default = everything (a real, meaningful
+# commit); the narrower builds exist only so ziskemu step counts can be subtracted stage by stage.
+default = ["host-tools", "stage_ruzstd", "stage_rlp"]
+host-tools = [
+  "dep:bincode",
+  "dep:clap",
+  "dep:hex",
+  "dep:serde_json",
+  "dep:ureq",
+  "dep:base64",
+  "dep:solana-program",
+  "rome-zk-layouts/solana",
+  "rome-zk-channel/zstd-c",
+]
+stage_ruzstd = []
+stage_rlp = ["stage_ruzstd"]

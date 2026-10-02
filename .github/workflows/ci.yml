@@ -1,0 +1,93 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: cargo fmt --all --check
+      - run: cd crates/rome-zk-prover-input && cargo fmt --all --check
+      - run: cd crates/rome-zk-prover && cargo fmt --all --check
+      - name: Cargo.lock is current
+        run: cargo metadata --locked --format-version 1 > /dev/null
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cd crates/rome-zk-prover-input && cargo clippy --locked --all-targets -- -D warnings
+      - run: cd crates/rome-zk-prover && cargo clippy --locked --all-targets -- -D warnings
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: cargo test --workspace
+      - run: cd crates/rome-zk-prover-input && cargo test --locked
+      - run: cd crates/rome-zk-prover && cargo test --locked
+  build-sbf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup show active-toolchain || rustup toolchain install
+      - name: Install the Solana tools
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+      - run: cargo build-sbf --version
+      - name: Platform-tools supports --arch v3
+        run: ./scripts/check-platform-tools.sh
+      - name: Build every program as SBPF v3
+        run: |
+          set -e
+          for p in programs/*/; do cargo build-sbf --manifest-path "$p/Cargo.toml" --sbf-out-dir target/deploy --arch v3; done
+          ./scripts/check-sbpf-v3.sh target/deploy/*.so
+  rollup-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run every shell test under deploy/rollup/tests
+        run: |
+          set -euo pipefail
+          if [ ! -d deploy/rollup/tests ]; then
+            echo "deploy/rollup/tests does not exist yet; nothing to run"
+            exit 0
+          fi
+          ls deploy/rollup/tests/*.sh >/dev/null
+          status=0
+          for t in deploy/rollup/tests/*.sh; do
+            echo "::group::$t"
+            if bash "$t"; then echo "PASS $t"; else echo "FAIL $t"; status=1; fi
+            echo "::endgroup::"
+          done
+          exit "$status"
+  codeql:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: rust
+          build-mode: none
+      - uses: github/codeql-action/analyze@v4
+  semgrep:
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@v7
+      - run: semgrep scan --config p/rust --config p/trailofbits --error

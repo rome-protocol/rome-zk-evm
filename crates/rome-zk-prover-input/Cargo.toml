@@ -1,0 +1,91 @@
+[package]
+name = "rome-zk-prover-input"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/rome-protocol/rome-zk-evm"
+publish = false
+description = "Host-only input generator for the batch guest: reads a finalized batch's inbox chunk bodies + batch account (zk-inbox-client, FINALIZED), fetches each block + its execution witness from a reth verifier, and writes the guest's two bincode inputs."
+
+# Standalone workspace (this crate's own README: "its own Cargo.lock", excluded from the root's
+# `members` glob) — an empty `[workspace]` table here stops cargo's upward directory walk from ever
+# reattaching this crate to a workspace root above rome-zk's own checkout (the same reason
+# `guest/rome-zk-bench-decode/Cargo.toml` declares one): without it, a package excluded from a parent
+# workspace makes cargo keep walking up past that parent looking for a different one, which can find and
+# attach to an unrelated Cargo.toml several directories further up.
+[workspace]
+
+[[bin]]
+name = "rome-zk-prover-input"
+path = "src/bin/rome_zk_prover_input.rs"
+
+[dependencies]
+# --- Solana side: the batch account + chunk bodies, exactly rome-zk-derive::inbox's own read path
+# (never a field-by-field re-decode). "devnet-driver" for the RPC client.
+zk-inbox-client = { path = "../zk-inbox-client", features = ["devnet-driver"] }
+# `chain_config_pda`/`decode_chain_config_account` — the SAME max_drift_secs source rome-zk-derive reads
+# at startup (derive, the guest and the program enforce one number).
+zk-settlement-client = { path = "../zk-settlement-client" }
+# Bumped in lockstep with `zk-inbox-client`/`zk-settlement-client` (path
+# dependencies above, both in the main workspace) — those now build against the Agave 4.3.0-line
+# `solana-pubkey`, so staying on 2.1.6 here would give this crate's own `Pubkey` and theirs' two
+# genuinely different Rust types (the `Pubkey` their `chunk_pda`/`batch_pda`/etc. return would no
+# longer satisfy this crate's own `FetchError`/`get_account` trait, which is exactly what broke first).
+solana-program = "=4.1.0"
+solana-client = "=4.3.0"
+solana-sdk = "=4.1.0"
+solana-commitment-config = "=3.1.1"
+rome-zk-layouts = { path = "../rome-zk-layouts" }
+rome-zk-merkle = { path = "../rome-zk-merkle" }
+# The channel decoder, to learn the batch's own first..=last block range from the DA bytes before any
+# verifier RPC is made — "zstd-c" (the real C codec) is fine here: this is a host tool, not the
+# ZisK guest target.
+rome-zk-channel = { path = "../rome-zk-channel", default-features = false, features = ["zstd-c"] }
+
+# --- reth-verifier side: pinned to EXACTLY the fork's own versions (crates/clients/rome/{guest,input} in
+# rome-protocol/zisk-eth-client, branch rome-guest) — not rome-zk-derive's newer alloy-consensus 2.3 pin.
+# `RomePublicInput`/`RomeWitnessInput` here are field-for-field copies of the guest's own wire types (a
+# cross-repo dependency on the fork was not used — see this crate's README), so bincode compatibility
+# depends on identical crate versions producing identical Rust types, not merely "the same shape".
+# Exact-pinned to what the fork's zec-rome ELF resolves to (its own standalone Cargo.lock,
+# rome-protocol/zisk-eth-client branch rome-guest, bin/guests/stateless-validator-rome) — a "2.0.0" range
+# resolves to 2.4.2 in THIS workspace's own (much larger) dependency graph, and RomePublicInput's bincode
+# wire format is only guaranteed byte-compatible with the guest's own `alloy_consensus::Header`/
+# `reth_ethereum_primitives::Block` when both sides compile the identical crate version — see
+# src/wire.rs's module doc.
+alloy-primitives = { version = "=1.6.0", default-features = false, features = ["rlp"] }
+alloy-rlp = { version = "0.3", features = ["derive"] }
+alloy-genesis = { version = "=2.0.5", features = ["serde-bincode-compat"] }
+alloy-consensus = { version = "=2.0.5", default-features = false }
+alloy-rpc-types-debug = "=2.0.5"
+alloy-eips = { version = "=2.0.5", default-features = false }
+reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v2.1.0", default-features = false }
+
+# `eth_getBlockByNumber`'s pinned response type (`Block`/`Header`, plain serde structs — no dependency on
+# `alloy-provider`) — a plain JSON-RPC POST decodes straight into this and
+# `.into()`/`.into_consensus()` produces the same `reth_ethereum_primitives::Block`/`alloy_consensus::
+# Header` upstream's provider-based `fetch_block` does; see src/verifier.rs's module doc for why
+# `alloy-provider` itself is gone from this crate rather than merely feature-gated.
+alloy-rpc-types-eth = "=2.0.5"
+
+serde = { version = "1", features = ["derive"] }
+serde_with = "3"
+serde_json = "1"
+bincode = { version = "2.0", default-features = false, features = ["serde", "std"] }
+hex = "0.4"
+# The sidecar's `provenance.genesis_sha256` — the same hash `guest-rome`'s `build.rs`
+# prints for the identical genesis file, so a sidecar and the ELF it was captured against can be checked
+# against one shared genesis fact.
+sha2 = "0.10"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+thiserror = "1"
+anyhow = "1"
+url = "2.5"
+# Plain blocking JSON-RPC client for the verifier fetch — the same dependency pattern
+# `guest/rome-zk-bench-decode/lib`'s own `fetch_real_batch` host tool already uses in this repo for its
+# Solana-side `getAccountInfo`/`getMultipleAccounts` reads; `rustls` (not `native-tls`) so no C toolchain
+# dependency is added.
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+
+[dev-dependencies]

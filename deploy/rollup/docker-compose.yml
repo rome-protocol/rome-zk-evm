@@ -1,0 +1,185 @@
+# A rollup node on one machine. Start it with `./rollup up`, which passes the rendered compose.env for you.
+#
+# Public and private services:
+#   sequencer      the chain's public RPC (8545 http, 8546 websocket). RPC_BIND decides who can reach it; the default is
+#                  this machine only. Put a TLS proxy of your choice in front of it to open it to the world.
+#   reth-verifier  a second reth node that `derive` drives from the Solana inbox. It runs reth's `testing` API, which
+#                  can include arbitrary transactions, so it is published on 127.0.0.1 only.
+#   derive         rebuilds the chain from Solana alone and feeds reth-verifier. Private.
+#   batcher        reads the sequencer's log and posts it to Solana. Private.
+#   prover         required for settlement on Solana; needs one GPU. `./rollup up` starts it when PROVER=on in .env.
+#   postgres       the prover's history, a local container. Starts with the prover.
+#
+# Everything except the sequencer's RPC publishes only on 127.0.0.1, and the Engine API (8551) is never published.
+# Each service serves GET /metrics on the port listed with it; scrape them with whatever you run.
+#
+# Files you provide (paths in .env; the container user is uid 999, so the files must be readable by it):
+#   SEQUENCER_KEY_PATH   the sequencer's signing key (64 hex characters)
+#   PAYER_KEYPAIR_PATH   the batcher's Solana keypair (the fee payer and the chain authority)
+# Files `./rollup init` renders into RENDERED_DIR: sequencer-config.toml, genesis.json, batcher.toml, derive.toml,
+# jwt.hex, and with PROVER=on prover.toml and prover-db-password.
+
+x-node: &node
+  # Public tags are pinned to the commit of the source export they were built from, so a tag names exactly one tree.
+  # Set ROME_ZK_TAG in .env to the tag your release notes give, or ROME_ZK_IMAGE to a full reference (an image you
+  # built from this tree). `./rollup up` refuses to start while neither is set.
+  image: ${ROME_ZK_IMAGE:-ghcr.io/rome-protocol/rome-zk-evm:${ROME_ZK_TAG:-unset}}
+  restart: unless-stopped
+  environment: ["RUST_LOG=info"]
+  logging:
+    driver: json-file
+    options:
+      max-size: "100m"
+      max-file: "3"
+
+services:
+  sequencer:
+    <<: *node
+    command: ["--config", "/data/config.toml", "--executor", "reth"]
+    volumes:
+      - ${RENDERED_DIR:-./rendered}/sequencer-config.toml:/data/config.toml:ro
+      - ${RENDERED_DIR:-./rendered}/genesis.json:/data/genesis.json:ro
+      - ${SEQUENCER_KEY_PATH:?SEQUENCER_KEY_PATH is not set - run ./rollup init}:/data/sequencer.key:ro
+      - sequencer-data:/data/reth
+    ports:
+      - "${RPC_BIND:-127.0.0.1}:8545:8545"
+      - "${RPC_BIND:-127.0.0.1}:8546:8546"
+      # metrics
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "-X", "POST", "-H", "content-type: application/json",
+             "--data", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_chainId\",\"params\":[]}",
+             "http://127.0.0.1:8545"]
+      interval: 10s
+      timeout: 3s
+      start_period: 30s
+      retries: 5
+
+  reth-verifier:
+    image: ghcr.io/paradigmxyz/reth:v2.5.2
+    restart: unless-stopped
+    command: >
+      node
+      --chain /genesis.json
+      --http --http.addr 0.0.0.0 --http.port 8547 --http.api eth,net,web3,testing,debug
+      --authrpc.addr 0.0.0.0 --authrpc.port 8551 --authrpc.jwtsecret /jwt.hex
+      --builder.gaslimit ${BLOCK_GAS_LIMIT:?BLOCK_GAS_LIMIT is not set - run ./rollup init}
+      --rpc.eth-proof-window ${VERIFIER_PROOF_WINDOW:-1000000}
+    volumes:
+      - ${RENDERED_DIR:-./rendered}/genesis.json:/genesis.json:ro
+      - ${RENDERED_DIR:-./rendered}/jwt.hex:/jwt.hex:ro
+      - verifier-data:/root/.local/share/reth
+    ports:
+      # RPC with the `testing` API: this machine only.
+      - "127.0.0.1:8547:8547"
+    # The reth image has bash but no curl, so the probe speaks HTTP over bash's /dev/tcp.
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8547 && printf 'POST / HTTP/1.0\r\nContent-Type: application/json\r\nContent-Length: 59\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_chainId\",\"params\":[]}' >&3 && timeout 3 grep -q result <&3"]
+      interval: 10s
+      timeout: 3s
+      start_period: 30s
+      retries: 5
+
+  derive:
+    <<: *node
+    entrypoint: ["rome-zk-derive"]
+    command: ["--config", "/data/derive.toml"]
+    # The image's own health probe asks the sequencer's RPC, which this binary does not serve.
+    healthcheck:
+      disable: true
+    volumes:
+      - ${RENDERED_DIR:-./rendered}/derive.toml:/data/derive.toml:ro
+      - ${RENDERED_DIR:-./rendered}/jwt.hex:/data/jwt.hex:ro
+    ports:
+      # metrics
+      - "127.0.0.1:9003:9003"
+    depends_on:
+      reth-verifier:
+        condition: service_healthy
+
+  batcher:
+    <<: *node
+    entrypoint: ["rome-zk-batcher"]
+    command: ["--config", "/data/batcher.toml", "--follow", "/data/reth/log"]
+    healthcheck:
+      disable: true
+    volumes:
+      - ${RENDERED_DIR:-./rendered}/batcher.toml:/data/batcher.toml:ro
+      - ${PAYER_KEYPAIR_PATH:?PAYER_KEYPAIR_PATH is not set - run ./rollup init}:/run/rome-zk/payer.json:ro
+      - sequencer-data:/data/reth:ro
+    ports:
+      # metrics
+      - "127.0.0.1:9002:9002"
+    depends_on:
+      sequencer:
+        condition: service_healthy
+
+  prover:
+    # Built from this tree (deploy/rollup/prover/Dockerfile) the first time the prover starts; the published prover image
+    # comes with the public release. Set ROME_ZK_PROVER_IMAGE to use an image you pushed somewhere else.
+    image: ${ROME_ZK_PROVER_IMAGE:-rome-zk-prover:local}
+    build:
+      context: ../..
+      dockerfile: deploy/rollup/prover/Dockerfile
+    profiles: ["prover"]
+    restart: unless-stopped
+    command: ["--config", "/data/prover.toml", "--follow"]
+    environment: ["RUST_LOG=info", "ZISK_HOME=/opt/zisk"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "3"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ${RENDERED_DIR:-./rendered}/prover.toml:/data/prover.toml:ro
+      - ${RENDERED_DIR:-./rendered}/genesis.json:/data/genesis.json:ro
+      - ${VKEY_JSON:-./vkey.json}:/data/vkey.json:ro
+      - ${PAYER_KEYPAIR_PATH:-./payer.json}:/run/rome-zk/payer.json:ro
+      - ${ELF_DIR:-./elf}:/data/elf:ro
+      # The entrypoint checks the proving keys against this manifest before every start (see prover/check-keys.sh).
+      - ./prover/check-keys.sh:/opt/prover/check-keys.sh:ro
+      - ${PROVER_KEYS_MANIFEST:-./prover/keys.sha256}:/opt/prover/keys.sha256:ro
+      # About 77 GB of proving keys, downloaded once on the host.
+      - ${ZISK_HOME:-/opt/zisk}:/opt/zisk:ro
+      - zisk-cache:/opt/zisk/cache
+      - prover-work:/data/work
+    ports:
+      # metrics
+      - "127.0.0.1:9004:9004"
+    depends_on:
+      reth-verifier:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16
+    profiles: ["prover"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rome
+      POSTGRES_DB: prover
+      POSTGRES_PASSWORD_FILE: /run/secrets/db-password
+    volumes:
+      - ${PROVER_DB_PASSWORD_FILE:-./prover-db-password}:/run/secrets/db-password:ro
+      - postgres-data:/var/lib/postgresql/data
+    # No host port: only the prover uses it, over the compose network.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rome -d prover"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  sequencer-data:
+  verifier-data:
+  postgres-data:
+  prover-work:
+  zisk-cache:

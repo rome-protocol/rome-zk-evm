@@ -1,0 +1,12 @@
+[package]
+name = "rome-zk-explorer-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "explorer API over the indexer schema"
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,88 @@
+[package]
+name = "rome-zk-sequencer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "ordered log, admission, 50 ms signed sub-blocks / 1 s blocks, in-process reth payload job, preconf feed"
+
+[features]
+default = ["reth"]
+# The in-process reth executor lives in a sibling crate (dependency weight — reth
+# pulls hundreds of transitive crates) so the mock-only build stays light; default-on because the
+# build gate wants `--executor reth` to work by default, but keeping this switchable
+# means `cargo test -p rome-zk-sequencer --no-default-features` never touches reth's build graph.
+reth = [
+    "dep:rome-zk-executor-reth",
+    "dep:reth-rpc-builder",
+    "dep:reth-rpc",
+    "dep:reth-rpc-eth-api",
+    "dep:reth-rpc-eth-types",
+    "dep:reth-network-api",
+    "dep:reth-transaction-pool",
+    "dep:reth-ethereum-consensus",
+    "dep:reth-provider",
+    "dep:reth-tasks",
+    "dep:reth-chainspec",
+    "dep:reth-evm-ethereum",
+    "dep:reth-evm",
+    "dep:eyre",
+    "dep:reth-rpc-convert",
+    "dep:alloy-network",
+]
+
+[dependencies]
+alloy = { version = "2.4", default-features = false, features = ["consensus", "rlp", "signer-local", "k256", "rand"] }
+rome-zk-executor-api = { path = "../rome-zk-executor-api" }
+# The /metrics HTTP responder itself lives here now (reth-free), so rome-zk-batcher can
+# reuse it — this crate's own `metrics::serve_metrics` is a thin call into it.
+rome-zk-metrics-http = { path = "../rome-zk-metrics-http" }
+rome-zk-profile = { path = "../rome-zk-profile" }
+# Sub-block header + ordered-log record format (split out of the batcher/sequencer) — this crate re-exports it as `log` /
+# `header` so every existing call site keeps compiling; the batcher, derive and the indexer read the same
+# crate directly.
+rome-zk-log = { path = "../rome-zk-log" }
+rome-zk-executor-reth = { path = "../rome-zk-executor-reth", optional = true }
+# `src/node.rs`'s standalone reth RPC surface (`RpcModuleBuilder` + `EthApiBuilder`
+# over this crate's own `ProviderFactory` clone, `examples/rpc-db` in the pinned reth tree — see
+# `rome-zk-executor-reth`'s module doc for the full source citation). Same `tag = "v2.5.2"` pin as
+# `rome-zk-executor-reth`'s own reth-* deps (must match — a mismatched reth git rev here would
+# resolve a second, incompatible copy of these crates). All optional/gated by the `reth` feature,
+# same reasoning as `rome-zk-executor-reth` itself.
+reth-rpc-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2", optional = true }
+reth-rpc = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2", optional = true }
+reth-rpc-eth-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2", optional = true }
+reth-rpc-eth-types = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2", optional = true }
+reth-network-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2", optional = true }
+reth-transaction-pool = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2", optional = true }
+reth-ethereum-consensus = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2", optional = true }
+reth-provider = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2", optional = true }
+reth-tasks = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2", optional = true }
+reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2", optional = true }
+reth-evm-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2", optional = true }
+reth-evm = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2", optional = true }
+reth-rpc-convert = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2", optional = true }
+alloy-network = { version = "2.3", default-features = false, optional = true }
+eyre = { version = "0.6", optional = true }
+alloy-eips = { version = "2", default-features = false, features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+hex = "0.4"
+jsonrpsee = { version = "0.26", features = ["server", "ws-client", "macros", "client"] }
+lru = "0.12"
+prometheus = "0.14"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+toml = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }

@@ -1,0 +1,87 @@
+[package]
+name = "zk-bridge-client"
+version = "0.1.0"
+edition = "2021"
+publish = false
+# Thin, async-runtime-agnostic client for `programs/zk-bridge`: instruction builders, PDA derivation, and
+# account decoding — mirrors `zk-settlement-client`'s own shape and reasoning.
+
+[dependencies]
+borsh = { version = "1.5.1", features = ["derive"] }
+solana-program.workspace = true
+solana-system-interface = { workspace = true, features = ["bincode"] }
+zk-bridge = { path = "../../programs/zk-bridge", features = ["no-entrypoint"] }
+rome-zk-layouts = { path = "../rome-zk-layouts" }
+thiserror = "1"
+
+[features]
+# Pulls in a Solana RPC client + Tokio for the `release-exit` example binary — off by default so plain library
+# consumers (the exit-prover, program tests) never need an async runtime transitively. Mirrors
+# zk-settlement-client's own `devnet-driver` feature shape.
+devnet-driver = [
+  "dep:solana-client",
+  "dep:solana-sdk",
+  "dep:solana-commitment-config",
+  "dep:tokio",
+  "dep:zk-settlement-client",
+  "dep:hex",
+  "dep:base64",
+  "dep:bincode",
+]
+
+[dependencies.solana-client]
+workspace = true
+optional = true
+
+[dependencies.solana-sdk]
+workspace = true
+optional = true
+
+[dependencies.solana-commitment-config]
+workspace = true
+optional = true
+
+[dependencies.tokio]
+version = "1"
+features = ["macros", "rt-multi-thread"]
+optional = true
+
+[dependencies.zk-settlement-client]
+path = "../zk-settlement-client"
+optional = true
+
+[dependencies.hex]
+version = "0.4"
+optional = true
+
+# `release-exit.rs`'s `--dry-run` (the default): base64-encodes the bincode-serialized `Transaction` —
+# the same wire encoding a real `sendTransaction` RPC call receives — so a dry-run tx is inspectable
+# without ever touching a cluster. Mirrors `zk-settlement-client/examples/governance.rs`'s own shape.
+[dependencies.base64]
+version = "0.22"
+optional = true
+
+[dependencies.bincode]
+version = "1"
+optional = true
+
+[[example]]
+name = "release-exit"
+required-features = ["devnet-driver"]
+
+[[example]]
+name = "vault"
+required-features = ["devnet-driver"]
+
+[lints]
+workspace = true
+
+# Unconditional (never behind `devnet-driver`, unlike the optional `[dependencies.solana-sdk]` above) —
+# `tests/vault_example.rs`'s real-BPF check needs a program-test rig regardless of which library features
+# a plain `cargo test -p zk-bridge-client` happens to build with, the same shape
+# `programs/zk-bridge/Cargo.toml`'s own `[dev-dependencies]` already uses.
+[dev-dependencies]
+solana-program-test.workspace = true
+solana-sdk.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+rome-zk-testkit = { path = "../rome-zk-testkit" }

@@ -1,0 +1,12 @@
+[toolchain]
+# Bumped from 1.94.1 because reth v2.5.2's own workspace (crates/*, its `vergen` build-dep included) requires rustc
+# >= 1.95/1.96 — verified via `cargo check` failing "rustc 1.94.1 is not supported" against ~100 reth-* crates +
+# vergen 10.0.3 (needs exactly 1.96.0). Bumped again from 1.96.1 for the Agave 4.3.0-line crate bump:
+# `solana-client = 4.3.0`'s own dependency chain (solana-rpc-client, -streamer, -perf, -program-runtime,
+# -connection-cache, and ~30 more at the Agave 4.3.0 pin) declares `rust-version = "1.97.1"` — `cargo check` refuses
+# outright ("rustc 1.96.1 is not supported") before this bump, for every one of them. Reth v2.5.2 is unaffected (its
+# own floor is 1.95/1.96, well under 1.97.1). Solana programs are unaffected either way: `cargo build-sbf` uses its
+# own bundled platform-tools rustc (1.89.0, `solana-release` under `~/.local/share/solana`), never this
+# rustup-managed host toolchain.
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]

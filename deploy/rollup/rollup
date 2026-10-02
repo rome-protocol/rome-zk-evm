@@ -1,0 +1,547 @@
+#!/usr/bin/env bash
+# rollup — run a rollup node on one machine. Needs bash, docker with the compose plugin (Engine 28 or newer), curl,
+# jq, openssl, python3 (3.11 or newer) and rustup/cargo. It reaches no cloud service: every file it reads is local,
+# every request it makes goes to your own containers or to the Solana RPC endpoint you configured.
+#
+#   ./rollup init                   read your chain id from Solana, render every config with it (from chain.toml, .env
+#                                   and the programs file)
+#   ./rollup register --dry-run     print the registration commands without running anything
+#   ./rollup register --confirm     register the chain on Solana (no verifier keys) and write rendered/pdas.env
+#   ./rollup up [service...]        start the node (the prover too when PROVER=on)
+#   ./rollup check                  health check: services, chain id, heads, batcher, inbox, roots, derive
+#
+# Where things live (each can be overridden by an environment variable of the same name):
+#   ROLLUP_ENV   the machine's settings        default deploy/rollup/.env
+#   CHAIN_TOML   the chain's settings          default deploy/rollup/chain.toml
+#   ROLLUP_OUT   what init renders             default deploy/rollup/rendered
+#
+# Every refusal starts with a CamelCase name, written to stderr, and exits non-zero.
+set -uo pipefail
+
+ROLLUP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$ROLLUP_DIR/../.." && pwd)"
+# shellcheck source=lib/config-lib.sh
+source "$ROLLUP_DIR/lib/config-lib.sh"
+
+abs() { case "$1" in /*) printf '%s' "$1" ;; *) printf '%s' "$ROLLUP_DIR/${1#./}" ;; esac; }
+ENV_FILE="$(abs "${ROLLUP_ENV:-$ROLLUP_DIR/.env}")"
+CHAIN_TOML="$(abs "${CHAIN_TOML:-$ROLLUP_DIR/chain.toml}")"
+OUT="$(abs "${ROLLUP_OUT:-$ROLLUP_DIR/rendered}")"
+
+# Where the node's own ports are, on this machine.
+SEQUENCER_RPC="http://127.0.0.1:8545"
+VERIFIER_RPC="http://127.0.0.1:8547"
+METRICS_SEQUENCER="http://127.0.0.1:9001/metrics"
+METRICS_BATCHER="http://127.0.0.1:9002/metrics"
+METRICS_PROVER="http://127.0.0.1:9004/metrics"
+
+die() { echo "$1: $2" >&2; exit 1; }
+
+# cfg KEY [DEFAULT] -> the process environment wins, then the .env file, then the default.
+cfg() {
+  local key="$1" def="${2:-}" v="${!1:-}"
+  [[ -n "$v" ]] || v="$(rz_env_get "$ENV_FILE" "$key")"
+  printf '%s' "${v:-$def}"
+}
+
+load_env() {
+  [[ -f "$ENV_FILE" ]] || die EnvMissing "$ENV_FILE does not exist (copy .env.example to .env and edit it)"
+  SOLANA_RPC_URL="$(cfg SOLANA_RPC_URL)"
+  [[ -n "$SOLANA_RPC_URL" ]] || die SolanaRpcUrlMissing "SOLANA_RPC_URL is not set in $ENV_FILE"
+}
+
+load_programs() {
+  PROGRAMS="$(abs "$(cfg PROGRAMS_JSON programs.devnet.json)")"
+  [[ -f "$PROGRAMS" ]] || die ProgramsFileMissing "$PROGRAMS does not exist (set PROGRAMS_JSON in $ENV_FILE to the published program-address file for your cluster)"
+  local name val
+  CLUSTER="$(jq -r '.cluster // empty' "$PROGRAMS" 2>/dev/null)"
+  INBOX_ID="$(jq -r '.programs["zk-inbox"] // empty' "$PROGRAMS" 2>/dev/null)"
+  SETTLEMENT_ID="$(jq -r '.programs["zk-settlement"] // empty' "$PROGRAMS" 2>/dev/null)"
+  for name in CLUSTER INBOX_ID SETTLEMENT_ID; do
+    val="${!name}"
+    [[ -n "$val" ]] || die ProgramsFileInvalid "$PROGRAMS has no value for $name (expected cluster, programs.zk-inbox and programs.zk-settlement)"
+  done
+}
+
+require_init() {
+  [[ -f "$OUT/genesis.json" && -f "$OUT/compose.env" ]] || die NotInitialised "nothing rendered under $OUT (run ./rollup init first)"
+}
+
+# The chain id is not chosen. A permissionless id is derived by the settlement program from the payer's key and the
+# number of chains that payer has registered so far, so it is read from Solana: the register_chain example's chain-id
+# command prints it and sends nothing. Sets D_AUTHORITY, D_NONCE and D_ID.
+fetch_chain_id() {
+  local payer="$1" out errf
+  command -v cargo >/dev/null 2>&1 || die CargoMissing "reading your chain id runs from the source tree and needs a Rust toolchain (cargo)"
+  [[ -f "$REPO_ROOT/Cargo.toml" ]] || die SourceTreeMissing "$REPO_ROOT has no Cargo.toml; run from a full checkout"
+  [[ -f "$payer" ]] || die PayerKeyMissing "$payer does not exist (a funded Solana keypair; set PAYER_KEYPAIR_PATH in $ENV_FILE). Your chain id comes from this key."
+  errf="$(mktemp)"
+  if ! out="$(cd "$REPO_ROOT" && cargo run --quiet -p zk-settlement-client --features devnet-driver --example register_chain -- chain-id --keypair "$payer" --settlement "$SETTLEMENT_ID" --rpc-url "$SOLANA_RPC_URL" 2>"$errf")"; then
+    tail -5 "$errf" >&2; rm -f "$errf"
+    die ChainIdLookupFailed "could not read the registration nonce for $payer from $SOLANA_RPC_URL"
+  fi
+  rm -f "$errf"
+  D_AUTHORITY="$(sed -n 's/^authority=//p' <<<"$out" | head -1)"
+  D_NONCE="$(sed -n 's/^nonce=//p' <<<"$out" | head -1)"
+  D_ID="$(sed -n 's/^chain_id=//p' <<<"$out" | head -1)"
+  [[ -n "$D_AUTHORITY" && "$D_NONCE" =~ ^[0-9]+$ && "$D_ID" =~ ^[0-9]+$ ]] || die ChainIdLookupFailed "unexpected output from the chain-id command: $out"
+  (( D_ID >= 4294967296 )) || die ChainIdInvalid "the derived chain id $D_ID is below 2^32, which a permissionless registration cannot produce"
+}
+
+# ---------------------------------------------------------------------------------------------------------- init
+cmd_init() {
+  load_env
+  [[ -f "$CHAIN_TOML" ]] || die ChainTomlMissing "$CHAIN_TOML does not exist (copy chain.toml.example to chain.toml and edit it)"
+  load_programs
+  local example="${SEQUENCER_EXAMPLE_CONFIG:-$REPO_ROOT/crates/rome-zk-sequencer/config.example.toml}"
+
+  local errf vals chosen funded close_after
+  errf="$(mktemp)"
+  if ! vals="$(rz_toml_get "$CHAIN_TOML" chain_id genesis.funded_address batcher.batch_close_after_secs 2>"$errf")"; then
+    local err; err="$(tail -1 "$errf")"; rm -f "$errf"
+    case "$err" in Python311Required*) echo "$err" >&2; exit 1 ;; *) die ChainTomlInvalid "$CHAIN_TOML: $err" ;; esac
+  fi
+  rm -f "$errf"
+  chosen="$(sed -n 1p <<<"$vals")"; funded="$(sed -n 2p <<<"$vals")"; close_after="$(sed -n 3p <<<"$vals")"
+  [[ -z "$chosen" ]] || die ChainIdNotChosen "chain_id in $CHAIN_TOML must be removed: a permissionless chain id is derived from your payer key and its registration count, and init reads it from Solana"
+  [[ "$funded" =~ ^0x[0-9a-fA-F]{40}$ ]] || die FundedAddressInvalid "genesis.funded_address in $CHAIN_TOML must be 0x followed by 40 hex characters (got '$funded')"
+  # The precompiles live at 0x00..00 to 0x00..ff on this chain (Prague has BLS precompiles above 0x0a), and the exit portal
+  # sits at 0x42..16: genesis supply put at any of them is in an account nobody can spend from, or collides.
+  local funded_lc="${funded,,}"
+  if [[ "$funded_lc" =~ ^0x0{38}[0-9a-f]{2}$ ]]; then
+    die FundedAddressReserved "genesis.funded_address in $CHAIN_TOML is $funded, a precompile address (or zero): nobody can spend from it. Use an address you control."
+  fi
+  [[ "$funded_lc" != 0x4200000000000000000000000000000000000016 ]] || die FundedAddressReserved "genesis.funded_address in $CHAIN_TOML is the exit portal's address; use an address you control."
+  [[ "$close_after" =~ ^[1-9][0-9]*$ ]] || die BatchCloseAfterInvalid "batcher.batch_close_after_secs in $CHAIN_TOML must be a positive integer (got '$close_after')"
+
+  # [profile] becomes sequencer settings, one for one. A name the example config does not have is refused by name, and so
+  # is a name init sets itself: it would override the derived chain id or move a path off the mounted volume.
+  local profile_lines=() line k v
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    k="${line%%=*}"
+    case "$k" in
+      chain_id|rpc_addr|metrics_addr|log_dir|sequencer_key_path|datadir|genesis_path)
+        die ProfileKeyReserved "[profile] $k in $CHAIN_TOML is set by init itself (reserved: chain_id, rpc_addr, metrics_addr, log_dir, sequencer_key_path, datadir, genesis_path); remove it" ;;
+    esac
+    profile_lines+=("$line")
+  done < <(rz_toml_table "$CHAIN_TOML" profile)
+
+  # Everything in chain.toml is checked; now the one network call: the chain id.
+  local payer_key chain_id rec="$OUT/chain-id.env" rec_auth rec_nonce rec_id
+  payer_key="$(abs "$(cfg PAYER_KEYPAIR_PATH ./keys/payer.json)")"
+  fetch_chain_id "$payer_key"
+  if [[ -f "$rec" ]]; then
+    # A chain id init recorded stays: registering moves the payer's nonce forward, and the id derived from the new nonce
+    # would be another chain. The record holds only while the payer is the key that was recorded.
+    rec_auth="$(rz_env_get "$rec" AUTHORITY)"; rec_nonce="$(rz_env_get "$rec" NONCE)"; rec_id="$(rz_env_get "$rec" CHAIN_ID)"
+    [[ -n "$rec_auth" && "$rec_nonce" =~ ^[0-9]+$ && "$rec_id" =~ ^[0-9]+$ ]] || die ChainIdRecordInvalid "$rec has no valid AUTHORITY, NONCE and CHAIN_ID (move $OUT aside to start a new chain)"
+    [[ "$D_AUTHORITY" == "$rec_auth" ]] || die AuthorityChanged "the payer key $payer_key is $D_AUTHORITY, but $rec records the chain's authority as $rec_auth; use that key again (PAYER_KEYPAIR_PATH in $ENV_FILE), or move $OUT aside to start a new chain"
+    D_NONCE="$rec_nonce"; D_ID="$rec_id"
+  fi
+  chain_id="$D_ID"
+
+  local pairs=()
+  pairs+=("chain_id=$chain_id" 'rpc_addr="0.0.0.0:9944"' 'metrics_addr="0.0.0.0:9001"' 'log_dir="/data/reth/log"'
+          'sequencer_key_path="/data/sequencer.key"' 'datadir="/data/reth/db"' 'genesis_path="/data/genesis.json"')
+  for line in ${profile_lines[@]+"${profile_lines[@]}"}; do
+    k="${line%%=*}"; v="${line#*=}"
+    [[ "$v" =~ ^[0-9]+$ ]] || v="\"$v\""
+    pairs+=("$k=$v")
+  done
+
+  STAGE="$(mktemp -d)"
+  trap 'rm -rf "$STAGE"' EXIT
+  rz_render_sequencer_config "$example" "$STAGE/sequencer-config.toml" "${pairs[@]}" || exit 1
+
+  local gas_limit gas_hex blocks_per_batch
+  gas_limit="$(rz_profile_gas_limit "$STAGE/sequencer-config.toml")" || die ProfileInvalid "sub_block_gas_limit and sub_blocks_per_block must be set in [profile]"
+  gas_hex="$(printf '0x%x' "$gas_limit")"
+  blocks_per_batch="$(rz_config_value "$STAGE/sequencer-config.toml" blocks_per_batch)"
+
+  # The exit portal is a predeploy at 0x42..16, the same bytecode every chain starts with. Exiting funds also needs the
+  # settlement program's exit configuration to name it; that is set later, by the program's governance.
+  local portal_hex portal_file="${EXIT_PORTAL_RUNTIME_HEX:-$REPO_ROOT/contracts/exit-portal/RomeExitPortal.runtime.hex}"
+  portal_hex="$(rz_hex_body "$portal_file" 2>/dev/null)" || die ExitPortalRuntimeMissing "$portal_file is absent, empty or not valid hex (run from a full checkout)"
+  rz_render_template "$ROLLUP_DIR/genesis.json.template" "$STAGE/genesis.json" \
+    "CHAIN_ID=$chain_id" "GAS_LIMIT_HEX=$gas_hex" "FUNDED_ADDRESS=$funded" "EXIT_PORTAL_RUNTIME=$portal_hex" || exit 1
+  local common=("CHAIN_ID=$chain_id" "CLUSTER=$CLUSTER" "INBOX_PROGRAM_ID=$INBOX_ID" "SETTLEMENT_PROGRAM_ID=$SETTLEMENT_ID"
+                "SOLANA_RPC_URL=$SOLANA_RPC_URL" "BATCH_CLOSE_AFTER_SECS=$close_after" "BLOCKS_PER_BATCH=$blocks_per_batch")
+  rz_render_template "$ROLLUP_DIR/batcher.toml.template" "$STAGE/batcher.toml" "${common[@]}" || exit 1
+  rz_render_template "$ROLLUP_DIR/derive.toml.template" "$STAGE/derive.toml" "${common[@]}" || exit 1
+
+  # The prover is required for settlement; when enabled, its inputs are checked before anything is written.
+  local prover; prover="$(cfg PROVER)"
+  local elf_sha="" vkey=""
+  if [[ "$prover" == on ]]; then
+    vkey="$(cfg VKEY_JSON)"
+    [[ -n "$vkey" && -f "$(abs "$vkey")" ]] || die ProverVkeyMissing "PROVER=on needs VKEY_JSON in $ENV_FILE to name your verification-key file (got '${vkey:-unset}')"
+    elf_sha="$(jq -r '.elf_sha256 // empty' "$(abs "$vkey")" 2>/dev/null | sed 's/^0x//')"
+    [[ "$elf_sha" =~ ^[0-9a-fA-F]{64}$ ]] || die ProverVkeyInvalid "$(abs "$vkey") has no 64-hex-character elf_sha256"
+  fi
+
+  # A genesis that is already there is never rewritten: a node refuses to start on a genesis that differs from its own
+  # chain state, so a changed chain.toml must not slip a new one in. Nothing else is written when this refuses.
+  if [[ -e "$OUT/genesis.json" ]] && ! cmp -s "$STAGE/genesis.json" "$OUT/genesis.json"; then
+    local old_cid cause="chain.toml would change it"
+    old_cid="$(jq -r '.config.chainId // empty' "$OUT/genesis.json" 2>/dev/null)"
+    if [[ -n "$old_cid" && "$old_cid" != "$chain_id" ]]; then
+      cause="the chain id would change from $old_cid to $chain_id (the payer's registration nonce moved, and $rec, which keeps the first id, is missing)"
+    fi
+    echo "GenesisDrift: $OUT/genesis.json already exists and $cause; refusing to overwrite a genesis that may be live" >&2
+    echo "fields differing: $(rz_genesis_diff_summary "$OUT/genesis.json" "$STAGE/genesis.json")" >&2
+    echo "to start a new chain, move $OUT aside and run init again (the old chain's data volumes must go too)" >&2
+    exit 1
+  fi
+
+  # Compose variables.
+  local seq_key opt
+  seq_key="$(abs "$(cfg SEQUENCER_KEY_PATH ./keys/sequencer.key)")"
+  printf 'AUTHORITY=%s\nNONCE=%s\nCHAIN_ID=%s\n' "$D_AUTHORITY" "$D_NONCE" "$D_ID" > "$STAGE/chain-id.env"
+  {
+    echo "CHAIN_ID=$chain_id"
+    echo "BLOCK_GAS_LIMIT=$gas_limit"
+    echo "BLOCKS_PER_BATCH=$blocks_per_batch"
+    echo "BATCH_CLOSE_AFTER_SECS=$close_after"
+    echo "RENDERED_DIR=$OUT"
+    echo "SEQUENCER_KEY_PATH=$seq_key"
+    echo "PAYER_KEYPAIR_PATH=$payer_key"
+    echo "RPC_BIND=$(cfg RPC_BIND 127.0.0.1)"
+    echo "PROVER_DB_PASSWORD_FILE=$OUT/prover-db-password"
+    for opt in ROME_ZK_IMAGE ROME_ZK_TAG ROME_ZK_PROVER_IMAGE VERIFIER_PROOF_WINDOW; do
+      v="$(cfg "$opt")"; [[ -z "$v" ]] || echo "$opt=$v"
+    done
+    for opt in VKEY_JSON ELF_DIR ZISK_HOME PROVER_KEYS_MANIFEST; do
+      v="$(cfg "$opt")"; [[ -z "$v" ]] || echo "$opt=$(abs "$v")"
+    done
+  } > "$STAGE/compose.env"
+
+  mkdir -p "$OUT" || die OutputDirFailed "cannot create $OUT"
+  if [[ "$prover" == on ]]; then
+    local pw="$OUT/prover-db-password"
+    [[ -s "$pw" ]] || (umask 077; openssl rand -hex 24 > "$pw")
+    chmod 600 "$pw"
+    rz_render_template "$ROLLUP_DIR/prover.toml.template" "$STAGE/prover.toml" "${common[@]}" "ELF_SHA256=$elf_sha" \
+      "DATABASE_URL=postgres://rome:$(cat "$pw")@postgres:5432/prover" || exit 1
+  else
+    rm -f "$OUT/prover.toml"
+  fi
+  local f
+  for f in sequencer-config.toml genesis.json batcher.toml derive.toml compose.env chain-id.env prover.toml; do
+    [[ -f "$STAGE/$f" ]] && cp "$STAGE/$f" "$OUT/$f"
+  done
+  # 0644 on purpose: derive and the verifier node run as other users than you, and the engine port is never published.
+  rz_ensure_jwt "$OUT/jwt.hex" 644
+
+  if grep -rqE '__[A-Z0-9_]+__' "$OUT" --include='*.toml' --include='*.json' --include='*.env'; then
+    die PlaceholderLeft "a template placeholder is still in $OUT: $(grep -rnE '__[A-Z0-9_]+__' "$OUT" | head -2)"
+  fi
+  [[ -e "$seq_key" ]] || echo "note: the sequencer key $seq_key does not exist yet (64 hex characters in a file, readable by uid 999)" >&2
+  echo "rendered under $OUT: authority=$D_AUTHORITY nonce=$D_NONCE chain_id=$chain_id, genesis gas limit $gas_limit, blocks_per_batch=$blocks_per_batch, cluster=$CLUSTER"
+}
+
+# ------------------------------------------------------------------------------------------------------ register
+account_exists() { # $1=pubkey -> 0 when the account exists, 1 when the RPC says there is none, 2 when it could not be read
+  local body json
+  body="{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getAccountInfo\",\"params\":[\"$1\",{\"encoding\":\"base64\",\"commitment\":\"confirmed\"}]}"
+  json="$(curl -sS --max-time 10 -X POST -H 'content-type: application/json' --data "$body" "$SOLANA_RPC_URL" 2>/dev/null)" || return 2
+  jq -e '(.result | type == "object") and (.result | has("value"))' <<<"$json" >/dev/null 2>&1 || return 2
+  jq -e '.result.value == null' <<<"$json" >/dev/null 2>&1 && return 1
+  return 0
+}
+cmd_register() {
+  local dry=0 confirm=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry=1 ;;
+      --confirm) confirm=1 ;;
+      *) die UnknownArgument "'$1' (usage: rollup register --dry-run | --confirm)" ;;
+    esac
+    shift
+  done
+  [[ $dry -eq 1 || $confirm -eq 1 ]] || die refusing "pass --dry-run to see what registration would do, or --confirm to register for real (there is no default)"
+  [[ $dry -eq 0 || $confirm -eq 0 ]] || die refusing "--dry-run and --confirm are mutually exclusive"
+  require_init
+  load_env; load_programs
+
+  local chain_id payer evm_rpc="$SEQUENCER_RPC" max_drift=60 rec="$OUT/chain-id.env" init_id init_nonce init_auth
+  chain_id="$(jq -r '.config.chainId' "$OUT/genesis.json")"
+  payer="$(abs "$(cfg PAYER_KEYPAIR_PATH ./keys/payer.json)")"
+  [[ -f "$rec" ]] || die NotInitialised "$rec does not exist (run ./rollup init first; it records the chain id it read from Solana)"
+  init_id="$(rz_env_get "$rec" CHAIN_ID)"; init_nonce="$(rz_env_get "$rec" NONCE)"; init_auth="$(rz_env_get "$rec" AUTHORITY)"
+  [[ "$init_id" == "$chain_id" ]] || die ChainIdMismatch "the genesis under $OUT has chain id $chain_id but init recorded $init_id in $rec"
+  # Registration sends no verifier keys: the program refuses them on a permissionless chain. Rome registers the
+  # chain's layout-1 key afterwards.
+  local id_cmd reg_cmd cursor_cmd pda_cmd
+  id_cmd="cargo run --quiet -p zk-settlement-client --features devnet-driver --example register_chain -- chain-id --keypair $payer --settlement $SETTLEMENT_ID --rpc-url $SOLANA_RPC_URL"
+  reg_cmd="cargo run -p zk-settlement-client --features devnet-driver --example register_chain -- --keypair $payer --settlement $SETTLEMENT_ID --inbox $INBOX_ID --evm-rpc $evm_rpc --permissionless --nonce $init_nonce --expect-chain-id $init_id --max-drift-secs $max_drift --rpc-url $SOLANA_RPC_URL"
+  cursor_cmd="cargo run -p zk-inbox-client --features devnet-driver --example init_cursor -- --keypair $payer --inbox $INBOX_ID --settlement $SETTLEMENT_ID --chain-id $chain_id --next-batch 1 --rpc-url $SOLANA_RPC_URL"
+  pda_cmd="cargo run --quiet -p rome-zk-layouts --example print_pdas -- $INBOX_ID $SETTLEMENT_ID $chain_id"
+
+  echo "chain_id=$chain_id authority=$init_auth nonce=$init_nonce inbox=$INBOX_ID settlement=$SETTLEMENT_ID cluster=$CLUSTER (init derived this chain id from the authority's nonce and rendered the genesis with it)"
+  if [[ $dry -eq 1 ]]; then
+    echo "-- dry run: no key read, no network call, nothing started --"
+    echo "would run, in order, from $REPO_ROOT:"
+    echo "  $id_cmd    # must still print chain_id=$chain_id, or registration stops with NonceAdvanced"
+    echo "  $reg_cmd    # skipped when the chain's root account already exists (a re-run after a partial failure)"
+    echo "  $cursor_cmd"
+    echo "  $pda_cmd    # the printed addresses go to $OUT/pdas.env"
+    echo "registration locks the chain deposit from the payer, sends no verifier keys, and starts the sequencer if it is not running (it reads the genesis block from $evm_rpc), so it needs only the Solana RPC otherwise"
+    return 0
+  fi
+
+  [[ -f "$REPO_ROOT/Cargo.toml" ]] || die SourceTreeMissing "$REPO_ROOT has no Cargo.toml; run register from a full checkout"
+  cd "$REPO_ROOT" || exit 1
+  # The payer must be the authority init recorded, on a first registration and on a resume alike. Say so by name before
+  # any nonce is compared, so a changed key is not reported as a moved nonce.
+  fetch_chain_id "$payer"
+  [[ "$D_AUTHORITY" == "$init_auth" ]] || die AuthorityChanged "the payer key $payer is $D_AUTHORITY, but $rec records the chain's authority as $init_auth; use that key again (PAYER_KEYPAIR_PATH in $ENV_FILE), or move $OUT aside to start a new chain"
+  # The first registration of this chain: check the nonce, bring the sequencer up, send the registration. (Uses this
+  # function's variables.)
+  register_new_chain() {
+    # The id was derived at init from the payer's nonce at that moment. If the nonce moved without this chain being
+    # registered, the program would derive another id and the genesis would not match it: refuse here, before anything is
+    # sent or locked.
+    fetch_chain_id "$payer"
+    if [[ "$D_ID" != "$init_id" ]]; then
+      # The nonce moves in the same instruction that writes the root. If the root is there now, an earlier run registered
+      # this chain and the nonce moved because of it: carry on instead of telling the operator to start over.
+      local again_rc=0
+      account_exists "$root_pda" || again_rc=$?
+      if [[ "$again_rc" -eq 0 ]]; then
+        echo "chain $chain_id is already registered (its root account $root_pda exists); not registering again, continuing with the batch cursor"
+        return 0
+      fi
+      # 2 = the RPC failed on this read: whether the chain is registered is not known, so do not advise starting over.
+      [[ "$again_rc" -ne 2 ]] || die RootLookupFailed "the nonce moved and the root account could not be read, so it is not known whether chain $chain_id is registered; nothing was sent; run register again"
+      die NonceAdvanced "the registration nonce for $D_AUTHORITY is now $D_NONCE (init read $init_nonce), so the next chain id would be $D_ID, not $init_id; nothing was sent. Move $OUT aside, remove the old data volumes and run ./rollup init again"
+    fi
+    # Registration reads the genesis block from the sequencer, which does not need Solana to run: start it if it is not up.
+    local live waited=0 wait_max="${REGISTER_SEQUENCER_WAIT_SECS:-180}"
+    sequencer_chain_id() { curl -sS --max-time 5 -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' "$evm_rpc" 2>/dev/null | jq -r '.result // empty' 2>/dev/null; }
+    live="$(sequencer_chain_id)"
+    if [[ -z "$live" ]]; then
+      echo "nothing answers at $evm_rpc; starting the sequencer (./rollup up sequencer) and waiting up to ${wait_max}s for it" >&2
+      (cmd_up sequencer) || exit 1
+      while [[ -z "$live" && $waited -lt $wait_max ]]; do sleep 1; waited=$((waited+1)); live="$(sequencer_chain_id)"; done
+    fi
+    [[ -n "$live" ]] || die SequencerNotReachable "nothing answered at $evm_rpc within ${wait_max}s after starting the sequencer; see: ./rollup check"
+    [[ "$((live))" == "$chain_id" ]] || die ChainIdMismatch "the sequencer at $evm_rpc reports chain id $((live)), the genesis says $chain_id"
+
+    local out registered
+    # The recorded nonce and chain id go with the send, so the program itself refuses a pair that went stale.
+    out="$(cargo run -p zk-settlement-client --features devnet-driver --example register_chain -- --keypair "$payer" --settlement "$SETTLEMENT_ID" --inbox "$INBOX_ID" --evm-rpc "$evm_rpc" --permissionless --nonce "$init_nonce" --expect-chain-id "$init_id" --max-drift-secs "$max_drift" --rpc-url "$SOLANA_RPC_URL" 2>&1)" || { echo "$out" >&2; die RegisterFailed "register_chain exited non-zero"; }
+    echo "$out"
+    registered="$(grep -oE '^chain [0-9]+' <<<"$out" | head -1 | cut -d' ' -f2)"
+    if [[ -n "$registered" && "$registered" != "$chain_id" ]]; then
+      die NonceAdvanced "the program registered chain id $registered, but the genesis was rendered with $chain_id: the payer's nonce moved while registering (another registration by the same key); init again in a fresh output directory"
+    fi
+  }
+
+  # The addresses of this chain's accounts are known before anything is sent. If the root account is already there, an
+  # earlier run registered this chain and stopped later: carry on from the cursor instead of registering again.
+  local pdas cursor_pda root_pda
+  pdas="$(cargo run --quiet -p rome-zk-layouts --example print_pdas -- "$INBOX_ID" "$SETTLEMENT_ID" "$chain_id" 2>/dev/null)"
+  cursor_pda="$(grep -E '^\| batch cursor \| zk-inbox \|' <<<"$pdas" | grep -oE '`[^`]+`' | tr -d '`' | head -1)"
+  root_pda="$(grep -E '^\| root \| zk-settlement \|' <<<"$pdas" | grep -oE '`[^`]+`' | tr -d '`' | head -1)"
+  [[ -n "$cursor_pda" && -n "$root_pda" ]] || die PdaLookupFailed "could not read the batch cursor and root addresses from print_pdas"
+  local exists_rc=0
+  account_exists "$root_pda" || exists_rc=$?
+  case "$exists_rc" in
+    0) echo "chain $chain_id is already registered (its root account $root_pda exists); not registering again, continuing with the batch cursor" ;;
+    1) register_new_chain ;;
+    *) die RootLookupFailed "could not read the root account $root_pda from $SOLANA_RPC_URL, so it is not known whether chain $chain_id is registered; nothing was sent" ;;
+  esac
+  cargo run -p zk-inbox-client --features devnet-driver --example init_cursor -- --keypair "$payer" --inbox "$INBOX_ID" --settlement "$SETTLEMENT_ID" --chain-id "$chain_id" --next-batch 1 --rpc-url "$SOLANA_RPC_URL" || die InitCursorFailed "init_cursor exited non-zero"
+  printf 'CURSOR_PDA=%s\nROOT_PDA=%s\n' "$cursor_pda" "$root_pda" > "$OUT/pdas.env"
+  echo "registered; wrote $OUT/pdas.env (cursor $cursor_pda, root $root_pda)"
+}
+
+# ----------------------------------------------------------------------------------------------------------- up
+dc() {
+  local profile=()
+  [[ "$(cfg PROVER)" == on ]] && profile=(--profile prover)
+  docker compose --env-file "$OUT/compose.env" -f "$ROLLUP_DIR/docker-compose.yml" ${profile[@]+"${profile[@]}"} "$@"
+}
+
+cmd_up() {
+  require_init
+  local seq_key payer_key
+  seq_key="$(rz_env_get "$OUT/compose.env" SEQUENCER_KEY_PATH)"
+  payer_key="$(rz_env_get "$OUT/compose.env" PAYER_KEYPAIR_PATH)"
+  if [[ -z "$(rz_env_get "$OUT/compose.env" ROME_ZK_IMAGE)" && -z "$(rz_env_get "$OUT/compose.env" ROME_ZK_TAG)" ]]; then
+    die ImageTagNotSet "set ROME_ZK_TAG in $ENV_FILE to the image tag from your release notes (or ROME_ZK_IMAGE to an image you built), then run ./rollup init again"
+  fi
+  [[ -f "$seq_key" ]] || die SequencerKeyMissing "$seq_key does not exist (64 hex characters, readable by uid 999)"
+  if [[ $# -eq 0 ]] || printf '%s\n' "$@" | grep -qxE 'batcher|prover'; then
+    [[ -f "$payer_key" ]] || die PayerKeyMissing "$payer_key does not exist (a funded Solana keypair, readable by uid 999)"
+  fi
+  dc up -d "$@"
+}
+
+# -------------------------------------------------------------------------------------------------------- check
+FAILED=0
+pass() { echo "PASS: $1 — $2"; }
+fail() { echo "FAIL: $1 — $2"; FAILED=1; }
+skip() { echo "SKIP: $1 — $2"; }
+
+rpc() { # $1=url $2=method -> the result field, or nothing
+  curl -sS --max-time 5 -X POST -H 'content-type: application/json' \
+    --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$2\",\"params\":[]}" "$1" 2>/dev/null | jq -r '.result // empty' 2>/dev/null
+}
+metric() { # $1=url $2=metric name -> the last sample's value, or nothing
+  curl -sS --max-time 5 "$1" 2>/dev/null | grep -E "^$2( |\{)" | tail -1 | awk '{print $NF}'
+}
+account_u64() { # $1=pubkey $2=byte offset -> decimal, or nothing (and non-zero) when the account is absent or short
+  local body json b64
+  body="{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getAccountInfo\",\"params\":[\"$1\",{\"encoding\":\"base64\",\"commitment\":\"confirmed\"}]}"
+  json="$(curl -sS --max-time 10 -X POST -H 'content-type: application/json' --data "$body" "$SOLANA_RPC_URL" 2>/dev/null)" || return 1
+  b64="$(jq -r '.result.value.data[0] // empty' <<<"$json" 2>/dev/null)"
+  [[ -n "$b64" ]] || return 1
+  python3 - "$b64" "$2" <<'PY' 2>/dev/null
+import base64, struct, sys
+data = base64.b64decode(sys.argv[1]); off = int(sys.argv[2])
+if len(data) < off + 8:
+    sys.exit(1)
+print(struct.unpack_from("<Q", data, off)[0])
+PY
+}
+
+cmd_check() {
+  require_init
+  load_env
+  local env="$OUT/compose.env" sample="${CHECK_SAMPLE_SECS:-3}"
+  local chain_id bpb close_after prover
+  chain_id="$(rz_env_get "$env" CHAIN_ID)"; bpb="$(rz_env_get "$env" BLOCKS_PER_BATCH)"
+  close_after="$(rz_env_get "$env" BATCH_CLOSE_AFTER_SECS)"; prover="$(cfg PROVER)"
+
+  # Services. A service that is not running is named once; the items that need it are skipped with the reason.
+  local services=(sequencer batcher reth-verifier derive) running svc
+  [[ "$prover" == on ]] && services+=(prover postgres)
+  running="$(dc ps --services --status running 2>/dev/null)"
+  declare -A up_
+  for svc in "${services[@]}"; do
+    if grep -qx "$svc" <<<"$running"; then up_[$svc]=1; pass "service $svc" "running"
+    else up_[$svc]=0; fail "service $svc" "ServiceMissing: $svc is not running (start it with ./rollup up)"; fi
+  done
+  needs() { # needs svc... -> 0 when all are running; otherwise sets MISSING to the first that is not
+    local s; for s in "$@"; do [[ "${up_[$s]:-0}" == 1 ]] || { MISSING="$s"; return 1; }; done; return 0
+  }
+
+  # Chain id and sequencer head (blocks advance, or the sequencer's own idle counter does).
+  local bn1="" bn2="" idle1="" idle2="" ver1="" ver2="" head_ok=0
+  if needs sequencer; then
+    local cid
+    cid="$(rpc "$SEQUENCER_RPC" eth_chainId)"
+    if [[ -z "$cid" ]]; then fail "chain id" "SequencerUnreachable: no answer from $SEQUENCER_RPC"
+    elif [[ "$((cid))" == "$chain_id" ]]; then pass "chain id" "$((cid)) matches chain.toml"
+    else fail "chain id" "ChainIdMismatch: the sequencer reports $((cid)), chain.toml says $chain_id"; fi
+
+    bn1="$(rpc "$SEQUENCER_RPC" eth_blockNumber)"; idle1="$(metric "$METRICS_SEQUENCER" rome_zk_sequencer_idle_ticks_total)"
+    needs reth-verifier && ver1="$(rpc "$VERIFIER_RPC" eth_blockNumber)"
+    sleep "$sample"
+    bn2="$(rpc "$SEQUENCER_RPC" eth_blockNumber)"; idle2="$(metric "$METRICS_SEQUENCER" rome_zk_sequencer_idle_ticks_total)"
+    needs reth-verifier && ver2="$(rpc "$VERIFIER_RPC" eth_blockNumber)"
+    if [[ -z "$bn1" || -z "$bn2" ]]; then
+      fail "sequencer head" "SequencerUnreachable: eth_blockNumber gave no answer"
+    elif (( bn2 > bn1 )); then pass "sequencer head" "advancing, block $((bn1)) to $((bn2)) in ${sample}s"; head_ok=1
+    elif [[ -n "$idle1" && -n "$idle2" ]] && awk -v a="$idle1" -v b="$idle2" 'BEGIN{exit !(b>a)}'; then
+      pass "sequencer head" "idle at block $((bn2)): no transactions, but its idle counter rose ($idle1 to $idle2)"; head_ok=1
+    else fail "sequencer head" "SequencerStalled: block stayed at $((bn2)) for ${sample}s and the idle counter did not rise (${idle1:-no metric} to ${idle2:-no metric})"; fi
+  else
+    skip "chain id" "needs the sequencer, which is not running"
+    skip "sequencer head" "needs the sequencer, which is not running"
+  fi
+
+  # Solana side: the batch cursor and the root account, found through pdas.env (written by `rollup register`).
+  local next_batch="" head_final="" cursor_pda root_pda have_pdas=0 cursor_ok=0 root_ok=0
+  if [[ -f "$OUT/pdas.env" ]]; then
+    have_pdas=1; cursor_pda="$(rz_env_get "$OUT/pdas.env" CURSOR_PDA)"; root_pda="$(rz_env_get "$OUT/pdas.env" ROOT_PDA)"
+  fi
+  if (( have_pdas )); then
+    if next_batch="$(account_u64 "$cursor_pda" 13)" && [[ -n "$next_batch" ]]; then
+      cursor_ok=1; pass "batcher cursor" "next_batch=$next_batch (account $cursor_pda)"
+    else fail "batcher cursor" "CursorUnreadable: could not read the batch cursor account $cursor_pda from $SOLANA_RPC_URL (is the chain registered on this cluster?)"; fi
+  else
+    fail "batcher cursor" "PdasMissing: $OUT/pdas.env does not exist; run ./rollup register --confirm, which writes it"
+  fi
+
+  # Batcher backlog: an unposted block older than the close-after window plus a minute means the batcher is stuck.
+  local bound=$(( close_after + 60 )) oldest=""
+  if needs batcher; then
+    oldest="$(metric "$METRICS_BATCHER" rome_zk_batcher_oldest_unposted_block_age_seconds)"
+    if [[ -z "$oldest" ]]; then fail "batcher backlog" "BatcherUnreachable: no metrics from $METRICS_BATCHER"
+    elif awk -v v="$oldest" -v b="$bound" 'BEGIN{exit !(v<=b)}'; then pass "batcher backlog" "oldest unposted block is ${oldest}s old (bound ${bound}s)"
+    else fail "batcher backlog" "BatcherBehind: the oldest unposted block is ${oldest}s old (bound ${bound}s)"; fi
+  else
+    skip "batcher backlog" "needs the batcher, which is not running"
+  fi
+
+  # Inbox batches: next_batch - 1 batches are on Solana. None yet is fine until a block has waited too long.
+  if (( cursor_ok )) && needs batcher && [[ -n "$oldest" ]]; then
+    local posted=$(( next_batch - 1 ))
+    if (( posted > 0 )); then pass "inbox batches" "$posted posted (next_batch=$next_batch)"
+    elif awk -v v="$oldest" -v b="$bound" 'BEGIN{exit !(v<=b)}'; then pass "inbox batches" "0 posted yet, and no block has waited past ${bound}s"
+    else fail "inbox batches" "NoBatchPosted: nothing is on Solana and the oldest unposted block is ${oldest}s old"; fi
+  elif (( cursor_ok )); then skip "inbox batches" "needs the batcher, which is not running"
+  else skip "inbox batches" "needs the batch cursor, which could not be read"; fi
+
+  # Roots: the settlement account's last finalized batch.
+  if (( have_pdas )); then
+    if head_final="$(account_u64 "$root_pda" 186)" && [[ -n "$head_final" ]]; then
+      root_ok=1; pass "roots" "head_final_batch=$head_final (account $root_pda)"
+    else fail "roots" "RootUnreadable: could not read the root account $root_pda from $SOLANA_RPC_URL"; fi
+  else
+    skip "roots" "needs pdas.env (run ./rollup register --confirm)"
+  fi
+
+  # Settlement lag and prover lag only mean something with a prover.
+  if [[ "$prover" == on ]]; then
+    if (( cursor_ok && root_ok )); then
+      local lag=$(( next_batch - 1 - head_final ))
+      if (( lag <= 2 )); then pass "settlement lag" "lag=$lag batches (posted $((next_batch - 1)), finalized $head_final)"
+      else fail "settlement lag" "SettlementBehind: lag=$lag batches (posted $((next_batch - 1)), finalized $head_final, bound 2)"; fi
+    else skip "settlement lag" "needs the cursor and root accounts, which could not both be read"; fi
+    if needs prover; then
+      local behind secs
+      behind="$(metric "$METRICS_PROVER" rome_zk_prover_batches_behind)"; secs="$(metric "$METRICS_PROVER" rome_zk_prover_lag_seconds)"
+      if [[ -n "$behind" ]] && awk -v b="$behind" -v s="${secs:-0}" 'BEGIN{exit !(b<=2 && s<=600)}'; then
+        pass "prover lag" "batches_behind=$behind, oldest unproved batch ${secs:-0}s old"
+      else fail "prover lag" "ProverBehind: batches_behind=${behind:-no metric}, lag_seconds=${secs:-no metric} (bounds 2 batches, 600s)"; fi
+    else skip "prover lag" "needs the prover, which is not running"; fi
+  else
+    skip "settlement lag" "no prover configured (PROVER=on in .env turns it on)"
+    skip "prover lag" "no prover configured (PROVER=on in .env turns it on)"
+  fi
+
+  # Derive lag: the verifier node trails the sequencer by the batch still open and the one being posted. A gap of two
+  # batches' worth of blocks that is not closing is a derive that has stopped.
+  if needs sequencer reth-verifier derive; then
+    if [[ -z "$ver2" ]]; then fail "derive lag" "VerifierUnreachable: no answer from $VERIFIER_RPC"
+    elif [[ -z "$bn2" ]]; then skip "derive lag" "needs the sequencer's head, which could not be read"
+    else
+      local gap=$(( bn2 - ver2 )) limit=$(( 2 * bpb ))
+      if (( gap < limit )) || { [[ -n "$ver1" ]] && (( ver2 > ver1 )); }; then
+        pass "derive lag" "verifier at block $((ver2)), sequencer at $((bn2)) (gap $gap, limit $limit)"
+      else fail "derive lag" "DeriveBehind: verifier at block $((ver2)), sequencer at $((bn2)) (gap $gap, limit $limit) and the verifier did not advance"; fi
+    fi
+  else
+    needs sequencer reth-verifier derive || true
+    skip "derive lag" "needs $MISSING, which is not running"
+  fi
+
+  echo "== rollup check :: $( (( FAILED == 0 )) && echo ALL PASS || echo SOME FAILED ) =="
+  exit "$FAILED"
+}
+
+usage() { sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  init) cmd_init "$@" ;;
+  register) cmd_register "$@" ;;
+  up) cmd_up "$@" ;;
+  check) cmd_check "$@" ;;
+  -h|--help|help|"") usage ;;
+  *) echo "UnknownCommand: '$cmd'" >&2; usage >&2; exit 1 ;;
+esac

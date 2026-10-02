@@ -1,0 +1,17 @@
+[package]
+name = "rome-zk-metrics-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "minimal, reth-free HTTP/1.1 responder for a Prometheus /metrics endpoint — moved out of rome-zk-sequencer so rome-zk-batcher can serve one too without pulling in reth"
+
+[dependencies]
+tokio = { version = "1", features = ["net", "io-util", "rt"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,38 @@
+[package]
+name = "rome-zk-channel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "channel/frame stream codec: RLP(blocks) -> zstd -> frames, and the inverse, plus the shadow compressor"
+
+[dependencies]
+alloy-primitives = { version = "1", default-features = false, features = ["rlp"] }
+alloy-rlp = { version = "0.3", features = ["derive"] }
+# default-features = false: this crate only ever touches `frame::*`
+# (FRAME_HEADER_LEN/write_header/read), never a Pubkey, so it never needs layouts' `solana` feature —
+# and turning it off here is what lets `--no-default-features --features decode-pure` on THIS crate build
+# for the ZisK guest target (no `solana-program`, no `getrandom 0.1.16`).
+rome-zk-layouts = { path = "../rome-zk-layouts", default-features = false }
+zstd = { version = "0.13", optional = true }
+# Pure-Rust zstd decoder: the C `zstd` crate above cannot build for the ZisK guest target
+# (`riscv64ima-zisk-zkvm-elf` has no C toolchain wired into `cargo-zisk build`); `ruzstd` decodes the same RFC 8878
+# format in pure Rust so the guest can reassemble+decompress a channel stream without the C dependency. Default
+# features (`std`, `hash`) kept on — the guest target has std (zisk-eth-client's reth-linked guest already builds
+# there), so there is no no_std constraint to opt out of.
+ruzstd = { version = "0.9", optional = true }
+thiserror = "2"
+
+[features]
+# Default unchanged: the C zstd encoder+decoder, exactly as before this feature split (every
+# existing crate's default build stays the same). `encode_stream` only ever needs the C crate (no
+# guest ever encodes); `decode-pure` is additive, never a replacement for the default path.
+default = ["zstd-c"]
+zstd-c = ["dep:zstd"]
+decode-pure = ["dep:ruzstd"]
+
+[dev-dependencies]
+hex = "0.4"
+
+[lints]
+workspace = true

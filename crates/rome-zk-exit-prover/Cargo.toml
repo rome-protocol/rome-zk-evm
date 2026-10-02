@@ -1,0 +1,52 @@
+[package]
+name = "rome-zk-exit-prover"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Off-chain follower: watches the L2 exit portal for ExitInitiated, proves each against a FINAL batch's state_root via eth_getProof, verifies locally, sends ProveExit"
+
+[dependencies]
+rome-zk-mpt = { path = "../rome-zk-mpt" }
+rome-zk-layouts = { path = "../rome-zk-layouts" }
+zk-settlement-client = { path = "../zk-settlement-client" }
+rome-zk-solana-sender = { path = "../rome-zk-solana-sender" }
+rome-zk-metrics-http = { path = "../rome-zk-metrics-http" }
+solana-program.workspace = true
+solana-client.workspace = true
+solana-sdk.workspace = true
+solana-commitment-config.workspace = true
+# V1-generation, matching rome-zk-solana-sender: only what this crate needs directly (a throwaway
+# measurement keypair, plus the pinned Hash/wincode types the tx-size guard reads) — every conversion
+# still goes through that crate's own `compat` module, never a second boundary.
+solana-keypair.workspace = true
+solana-signer.workspace = true
+solana-hash.workspace = true
+solana-instruction-error.workspace = true
+solana-transaction-error.workspace = true
+wincode.workspace = true
+borsh = { version = "1.5.1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+toml = "0.8"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+prometheus = "0.14"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+hex = "0.4"
+anyhow = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+solana-signature = { workspace = true, features = ["rand"] }
+
+[[bin]]
+name = "rome-zk-exit-prover"
+path = "src/bin/rome-zk-exit-prover.rs"
+
+[lints]
+workspace = true

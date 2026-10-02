@@ -1,0 +1,27 @@
+# Your chain, in one file. Copy this to chain.toml and edit it; `./rollup init` renders every config from it.
+# Changing a value after the chain is live can change the genesis, and init refuses to overwrite a genesis that
+# differs from the one you already have.
+
+# There is no chain_id here and init refuses one. A permissionless chain id is derived by the settlement program from
+# your payer key and its registration count; `./rollup init` reads it from Solana and renders the genesis and every
+# config with it (see rendered/chain-id.env).
+
+[genesis]
+# The one funded account in the genesis (it receives 1e27 wei). Use an address you control. The zero address below is
+# a placeholder: init refuses it, and every other address from 0x00..00 to 0x00..ff, because those are precompiles
+# that nobody can spend from.
+funded_address = "0x0000000000000000000000000000000000000000"
+
+# The sequencer's settings. Every key must exist in crates/rome-zk-sequencer/config.example.toml; init refuses a
+# name it does not know. The genesis gas limit is sub_block_gas_limit x sub_blocks_per_block.
+[profile]
+sub_block_ms = 50
+sub_blocks_per_block = 20
+sub_block_gas_limit = 2_000_000
+blocks_per_batch = 60
+# 0 means the sequencer seals blocks only when there are transactions.
+empty_block_interval_secs = 0
+
+[batcher]
+# A partly filled batch is posted to Solana after this many seconds.
+batch_close_after_secs = 60

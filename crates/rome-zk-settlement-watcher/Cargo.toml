@@ -1,0 +1,46 @@
+[package]
+name = "rome-zk-settlement-watcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "settlement watcher: Solana signatures -> Postgres, finality tracking, read-time status"
+
+[dependencies]
+zk-inbox-client = { path = "../zk-inbox-client" }
+zk-settlement-client = { path = "../zk-settlement-client" }
+# Re-derives `message_hash()` off a decoded `ProveExit`'s `ExitMessageArg` (the single owner of
+# that arithmetic) -- this crate never re-implements it independently.
+rome-zk-layouts = { path = "../rome-zk-layouts" }
+solana-program.workspace = true
+solana-client.workspace = true
+solana-sdk.workspace = true
+solana-commitment-config.workspace = true
+solana-transaction-status-client-types.workspace = true
+borsh = { version = "1.5.1", features = ["derive"] }
+sqlx = { version = "0.8", default-features = false, features = [
+  "runtime-tokio-rustls",
+  "postgres",
+  "migrate",
+  "macros",
+] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bs58 = "0.5"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# The `exit_lifecycle.rs` test builds a real `ProveExit` instruction via `zk_settlement_client::
+# prove_exit_ix`, whose `proof` argument is this crate's type — never executed on-chain here, only
+# compiled into a `UiRawMessage` the way a real `getTransaction` result already carries it.
+rome-zk-mpt = { path = "../rome-zk-mpt" }
+
+[[bin]]
+name = "rome-zk-settlement-watcher"
+path = "src/bin/rome-zk-settlement-watcher.rs"
+
+[lints]
+workspace = true

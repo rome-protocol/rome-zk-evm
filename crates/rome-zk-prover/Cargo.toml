@@ -1,0 +1,122 @@
+[package]
+name = "rome-zk-prover"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/rome-protocol/rome-zk-evm"
+publish = false
+description = "prover orchestrator: config + vkey of record, the cargo-zisk subprocess Prover, and the ZisK calldata decoder"
+
+# Standalone workspace (see the root Cargo.toml's `exclude`): this crate path-depends on `rome-zk-prover-input`, which
+# pins alloy-consensus/alloy-genesis/alloy-rpc-types-debug/ alloy-eips exact to the zisk-eth-client fork's own
+# guest-rome versions (2.0.5) and is itself excluded from the root workspace for the same reason (its README: "conflicts
+# with rome-zk-batcher's `alloy = \"^2.4\"` in one shared lockfile — verified, the resolver refuses outright"). An empty
+# `[workspace]` table here stops cargo's upward directory walk from ever reattaching this crate to a workspace root
+# above rome-zk's own checkout (the same reason `rome-zk-prover-input/Cargo.toml` declares one).
+[workspace]
+
+[dependencies]
+rome-zk-prover-input = { path = "../rome-zk-prover-input" }
+zk-settlement-client = { path = "../zk-settlement-client" }
+# `cursor_pda`/`decode_batch_cursor`/`batch_pda`/`BatchAccount`/`decode_batch_account` — the anchor
+# module's own inbox-batch/cursor reads.
+zk-inbox-client = { path = "../zk-inbox-client" }
+rome-zk-layouts = { path = "../rome-zk-layouts" }
+veritas = { path = "../../programs/veritas", features = ["no-entrypoint"] }
+# Postgres job history: the same pattern `rome-zk-settlement-watcher` already uses for
+# `migrations/explorer` — copied for `migrations/prover` here (both crates' own `sqlx::migrate!`).
+sqlx = { version = "0.8", default-features = false, features = [
+  "runtime-tokio-rustls",
+  "postgres",
+  "migrate",
+  "macros",
+] }
+rome-zk-solana-sender = { path = "../rome-zk-solana-sender" }
+rome-zk-metrics-http = { path = "../rome-zk-metrics-http" }
+prometheus = "0.14"
+# Bumped from the 2.1.6 generation in lockstep with every path dependency above
+# (`zk-settlement-client`/`zk-inbox-client`/`rome-zk-solana-sender`, all in the main workspace, all now
+# the Agave 4.3.0-line) — this crate's own `Pubkey`/`Instruction` must be the identical type theirs is,
+# or every function signature exchanging one (e.g. `poster.rs`'s own `post_root_proved_ix` call) is a
+# real type mismatch, not merely a style choice. The anchor module's own FINALIZED read client is
+# distinct from the sender's CONFIRMED client — that ownership split is unaffected.
+solana-program = "=4.1.0"
+solana-client = "=4.3.0"
+solana-system-interface = { version = "=3.3.0", features = ["bincode"] }
+solana-sdk = "=4.1.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "signal"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+# The vkey-of-record file (`fixtures/vkeys/<chain>-layout1.json`) and the calldata a decoded proof
+# feeds to the poster are both JSON, not TOML; `hex` decodes their 0x-prefixed fields.
+serde_json = "1"
+hex = "0.4"
+sha2 = "0.10"
+thiserror = "2"
+tracing = "0.1"
+anyhow = "1"
+# `killpg` on `LocalCargoZisk`'s timeout path (kill the whole process group `cargo-zisk` leads, not
+# just its own pid, so a grandchild the tool forked can never hold the drain pipe open past a
+# timeout) — pinned to the version already resolving elsewhere in this crate's dependency tree.
+nix = { version = "=0.29.0", default-features = false, features = ["signal", "process"] }
+# V1-generation (SIMD-0385) — the CLI binary's own payer key, blockhash type, and (only for its own
+# read-only `--dry-run` simulateTransaction call) a V1-generation RPC client, matching
+# `rome-zk-solana-sender`'s exact pins (the sender crate owns SENDING; the CLI's simulate-only call is not a send, so it
+# is not routed through `Sender`).
+# Note: rome-zk-solana-sender (a path dependency below) moved to the Agave 4.3.0-line
+# crate set; `solana-hash`/`solana-client-v1` here are bumped in lockstep, and only as far as needed
+# — both are a real resolver conflict otherwise, since this is one shared
+# standalone Cargo.lock with that crate's own dependency graph (same major version, two different exact
+# pins is unconstructable for Cargo, not merely undesirable).
+solana-keypair = "=3.1.2"
+solana-hash = "=4.7.0"
+solana-signer = "=3.0.1"
+solana-commitment-config = "=3.1.1"
+# Now the identical version as the plain `solana-client` above (both bumped to 4.3.0
+# together) — Cargo refuses two dependency names resolving to the exact same crate+version ("depends on
+# crate solana-client multiple times with different names"), so the historical `solana_client_v1::`
+# import path in `src/bin/rome-zk-prover.rs` is a plain Rust `use solana_client as solana_client_v1;`
+# alias instead (that file), never a second Cargo dependency.
+# `solana-transaction = 4.3.0`'s own `wincode` feature requires `wincode ^0.6.0` —
+# bumped in lockstep (same reasoning as the main workspace's own `Cargo.toml` comment).
+wincode = "=0.6.2"
+
+[[bin]]
+name = "rome-zk-prover"
+path = "src/bin/rome-zk-prover.rs"
+
+[dev-dependencies]
+tempfile = "3"
+# The follower's own fake-chain test harness: encodes real chunk/channel bytes and a real
+# reth-verifier `Header`/`Block`/`ExecutionWitness` for `VerifierFetch`'s fake implementation — pinned to
+# EXACTLY `rome-zk-prover-input`'s own versions (its README/module docs: byte-for-byte type identity
+# matters here) so the same crate instances resolve in this workspace's own `Cargo.lock`.
+rome-zk-channel = { path = "../rome-zk-channel", default-features = false, features = ["zstd-c"] }
+rome-zk-merkle = { path = "../rome-zk-merkle" }
+alloy-consensus = { version = "=2.0.5", default-features = false }
+alloy-rpc-types-debug = "=2.0.5"
+reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v2.1.0", default-features = false }
+# Real-BPF integration tests (poster/finality against a genuine `zk_settlement.so`) — dev-dependency
+# only, module doc: `program_test`/`send_measuring_cu`/`root_account_with_authority`/`cursor_account`.
+rome-zk-testkit = { path = "../rome-zk-testkit" }
+# The poster's own V1-tx-size test measures via `rome_zk_solana_sender::build_v1_tx` (never a second,
+# hand-rolled V1 builder) — a throwaway signing key + the serializer, matching the sender crate's own
+# exact pins.
+# Bumped in lockstep with solana-hash/solana-client-v1 above — same major-version
+# conflict otherwise against rome-zk-solana-sender's own `solana-signature`.
+solana-signature = "=3.6.0"
+# Bumped in lockstep with the rest of this crate's now-4.x generation above —
+# `agave-unstable-api` is not optional, the entire crate's content is gated behind it (its own lib.rs
+# top, `#![cfg(feature = "agave-unstable-api")]`).
+solana-program-test = { version = "=4.3.0", features = ["agave-unstable-api"] }
+# Decodes the real `.bin` fixture's own `RomePublicInput` frame so the
+# follower's fake chain serves the SAME real reset-6 batch-1 chunk bytes for every synthetic batch —
+# pinned to `rome-zk-prover-input`'s own version (its README: byte-for-byte type identity matters here).
+bincode = { version = "2.0", default-features = false, features = ["serde", "std"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+  'cfg(target_os, values("solana"))',
+  'cfg(feature, values("custom-heap", "custom-panic", "frozen-abi", "no-entrypoint"))',
+] }

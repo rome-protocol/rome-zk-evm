@@ -1,0 +1,11 @@
+{
+  "chain_id": 1,
+  "cluster": "devnet",
+  "payer": "Fixturepayer11111111111111111111111111111112",
+  "programs": {
+    "zk-inbox": "FixtureAprogram11111111111111111111111111112",
+    "zk-settlement": "FixtureBprogram11111111111111111111111111112",
+    "veritas": "FixtureCprogram11111111111111111111111111112",
+    "zk-bridge": "FixtureDprogram11111111111111111111111111112"
+  }
+}

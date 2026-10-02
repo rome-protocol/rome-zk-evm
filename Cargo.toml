@@ -1,0 +1,114 @@
+[workspace]
+resolver = "2"
+members = ["programs/*", "crates/*"]
+# rome-zk-prover-input (host-only): pins alloy-consensus/alloy-genesis/alloy-rpc-types-debug/ alloy-eips EXACT to
+# the private zisk-eth-client fork's own guest-rome versions (2.0.5/1.6.0), so its bincode wire format stays
+# byte-compatible with what the guest reads. Sharing this workspace's one Cargo.lock is not possible:
+# rome-zk-batcher already needs `alloy = "^2.4"`, which conflicts with an exact 2.0.5 pin (verified: the resolver
+# refuses outright, not a style preference). Given its own workspace + Cargo.lock (like the fork's own bin/guests/*
+# ELF packages), built with `cd crates/rome-zk-prover-input && cargo test`, never `-p rome-zk-prover-input` from
+# here.
+#
+# rome-zk-prover-input-cross-repo-wire: the cross-repo wire proof against the private zisk-eth-client fork's own
+# guest-rome types — path-depends on a `.fork/` checkout (never committed, see .gitignore) and, like
+# rome-zk-prover-input, is its own workspace: guest-rome's `native-keccak` alloy-primitives feature would otherwise
+# unify across this whole workspace's one Cargo.lock and break every ordinary caller of
+# `alloy_primitives::keccak256` at LINK time (verified; see that crate's own Cargo.toml comment). Built with `cd
+# crates/rome-zk-prover-input-cross-repo-wire && cargo test`, or `./run.sh` in that directory (skips loud if
+# `.fork/` is not cloned).
+#
+# rome-zk-prover: path-depends on rome-zk-prover-input (lib), so it inherits that crate's alloy 2.0.5 exact pins and
+# cannot share this workspace's one Cargo.lock either (same conflict with rome-zk-batcher's `alloy = "^2.4"`). Own
+# `[workspace]`, own Cargo.lock, built with `cd crates/rome-zk-prover && cargo test --locked`, never `-p
+# rome-zk-prover` from here.
+exclude = [
+  "crates/rome-zk-prover-input",
+  "crates/rome-zk-prover-input-cross-repo-wire",
+  "crates/rome-zk-prover",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/rome-protocol/rome-zk-evm"
+
+# ---- the ONE Agave crate set ----------------------------------------------------------------------------
+# Public devnet (and the dev chain once redeployed) runs Agave 4.3.0; `solana-program-test`/`solana-client` no
+# longer share a single version number across the Agave crate graph (each component crate now releases
+# independently), so this set was assembled from `solana-program-test =4.3.0`'s and `solana-client =4.3.0`'s own
+# published dependency requirements (crates.io index), not a blanket `=4.3.0` sed (two earlier attempts at that
+# failed to resolve). Every version below is the HIGHEST stable release that still satisfies every one of those
+# requirements simultaneously (`solana-program@4.1.0` and `solana-sdk@4.1.0` are themselves the only stable 4.x
+# releases of those two crates; 5.0.0/5.1.0 are a line newer than program-test/client support). EVERY manifest in
+# this workspace inherits these via `<crate>.workspace = true` — never its own `version =` — so the set can only
+# ever be changed in this one place (that invariant is `scripts/check-workspace-deps.sh`, wired into CI's `fmt`
+# job).
+[workspace.dependencies]
+solana-program = "=4.1.0"
+solana-sdk = "=4.1.0"
+solana-client = "=4.3.0"
+# `agave-unstable-api` is not optional here: the ENTIRE crate's content is gated behind it
+# (`#![cfg(feature = "agave-unstable-api")]` at its own lib.rs top) — baked into this workspace-level declaration so
+# every `.workspace = true` consumer inherits it without repeating the feature list (Cargo unions a member's own
+# extra features onto the workspace entry's, never replaces).
+solana-program-test = { version = "=4.3.0", features = ["agave-unstable-api"] }
+solana-pubkey = "=4.4.0"
+solana-account = "=4.7.0"
+solana-hash = "=4.7.0"
+solana-keypair = "=3.1.2"
+solana-signer = "=3.0.1"
+solana-transaction-error = "=3.4.0"
+solana-message = "=4.6.0"
+solana-transaction = "=4.3.0"
+solana-signature = "=3.6.0"
+solana-instruction = "=3.5.1"
+solana-instruction-error = "=2.5.0"
+solana-commitment-config = "=3.1.1"
+solana-transaction-status-client-types = "=4.3.0"
+solana-account-decoder-client-types = "=4.3.0"
+# The System Program's instruction builders/program-id check (`create_account`/`transfer`/`allocate`/
+# `assign`, `id`/`check_id`) moved OUT of `solana_program::{system_instruction, system_program}`'s root
+# re-export between 2.1.6 and 4.1.0 — every call site now imports this crate's
+# `instruction`/`program` modules directly (most under a `use ... as system_instruction;` alias so the
+# call sites themselves need no rename).
+solana-system-interface = "=3.3.0"
+# `bpf_loader_upgradeable` (id/check_id + `get_program_data_address`) also moved out of
+# `solana_program`'s root re-export — split across these two crates upstream;
+# every call site keeps its old `bpf_loader_upgradeable::` path via a small local re-export module.
+solana-sdk-ids = "=3.1.0"
+solana-loader-v3-interface = "=7.0.0"
+# `solana-transaction = 4.3.0`'s own `wincode` feature (this V1 tx wire's own serialize/deserialize path)
+# requires `wincode ^0.6.0` — a different, newer major-minor line than this workspace's previous `=0.5.5`
+# (two crates implementing the SAME trait name at different wincode versions are genuinely different
+# Rust traits, `error[E0277]`/"multiple different versions of crate wincode" otherwise). Bumped in
+# lockstep.
+wincode = "=0.6.2"
+# `compute_budget::ComputeBudgetInstruction` also moved out of `solana_sdk`'s root re-export — now its own crate.
+solana-compute-budget-interface = "=3.1.0"
+# Standalone alt_bn128-syscall facade (programs/veritas) — not part of the solana-program-test/solana-client dependency graph above, so pinned
+# independently at its own latest stable line.
+solana-bn254 = "=3.2.1"
+
+# Solana programs: build with `cargo build-sbf --manifest-path programs/<p>/Cargo.toml`. The release profile is what
+# the CU measurements used: fat LTO + one codegen unit keep the SBF branch targets in range for the alt_bn128
+# verifier; overflow checks stay on in programs.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+overflow-checks = true
+
+# solana_program::entrypoint! emits cfgs the host compiler does not know; declare them once (standard Anza advice).
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+  'cfg(target_os, values("solana"))',
+  'cfg(feature, values("custom-heap", "custom-panic", "frozen-abi", "no-entrypoint"))',
+] }
+
+# Dependencies (reth, alloy, solana) dominate debug-build size and link time; line tables are enough for their
+# backtraces and cut the test binaries by several GB (CI disk space). Workspace crates keep full debug info.
+[profile.dev.package."*"]
+debug = "line-tables-only"
+[profile.test.package."*"]
+debug = "line-tables-only"

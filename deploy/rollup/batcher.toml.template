@@ -1,0 +1,33 @@
+# The batcher's config. `rollup init` fills the marked tokens from chain.toml, your .env and the programs
+# file, and writes the result to rendered/batcher.toml. Nothing here is a secret except possibly the Solana RPC URL
+# (some providers put an API key in it), so keep rendered/ out of version control.
+
+chain_id = __CHAIN_ID__
+inbox_program_id = "__INBOX_PROGRAM_ID__"
+settlement_program_id = "__SETTLEMENT_PROGRAM_ID__"
+
+# The ordered log the sequencer writes. The sequencer's data volume is mounted read-only here at the same path the
+# sequencer uses; the sequencer writes a profile.json beside the log when it creates it.
+log_dir = "/data/reth/log"
+
+max_frames_per_batch = 900
+in_flight = 800
+signature_status_batch_size = 256
+priority_fee_micro_lamports = 1000
+max_priority_fee_micro_lamports = 200_000
+compute_unit_limit = 200_000
+chunk_compute_unit_limit = 40_000
+loaded_accounts_data_size_limit = 262_144
+finalize_compute_unit_limit = 600_000
+confirm_timeout_secs = 60
+confirm_poll_interval_ms = 400
+# How many batches may be in flight to Solana at once.
+batches_in_flight = 2
+# A partly filled batch closes after this many seconds, counted on the batcher's own clock. Set in chain.toml.
+batch_close_after_secs = __BATCH_CLOSE_AFTER_SECS__
+# GET /metrics. The compose file publishes this on 127.0.0.1 only.
+metrics_addr = "0.0.0.0:9002"
+
+rpc_url = "__SOLANA_RPC_URL__"
+payer_key_path = "/run/rome-zk/payer.json"
+cluster = "__CLUSTER__"

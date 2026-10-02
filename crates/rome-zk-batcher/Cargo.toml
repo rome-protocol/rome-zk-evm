@@ -1,0 +1,119 @@
+[package]
+name = "rome-zk-batcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "channel/frame stream, shadow compressor, parallel seals, FinalizeBatch, TPU sender, re-derive-before-send"
+
+[dependencies]
+alloy-primitives = { version = "1", default-features = false, features = ["rlp"] }
+# The channel/frame stream codec (split out of the batcher/sequencer) — this crate re-exports it as
+# `channel` so every existing call site keeps compiling; `rome-zk-derive` depends on it directly to
+# decode the same bytes.
+rome-zk-channel = { path = "../rome-zk-channel" }
+# The Solana sender (split out of the batcher/sequencer) — this crate re-exports it as `sender` so every
+# existing call site keeps compiling; the prover orchestrator, the challenger and governance tooling are
+# its intended consumers, though today only this crate depends on it directly.
+rome-zk-solana-sender = { path = "../rome-zk-solana-sender" }
+# The ordered-log record format, sub-block header, segments, torn-tail recovery and tail-follow reader —
+# this crate depends on `rome-zk-log` directly now, the same crate the sequencer itself depends on, rather
+# than reaching them through the sequencer's `log`/`header` re-export.
+rome-zk-log = { path = "../rome-zk-log" }
+# Chain cadence/cap profile defaults, ProfileIdentity, profile.json read/write — the one
+# home every reader (sequencer, batcher, derive) shares; reth-free.
+rome-zk-profile = { path = "../rome-zk-profile" }
+zk-inbox-client = { path = "../zk-inbox-client", features = ["devnet-driver"] }
+# Root/registry account decoding for the binary's startup preflight — plain library use, no
+# `devnet-driver` feature (that pulls a Solana RPC client this crate already has its own copy of).
+zk-settlement-client = { path = "../zk-settlement-client" }
+rome-zk-merkle = { path = "../rome-zk-merkle" }
+rome-zk-layouts = { path = "../rome-zk-layouts" }
+# Agave crate set: every solana-* dependency inherits the ONE version pinned once
+# in the root workspace's [workspace.dependencies] — never its own literal
+# version here (scripts/check-workspace-deps.sh asserts this). This crate used to declare a SECOND,
+# differently-named `solana-client-v1`/`solana-transaction-status-client-types-v1` dependency (a Cargo
+# `package = "..."` rename) because it genuinely pointed at an older, semver-incompatible major version
+# of the same crate than the plain name below; now that the whole workspace is one Agave line, both
+# names would resolve to the identical package/version, which `workspace = true` + `package = "..."`
+# cannot express (Cargo looks the inherited entry up by the dependency's OWN key, not by `package`) — so
+# the historical `_v1` import paths this crate's tests still use are kept as a plain Rust `use ... as
+# solana_client_v1;` alias instead (`tests/devnet_probe.rs`), never a second Cargo dependency.
+solana-program.workspace = true
+solana-sdk-ids.workspace = true
+solana-loader-v3-interface.workspace = true
+solana-client.workspace = true
+solana-sdk.workspace = true
+solana-transaction-status-client-types = { workspace = true, features = ["agave-unstable-api"] }
+solana-message.workspace = true
+solana-transaction = { workspace = true, features = ["serde", "verify", "wincode"] }
+solana-keypair.workspace = true
+solana-signer.workspace = true
+# "rand" only for this crate's own tests (`Signature::new_unique()`, mirroring the pre-V1 sender tests).
+solana-signature = { workspace = true, features = ["rand"] }
+solana-hash.workspace = true
+solana-instruction.workspace = true
+solana-pubkey.workspace = true
+solana-commitment-config.workspace = true
+solana-transaction-error.workspace = true
+wincode.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+futures-util = "0.3"
+prometheus = "0.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.8"
+# CLI parsing for the `rome-zk-batcher` binary — same crate/version the sequencer's own binary uses.
+clap = { version = "4", features = ["derive"] }
+# The reth-free /metrics HTTP responder — the same one rome-zk-sequencer serves — lives in its
+# own crate so this one can reuse it without pulling reth in; adds tokio's `net`/`io-util`
+# features to the build (this crate's own tokio feature list above stays unchanged).
+rome-zk-metrics-http = { path = "../rome-zk-metrics-http" }
+
+[dev-dependencies]
+# This crate's production dependency on `rome-zk-sequencer` is dropped — the ordered
+# log, sub-block header, and chain-profile defaults are all read straight from their own owning crates
+# (`rome-zk-log`, `rome-zk-profile`) now. What is left is genuinely test-only: sealing a real
+# `SealerState` end to end for the cross-crate tests below (`ResumePoint`, `preconf`'s `ChannelSink`,
+# `signing::sign_header`, `testutil::signed_raw_tx`, `executor::MockExecutor`) — fixtures this crate has
+# no reason to reimplement when the real sealer already exists. Default features off: the sequencer's
+# `reth` feature (default-on there) pulls the whole reth dependency graph, which none of the above needs.
+rome-zk-sequencer = { path = "../rome-zk-sequencer", default-features = false }
+# `tests/pipeline.rs`'s own compression-ratio measurement encodes a block list directly to compare
+# against the channel codec's output size — the only place left in this crate that touches RLP once
+# `channel.rs`'s encoder moved into `rome-zk-channel` (split out of the batcher/sequencer).
+alloy-rlp = { version = "0.3", features = ["derive"] }
+# Cross-crate check: `rome-zk-derive`'s `batch_queue::decode_batch` is what a real
+# derivation node runs against every batch this crate's grouping produces — proving it accepts every
+# shape `grouping::group_by_blocks_per_batch` emits is a dev-only edge back onto a crate that (normally)
+# depends on this one; Cargo explicitly allows a dev-dependency cycle (never an ordinary one) since dev-
+# dependencies never build when `rome-zk-derive` itself compiles this crate as a normal dependency.
+rome-zk-derive = { path = "../rome-zk-derive" }
+rome-zk-testkit = { path = "../rome-zk-testkit" }
+tempfile = "3"
+# `with_retry`'s own tests drive its exponential backoff under a
+# paused virtual clock (`#[tokio::test(start_paused = true)]`) instead of real multi-second sleeps.
+tokio = { version = "1", features = ["test-util"] }
+solana-program-test.workspace = true
+zk-inbox = { path = "../../programs/zk-inbox", features = ["no-entrypoint"] }
+borsh = { version = "1.5.1", features = ["derive"] }
+alloy = { version = "2.4", default-features = false, features = ["consensus", "eips", "rlp", "signer-local", "k256", "rand"] }
+hex = "0.4"
+# `finalize_and_verify`'s tests plug a scripted `solana_client::rpc_sender::RpcSender` straight into a
+# real `RpcClient` (`RpcClient::new_sender`) — `solana-program-test`'s `BanksClient` has no
+# `RpcClient`-compatible transport (see `tests/pipeline.rs`'s module doc), so this is the only way to
+# drive `finalize_and_verify` itself (not just its inner pure helpers) against scripted account reads.
+async-trait = "0.1"
+bs58 = "0.5"
+# `tests/finalize_cu_limit.rs`'s own legacy->V1 `TransactionError` test bridge (both generations are one
+# Agave line now; see the production-deps comment above).
+solana-instruction-error.workspace = true
+solana-compute-budget-interface.workspace = true
+solana-system-interface = { workspace = true, features = ["bincode"] }
+
+[lints]
+workspace = true

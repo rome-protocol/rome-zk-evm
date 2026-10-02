@@ -1,0 +1,55 @@
+[package]
+name = "zk-settlement"
+version = "0.1.0"
+edition = "2021"
+publish = false
+# The settlement program: registers chains, accepts posted batch roots (proved or unproved), tracks finality,
+# and exposes `RootView`, which only ever returns a final root. See README.md.
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+no-entrypoint = []
+default = []
+
+[dependencies]
+borsh = { version = "1.5.1", features = ["derive"] }
+solana-program.workspace = true
+solana-system-interface = { workspace = true, features = ["bincode"] }
+solana-sdk-ids.workspace = true
+solana-loader-v3-interface.workspace = true
+veritas = { path = "../veritas", default-features = false, features = ["no-entrypoint"] }
+rome-zk-layouts = { path = "../../crates/rome-zk-layouts" }
+rome-zk-merkle = { path = "../../crates/rome-zk-merkle" }
+rome-zk-pda = { path = "../../crates/rome-zk-pda" }
+rome-zk-mpt = { path = "../../crates/rome-zk-mpt" }
+
+[dev-dependencies]
+alloy-consensus = { version = "2", default-features = false, features = ["std"] }
+alloy-primitives = { version = "1", default-features = false, features = ["std"] }
+alloy-rlp = "0.3"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+solana-program-test.workspace = true
+solana-sdk.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+zk-inbox = { path = "../zk-inbox", features = ["no-entrypoint"] }
+zk-inbox-client = { path = "../../crates/zk-inbox-client" }
+zk-settlement-client = { path = "../../crates/zk-settlement-client" }
+rome-zk-testkit = { path = "../../crates/rome-zk-testkit" }
+# The tx-size gate: builds the real V1 (SIMD-0385) wire shape for `ProposeExitConfig`/
+# `ActivateExitConfig` the same way a real sender would (`rome_zk_solana_sender::compat`), never a
+# legacy/program-test `Transaction` — pins match `rome-zk-solana-sender`'s own
+# Cargo.toml exactly (the sender crate owns these versions).
+rome-zk-solana-sender = { path = "../../crates/rome-zk-solana-sender" }
+solana-keypair.workspace = true
+solana-hash.workspace = true
+solana-message.workspace = true
+solana-signer.workspace = true
+solana-transaction = { workspace = true, features = ["serde", "verify", "wincode"] }
+wincode.workspace = true
+
+[lints]
+workspace = true

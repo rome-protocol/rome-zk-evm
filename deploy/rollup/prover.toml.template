@@ -1,0 +1,20 @@
+# The prover's config, rendered only when PROVER=on. `rollup init` fills the marked tokens.
+
+chain_id = __CHAIN_ID__
+inbox_program_id = "__INBOX_PROGRAM_ID__"
+settlement_program_id = "__SETTLEMENT_PROGRAM_ID__"
+solana_rpc_url = "__SOLANA_RPC_URL__"
+# The verifier node on the compose network (loopback-only on the host).
+verifier_rpc_url = "http://reth-verifier:8547"
+genesis_path = "/data/genesis.json"
+# The guest binary you built, named by the hash recorded in your verification-key file.
+elf_path = "/data/elf/__ELF_SHA256__.elf"
+vkey_json = "/data/vkey.json"
+zisk_home = "/opt/zisk"
+gpu = true
+work_dir = "/data/work"
+payer_key_path = "/run/rome-zk/payer.json"
+# GET /metrics. The compose file publishes this on 127.0.0.1 only.
+metrics_addr = "0.0.0.0:9004"
+# Proof history lives in the local database container.
+database_url = "__DATABASE_URL__"

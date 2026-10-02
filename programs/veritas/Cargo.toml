@@ -1,0 +1,26 @@
+[package]
+name = "veritas"
+description = "Veritas: Rome's verifier for ZisK's PLONK proofs on Solana. See README.md."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = []
+no-entrypoint = []
+
+[dependencies]
+solana-program.workspace = true
+solana-bn254.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+solana-program-test.workspace = true
+solana-sdk.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

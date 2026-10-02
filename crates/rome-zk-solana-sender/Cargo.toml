@@ -1,0 +1,71 @@
+[package]
+name = "rome-zk-solana-sender"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Solana RPC send/confirm: V1 transaction build, in-flight bound, status batching, block-height resubmit, retry counter"
+
+[dependencies]
+# Agave crate set: every solana-* dependency inherits the ONE version pinned once
+# in the root workspace's [workspace.dependencies] — never its own literal
+# version here (scripts/check-workspace-deps.sh asserts this). `compat` is this crate's conversion
+# boundary between `zk-inbox-client`/`zk-settlement-client`'s own `solana_program`-typed instruction
+# builders and the V1 wire types actually placed on the wire (see the module doc) — both are now the same
+# Agave line, so the boundary is a naming/ownership seam, not a cross-major-version bridge any more.
+solana-program.workspace = true
+solana-sdk.workspace = true
+# V1 generation (SIMD-0385) — the crate generation with `VersionedMessage::V1`, used to
+# compile, sign and send the transaction actually placed on the wire.
+solana-message.workspace = true
+solana-transaction = { workspace = true, features = ["serde", "verify", "wincode"] }
+solana-keypair.workspace = true
+solana-signer.workspace = true
+solana-signature = { workspace = true, features = ["rand"] }
+solana-hash.workspace = true
+solana-instruction.workspace = true
+# `InstructionError` — `TransactionError::InstructionError`'s own second field type, re-exported by
+# `sender_error_transaction_error`'s own callers so they can match on it without a
+# second, independently-pinned dependency.
+solana-instruction-error.workspace = true
+solana-pubkey.workspace = true
+solana-commitment-config.workspace = true
+solana-transaction-error.workspace = true
+wincode.workspace = true
+# Pre-bump, `solana-client-v1`/`solana-transaction-status-client-types-v1` were a Cargo
+# `package = "..."` rename onto a genuinely different, newer major version than this crate's own
+# `solana-program`/`solana-sdk` generation above. The whole workspace is now one Agave line, so both
+# names would resolve to the identical package/version — which `workspace = true` + `package = "..."`
+# cannot express (Cargo looks an inherited entry up by the dependency's own key, not by `package`).
+# `src/lib.rs` keeps the historical `solana_client_v1`/`solana_transaction_status_client_types_v1` import
+# paths as plain Rust `use ... as ...;` aliases instead of a second Cargo dependency.
+solana-client.workspace = true
+solana-transaction-status-client-types = { workspace = true, features = [
+  "agave-unstable-api",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+futures-util = "0.3"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+
+[dev-dependencies]
+serde_json = "1"
+tokio = { version = "1", features = ["test-util"] }
+# `system_instruction::transfer`/`system_program::id` are this crate's own
+# tests' only use of the System Program — no longer re-exported from `solana_program`'s root in the
+# Agave 4.x line (API fallout).
+solana-system-interface = { workspace = true, features = ["bincode"] }
+# Two of this crate's own tests build a real `FramePlan` through the real production path
+# (`pipeline::plan_chunk`) rather than a hand-rolled one, and size a fixture frame body against the real
+# codec constants — both a legitimate dev-only edge back onto a crate that (normally) depends on this one;
+# Cargo allows a dev-dependency cycle (never an ordinary one) since dev-dependencies never build when
+# `rome-zk-batcher` itself compiles this crate as a normal dependency.
+rome-zk-batcher = { path = "../rome-zk-batcher" }
+rome-zk-channel = { path = "../rome-zk-channel" }
+# Plain library use (instruction builders only, no RPC client) — same real instruction shapes the batcher
+# itself sends, for tests that build a genuine chunk-lane `FramePlan`.
+zk-inbox-client = { path = "../zk-inbox-client" }
+
+[lints]
+workspace = true

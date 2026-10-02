@@ -1,0 +1,32 @@
+[package]
+name = "rome-zk-prover-input-cross-repo-wire"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Proves rome-zk-prover-input's wire::RomePublicInput/RomeWitnessInput encode with rome-zk-prover-input and decode with the fork's own guest_rome::input types byte for byte, and the reverse. Path-depends on the fork checkout at ../../.fork (rome-protocol/zisk-eth-client, branch rome-guest) — see this crate's README."
+
+# Standalone workspace, its own Cargo.lock, excluded from both the rome-zk root workspace (root
+# Cargo.toml's exclude list) and rome-zk-prover-input's own standalone one: this crate's dependency on
+# guest-rome (via the fork) pulls in alloy-primitives with the `native-keccak` feature,
+# and Cargo unifies that feature across every crate sharing one Cargo.lock's resolution of
+# alloy-primitives — including rome-zk-prover-input's own `header_hash` (a normal, non-ZisK function that
+# calls plain `alloy_primitives::keccak256`), which would then need a `native_keccak256` symbol on a
+# native host (`ziskos` itself supplies one — see src/lib.rs's module doc). Isolating this
+# proof in its own workspace keeps that poisoning contained to this one crate and leaves
+# rome-zk-prover-input's own `cargo test --locked` untouched.
+[workspace]
+
+[dependencies]
+# The wire types under test — rome-zk-prover-input's own encode side.
+rome-zk-prover-input = { path = "../rome-zk-prover-input" }
+# The fork's own decode side (rome-protocol/zisk-eth-client, branch rome-guest) — a path dependency into
+# a checkout expected at `.fork/` under the rome-zk repo root (this crate's own README + rome-zk-prover-
+# input's README document the exact clone command). NOT git: this fork's own CI has no established
+# credentials for the (also private) rome-zk repo, the same reason rome-zk-prover-input's own wire.rs is a
+# copy rather than a cross-repo dependency in the other direction.
+guest-rome = { path = "../../.fork/crates/clients/rome/guest" }
+bincode = { version = "2.0", default-features = false, features = ["serde", "std"] }
+# Same exact versions rome-zk-prover-input/guest-rome both pin (see rome-zk-prover-input/Cargo.toml's own
+# comment) — needed directly (not just transitively) because the test module below names these paths.
+alloy-consensus = { version = "=2.0.5", default-features = false }
+alloy-rpc-types-debug = "=2.0.5"

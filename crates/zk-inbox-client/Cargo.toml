@@ -1,0 +1,79 @@
+[package]
+name = "zk-inbox-client"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+# Thin, async-runtime-agnostic client for programs/zk-inbox: instruction builders, PDA derivation, account
+# decoding, and an off-chain reference implementation of the accumulator's commitment (for verifying the
+# on-chain `acc` independently). No async runtime opinions — the batcher and the devnet example
+# (examples/devnet_driver.rs, feature "devnet-driver") each bring their own.
+
+[dependencies]
+borsh = { version = "1.5.1", features = ["derive"] }
+solana-program.workspace = true
+solana-system-interface = { workspace = true, features = ["bincode"] }
+zk-inbox = { path = "../../programs/zk-inbox", features = ["no-entrypoint"] }
+rome-zk-merkle = { path = "../rome-zk-merkle" }
+rome-zk-layouts = { path = "../rome-zk-layouts" }
+thiserror = "1"
+
+[features]
+# Pulls in a Solana RPC client + Tokio for the devnet example binary; off by default so plain library
+# consumers (the batcher, program tests) never need an async runtime transitively.
+devnet-driver = [
+  "dep:solana-client",
+  "dep:solana-sdk",
+  "dep:solana-commitment-config",
+  "dep:solana-transaction-status-client-types",
+  "dep:solana-account-decoder-client-types",
+  "dep:tokio",
+]
+
+[dependencies.solana-client]
+workspace = true
+optional = true
+
+[dependencies.solana-sdk]
+workspace = true
+optional = true
+
+[dependencies.solana-commitment-config]
+workspace = true
+optional = true
+
+[dependencies.solana-transaction-status-client-types]
+workspace = true
+optional = true
+
+[dependencies.solana-account-decoder-client-types]
+workspace = true
+optional = true
+
+[dependencies.tokio]
+version = "1"
+features = ["macros", "rt-multi-thread"]
+optional = true
+
+[[example]]
+name = "devnet_driver"
+required-features = ["devnet-driver"]
+
+[[example]]
+name = "find_max_batch_id"
+required-features = ["devnet-driver"]
+
+# This stanza was missing (found while building `-p zk-inbox-client` in isolation):
+# `examples/init_cursor.rs` uses `solana_client`/`solana_sdk`/`tokio` (its own doc comment already says
+# `cargo run --features devnet-driver --example init_cursor`) but without this, cargo builds it as an
+# implicit example target unconditionally. A workspace-wide build never noticed — rome-zk-batcher depends
+# on this crate with `features = ["devnet-driver"]`, so feature unification kept it green — but
+# `cargo test -p zk-inbox-client` alone (no other workspace member pulling the feature in) fails to
+# compile the example. Same pattern as the two examples above; no behaviour change.
+[[example]]
+name = "init_cursor"
+required-features = ["devnet-driver"]
+
+[lints]
+workspace = true

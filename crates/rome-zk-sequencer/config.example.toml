@@ -1,0 +1,104 @@
+# rome-zk-sequencer example config.
+#
+# Every field below is read by `Config::load` (src/config.rs) and covered by
+# `config::tests::example_config_parses_with_every_documented_knob`, which parses this exact file — keep
+# the two in sync. The [profile], [admission] and [rpc] tables are all optional in the TOML (each falls
+# back to its own `Default` if the table or field is omitted); they are spelled out here so every knob
+# this crate exposes is documented in one place, not just in doc comments.
+#
+# The signing key itself is never in this file (or anywhere in the repo) — only a path to it, resolved at
+# startup. Env overrides (ROME_ZK_SEQUENCER_CHAIN_ID, _RPC_ADDR, _METRICS_ADDR, _LOG_DIR, _KEY_PATH,
+# _SUB_BLOCK_GAS_LIMIT) apply on top of whatever this file sets.
+
+chain_id = 200101
+rpc_addr = "127.0.0.1:9944"
+metrics_addr = "127.0.0.1:9945"
+log_dir = "/var/lib/rome-zk-sequencer/log"
+sequencer_key_path = "/etc/rome-zk-sequencer/sequencer.key"
+
+# Sub-blocks per segment file in the ordered log. Optional — defaults to 1000.
+blocks_per_segment = 1000
+
+# The chain's cadence + cap, declared and validated together in one place (see
+# `crate::profile::Profile`). Every field is optional and defaults to the design's own values (see
+# `Profile::default`) — shown here explicitly so every knob is discoverable. `Config::load` rejects a
+# profile whose implied gas/s exceeds `prover_gas_per_sec` or whose implied DA rate exceeds
+# `da_bytes_per_sec`, naming the bound in the error.
+[profile]
+# Sub-block signing period, ms (every 50 ms).
+sub_block_ms = 50
+# Sub-blocks per EVM block (20 sub-blocks per block). sub_block_ms x sub_blocks_per_block
+# MUST be a whole number of seconds — EVM timestamps are integer seconds.
+sub_blocks_per_block = 20
+# EVM blocks per batch = one root post every 60 s at the defaults above.
+# Tiber raises this from the crate default (10, rome-zk-profile::DEFAULT_BLOCKS_PER_BATCH, unchanged) to
+# 60, so an idle chain posts 6x fewer batches — this is a per-profile knob, not a crate-default change.
+# The operator's deploy config (derive's config template and the env example) must be kept equal to this
+# value (derive does not read this file; the batcher reads it via the sequencer's persisted profile.json).
+blocks_per_batch = 60
+# Per-sub-block gas budget handed to the executor. `always` (this chain's actual
+# provisioning point) is sized to 40,000,000 gas/s, not the 100,000,000 gas/s executor ceiling
+# `DEFAULT_SUB_BLOCK_GAS_LIMIT` documents in code — 2,000,000 sub-block gas x 20 sub-blocks/s = 40M
+# gas/s. Also overridable at runtime via ROME_ZK_SEQUENCER_SUB_BLOCK_GAS_LIMIT.
+sub_block_gas_limit = 2000000
+# Percentage of the executor cap the sequencer sustains before shedding admission.
+admission_shed_pct = 70
+# Declared DA throughput budget, bytes/s — the profile above (40M gas/s) implies 140,952 B/s
+# (floor(40,000,000 x 74 / 21,000)) via the measured 74 B / 21,000-gas ratio; this
+# budget must cover that.
+da_bytes_per_sec = 140952
+# Declared prover throughput budget, gas/s — must cover the profile's own implied gas/s (40,000,000
+# above: `always` sized to ~2,000 transfers/s, not the 100M gas/s executor
+# ceiling). Raising sub_block_gas_limit or shortening sub_block_ms without raising this is rejected at
+# load, naming the bound ("1G gas/s is not a knob" without a matching budget raise).
+prover_gas_per_sec = 40000000
+
+# This chain's own block gas limit, published into every block's BlockEnv
+# and held steady per block — independent of the [reth] genesis's own (generous) gasLimit ceiling.
+# Optional — omitted here, so it derives as sub_block_gas_limit x sub_blocks_per_block (40,000,000); an
+# explicit value that disagrees with that product is rejected at load.
+# block_gas_limit = 40000000
+# 0 (Tiber's own default) = never seal a block with no transactions — an idle chain
+# writes nothing to the log and calls the executor for nothing (no block, no batch, no proof). N = seal
+# an empty block at most every N seconds, for a chain that wants a regular timestamp even while idle;
+# must be 0 or >= this profile's own block time (1s above), named at load otherwise. On a brand-new chain
+# (no log yet) a nonzero N seals empty block 1 on the first tick; a restart measures N from the last block.
+empty_block_interval_secs = 0
+
+[admission]
+# Bounded admission queue (adopted from Nitro's DefaultSequencerConfig).
+queue_capacity = 1024
+queue_timeout_secs = 12
+park_expiry_secs = 30
+max_tx_size = 131072
+# The most nonce-gap ("parked") txs a single sender may hold at once, so
+# one sender submitting nothing but gap txs cannot fill the whole bounded queue by itself.
+max_parked_per_sender = 16
+# Bounds the per-sender next-nonce LRU cache so an unbounded stream of
+# distinct senders cannot grow it forever — an evicted sender simply reseeds from the executor.
+max_next_nonce_entries = 100000
+
+[rpc]
+# RPC hardening — jsonrpsee's own defaults are sized for a handful of
+# long-lived clients, far below what a sequencer with many independent senders needs.
+max_request_body_size = 1048576
+max_connections = 10000
+max_subscriptions_per_connection = 8
+
+# Only read when the binary is started with `--executor reth`. Datadir holds
+# RethExecutor's real MDBX store (chain state, blocks, receipts — see rome-zk-executor-reth's module
+# doc); genesis_path is a genesis.json shaped like the operator's deploy genesis template
+# (chain 200101, Prague at 0).
+#
+# `--executor reth` ALWAYS serves the in-process reth node's own
+# eth_*/net/web3/debug/trace/ots RPC (`node::serve`) — this crate's own rpc_addr JSON-RPC server
+# (`rpc::serve`) is the mock executor's path only now. http_addr/ws_addr below are each independently
+# optional: set (as here) for Tiber's two-port shape (8545 http / 8546 ws, matching the stock `reth`
+# container this replaces); omit either or both to fall back to the top-level rpc_addr instead — both
+# omitted serves everything (eth_*, rome_*, the preconf feed) on that ONE socket. See
+# config::RethSettings::resolved_rpc_addrs's doc.
+[reth]
+datadir = "/var/lib/rome-zk-sequencer/reth"
+genesis_path = "/etc/rome-zk-sequencer/genesis.json"
+http_addr = "0.0.0.0:8545"
+ws_addr = "0.0.0.0:8546"

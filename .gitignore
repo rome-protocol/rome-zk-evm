@@ -1,0 +1,8 @@
+target/
+*.so
+.env
+keys/
+
+# The private zisk-eth-client fork checkout (branch rome-guest) that the cross-repo wire-proof test and the
+# real ziskemu run clone — a sibling repo, never committed into rome-zk.
+.fork/

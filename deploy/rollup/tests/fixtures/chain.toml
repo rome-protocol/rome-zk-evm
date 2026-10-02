@@ -1,0 +1,15 @@
+# Test fixture: values deliberately differ from every default so a render that ignores chain.toml fails.
+# No chain_id: init reads the derived one from Solana (the tests stub that call).
+
+[genesis]
+funded_address = "0x1111111111111111111111111111111111111111"
+
+[profile]
+sub_block_ms = 40
+sub_blocks_per_block = 10
+sub_block_gas_limit = 3_000_000
+blocks_per_batch = 30
+empty_block_interval_secs = 5
+
+[batcher]
+batch_close_after_secs = 45

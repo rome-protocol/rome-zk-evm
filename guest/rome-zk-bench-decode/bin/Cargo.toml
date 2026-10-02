@@ -1,0 +1,32 @@
+[package]
+name = "rome-zk-bench-decode"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Measurement guest: ZisK entrypoint over rome-zk-bench-decode-lib. Not the production guest."
+
+# The ZisK entrypoint expands to a native `main` that opens build/input.bin; it must never run under the
+# libtest harness (`cargo test` at the workspace root aborted with SIGABRT before the lib tests ran).
+[[bin]]
+name = "rome-zk-bench-decode"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+rome-zk-bench-decode-lib = { path = "../lib", default-features = false }
+# ziskos::io::read/commit do their own bincode encode/decode internally (bincode 2.x, serde compat) — this
+# crate never calls bincode directly.
+ziskos = "1.2.0-alpha"
+
+# Stage features pass straight through to the lib crate — `cargo-zisk build --release [--no-default-features] [--features stage_ruzstd[,stage_rlp]]`
+# selects which stages this ELF measures: no features = keccak+merkle+acc only;
+# +stage_ruzstd = + reassemble/ruzstd decompress; +stage_rlp (implies stage_ruzstd) = the full pipeline,
+# which is also this crate's own default (so a plain `cargo-zisk build --release` builds the real guest).
+[features]
+default = ["stage_ruzstd", "stage_rlp"]
+stage_ruzstd = ["rome-zk-bench-decode-lib/stage_ruzstd"]
+stage_rlp = ["rome-zk-bench-decode-lib/stage_rlp"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_vendor, values("zisk"))'] }

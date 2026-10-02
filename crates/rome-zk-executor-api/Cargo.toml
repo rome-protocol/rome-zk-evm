@@ -1,0 +1,14 @@
+[package]
+name = "rome-zk-executor-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "The Executor trait, factored out of rome-zk-sequencer so an implementation crate (rome-zk-executor-reth) can depend on the trait without a rome-zk-sequencer <-> rome-zk-executor-reth cycle. Re-exported at rome_zk_sequencer::executor — not a new public surface."
+
+[dependencies]
+alloy-primitives = { version = "1.6", default-features = false, features = ["std"] }
+thiserror = "2"
+
+[lints]
+workspace = true

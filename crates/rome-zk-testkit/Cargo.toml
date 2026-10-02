@@ -1,0 +1,20 @@
+[package]
+name = "rome-zk-testkit"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+# Shared solana-program-test fixtures live in rome-zk-testkit — dev-dependency ONLY.
+# Never a dependency of a program or a shipped binary; every
+# program's and crate's own `[dev-dependencies]` picks this up for its `tests/` integration suites.
+
+[dependencies]
+rome-zk-layouts = { path = "../rome-zk-layouts" }
+solana-program.workspace = true
+solana-system-interface = { workspace = true, features = ["bincode"] }
+solana-program-test.workspace = true
+solana-sdk.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,13 @@
+Rome ZK EVM
+Copyright 2026 Rome Protocol
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It depends on open-source libraries under their own licences. Most are Apache-2.0 or MIT. Two are under the
+Mozilla Public License 2.0 (MPL-2.0), a file-level licence: the source files of these libraries stay under
+MPL-2.0 and are used here unmodified, as ordinary dependencies.
+
+  fastrlp   MPL-2.0
+  imbl      MPL-2.0
+
+The licence of every dependency is recorded in its own package metadata and in the Cargo.lock of this repository.

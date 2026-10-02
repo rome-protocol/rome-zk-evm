@@ -1,0 +1,29 @@
+[package]
+name = "rome-zk-mpt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+# Bounded Ethereum Merkle-Patricia proof verifier: an exit proof is an MPT proof of the L2 exit portal's account
+# (against the proof-bound `state_root`) and of `sentMessages[message_hash]` in that account's storage trie —
+# `verify_account`/`verify_storage` below, hashing exclusively through `rome-zk-merkle::keccak256` (the workspace's
+# one keccak owner — this crate never links its own sha3/keccak). No `solana-program` dependency: unlike
+# `rome-zk-layouts`, this crate needs no `Pubkey` (it takes and returns only raw byte arrays), so it carries no
+# `solana` feature gate at all — the same code builds for host, SBF (`cargo build-sbf`, via `rome-zk-merkle`'s
+# `target_os = "solana"` syscall dispatch) and a future zkVM guest target unconditionally.
+#
+# RLP: this crate's own small bounded decoder (`src/rlp.rs`), not `alloy-rlp` — see that module's doc for
+# the reasoning (bound-first design over a general-purpose library plus after-the-fact bounds).
+
+[dependencies]
+rome-zk-merkle = { path = "../rome-zk-merkle" }
+borsh = { version = "1.5.1", features = ["derive"] }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+
+[lints]
+workspace = true

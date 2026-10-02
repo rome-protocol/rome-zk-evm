@@ -1,0 +1,47 @@
+[package]
+name = "zk-bridge"
+version = "0.1.0"
+edition = "2021"
+publish = false
+# The SPL vault that releases a proved settlement exit to `record.sol_recipient`, CPI-ing `zk-settlement`'s
+# `ConsumeExit` under the `["exit_consumer", chain_id]` PDA it signs as its own program identity. The zk
+# lane's first spl-token CPI.
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+no-entrypoint = []
+default = []
+
+[dependencies]
+borsh = { version = "1.5.1", features = ["derive"] }
+solana-program.workspace = true
+solana-system-interface = { workspace = true, features = ["bincode"] }
+# NO `spl-token`/`spl-token-interface`/`spl-associated-token-account-interface` Cargo dependency.
+# Before the workspace moved to `solana-program = "=4.1.0"` it sat on `"=2.1.6"`, and the SPL crates of that day
+# needed a newer `solana-pubkey`/`solana-instruction`, which put two different `Pubkey` types in one
+# `Cargo.lock` — hence `src/token.rs` hand-rolling the small, stable SPL Token wire format (the same kind
+# of fixed-layout encoding `rome_zk_layouts` already hand-rolls for every other account this workspace
+# reads). On `solana-program = "=4.1.0"` that no longer holds: `spl-token` 9.0.0, `spl-token-interface`
+# 3.0.0, `spl-associated-token-account` 8.0.0 and `spl-associated-token-account-interface` 2.0.0 all
+# resolve onto the one `solana-program` 4.1.0 and take its `Pubkey` and `Instruction` directly (checked with
+# a throwaway crate seeded from the workspace `Cargo.lock`). Whether to replace `src/token.rs` with them
+# is a separate decision that has not been taken; the hand-rolled wire stays until someone decides it.
+# **The real, deployed `TokenkegQ…`/`ATokenGP…` `.so` this workspace's tests CPI is still the genuine
+# program** — built straight from the pinned `spl-token = "=9.0.0"` crate's own source (see
+# `programs/zk-bridge/README.md`), just never a *Rust dependency* of this crate.
+rome-zk-layouts = { path = "../../crates/rome-zk-layouts" }
+rome-zk-pda = { path = "../../crates/rome-zk-pda" }
+zk-settlement-client = { path = "../../crates/zk-settlement-client" }
+
+[dev-dependencies]
+solana-program-test.workspace = true
+solana-sdk.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+rome-zk-testkit = { path = "../../crates/rome-zk-testkit" }
+zk-settlement = { path = "../zk-settlement", features = ["no-entrypoint"] }
+zk-bridge-client = { path = "../../crates/zk-bridge-client" }
+
+[lints]
+workspace = true

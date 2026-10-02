@@ -1,0 +1,104 @@
+[package]
+name = "rome-zk-derive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "derivation node: kona-shaped stages over the Solana inbox, committed block env, replay gate, strict policy"
+
+[[bin]]
+name = "rome-zk-derive"
+path = "src/bin/rome_zk_derive.rs"
+
+[dependencies]
+# --- codec: shared with, not duplicated from, the producer side (the decoder must match the
+# batcher's encoder byte for byte) --- the batcher encodes with the same crate; this crate depends on the
+# codec directly rather than pulling in the batcher's own (much heavier) dependency graph just to reach it.
+rome-zk-channel = { path = "../rome-zk-channel" }
+# Chain cadence/cap profile defaults — `DEFAULT_BLOCKS_PER_BATCH` re-exports this crate's
+# owned constant instead of pinning a separate local copy; reth-free.
+rome-zk-profile = { path = "../rome-zk-profile" }
+rome-zk-executor-api = { path = "../rome-zk-executor-api" }
+zk-inbox-client = { path = "../zk-inbox-client" }
+zk-inbox = { path = "../../programs/zk-inbox", features = ["no-entrypoint"] }
+# Resume anchor: reads + decodes the settlement root account (`root_pda`,
+# `decode_root_account`) — never re-derives its layout or PDA seeds (see `src/resume.rs`).
+zk-settlement-client = { path = "../zk-settlement-client" }
+# The chunk account header layout (`chunk::read`, `LayoutError`) — `inbox.rs` decodes every chunk header
+# through this one owner instead of a field-by-field re-decode of `zk_inbox::OFF_*`.
+rome-zk-layouts = { path = "../rome-zk-layouts" }
+# This crate's own `/metrics` responder, the exact same reth-free HTTP responder the
+# batcher and sequencer share — never a second hand-rolled copy.
+rome-zk-metrics-http = { path = "../rome-zk-metrics-http" }
+
+prometheus = "0.14"
+
+alloy-primitives = { version = "1", default-features = false, features = ["rlp"] }
+# `k256`: batch_queue.rs's recover_signer (signature-form check) needs `SignerRecoverable`, which
+# alloy-consensus only implements for `EthereumTxEnvelope` behind the `secp256k1`/`k256` feature gate
+# (verified against alloy-consensus 2.4.2 source: envelope.rs's `impl SignerRecoverable` is
+# `#[cfg(any(feature = "secp256k1", feature = "k256"))]`). Without it this crate does not compile
+# standalone -- every workspace-wide CI gate (`--workspace --all-targets`) unified the
+# feature in from a [dev-dependencies] `alloy` build, masking the gap.
+alloy-consensus = { version = "2.3", default-features = false, features = ["k256"] }
+alloy-eips = { version = "2.3", default-features = false }
+alloy-rpc-types-engine = { version = "2.3", default-features = false }
+
+solana-program.workspace = true
+solana-client.workspace = true
+solana-sdk.workspace = true
+solana-commitment-config.workspace = true
+
+# Real Engine API client (it runs against a stock reth Engine API): a JWT-authed jsonrpsee HTTP
+# client, same construction `reth_rpc_builder::auth::AuthServerHandle::http_client` uses
+# (`AuthClientLayer` + `tower::ServiceBuilder`) — verified against reth v2.5.2 source before writing
+# `engine.rs` (see that module's doc).
+reth-rpc-layer = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+jsonrpsee = { version = "0.26", features = ["client", "http-client"] }
+tower = "0.5"
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+eyre = "0.6"
+serde_json = "1"
+
+[dev-dependencies]
+# `tests/real_program_inbox.rs` drives the real batcher pipeline (`pipeline::plan_chunk`,
+# `open_and_grow_batch_ixs`) end-to-end against a live program — the one integration test in this crate
+# that needs the batcher itself, not just the codec it re-exports.
+rome-zk-batcher = { path = "../rome-zk-batcher" }
+alloy = { version = "2.4", default-features = false, features = ["consensus", "rlp", "signer-local", "k256", "rand"] }
+alloy-genesis = { version = "2.3", default-features = false }
+alloy-signer = { version = "2.3", default-features = false }
+alloy-signer-local = { version = "2.3", default-features = false }
+reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-e2e-test-utils = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-node-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-node-core = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-rpc-server-types = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-tasks = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
+rome-zk-executor-reth = { path = "../rome-zk-executor-reth" }
+solana-program-test.workspace = true
+solana-sdk.workspace = true
+solana-system-interface = { workspace = true, features = ["bincode"] }
+tempfile = "3"
+serde_json = "1"
+rome-zk-merkle = { path = "../rome-zk-merkle" }
+rome-zk-testkit = { path = "../rome-zk-testkit" }
+borsh = { version = "1.5.1", features = ["derive"] }
+# `tests/chain_config_real_program.rs` drives the real zk-settlement program (`InitGlobalConfig`,
+# `AllowReservedId`, `InitChainV2`) to prove `chain_bound::chain_drift_bound` against the real producer,
+# not a hand-built account — only `governance::MIN_RECLAIM_WINDOW_SLOTS` is used from it directly (the
+# rig's own floor), so this pulls in the program crate itself, not just its client.
+zk-settlement = { path = "../../programs/zk-settlement", features = ["no-entrypoint"] }
+
+[lints]
+workspace = true

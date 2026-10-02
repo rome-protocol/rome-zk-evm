@@ -1,0 +1,18 @@
+[package]
+name = "rome-zk-pda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+# `create_or_adopt_pda`: the one place every zk-inbox/zk-settlement instruction creates a PDA-owned account, closing
+# the "a pre-funded PDA permanently bricks the instruction" griefing class. Program-side only — `solana-program` is
+# its only dependency (a dedicated crate rather than a `rome-zk-layouts` feature, since that crate's whole point is
+# staying `solana-program`-free for its off-chain consumers — see its own module doc).
+
+[dependencies]
+solana-program.workspace = true
+solana-system-interface = { workspace = true, features = ["bincode"] }
+
+[lints]
+workspace = true

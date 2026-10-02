@@ -1,0 +1,27 @@
+# The derive client's config. `rollup init` fills the marked tokens and writes rendered/derive.toml.
+# Derive is read-only: it holds no funded key, only a Solana RPC endpoint and the verifier node's Engine API.
+
+chain_id = __CHAIN_ID__
+solana_rpc_url = "__SOLANA_RPC_URL__"
+inbox_program_id = "__INBOX_PROGRAM_ID__"
+settlement_program_id = "__SETTLEMENT_PROGRAM_ID__"
+
+# Must equal the sequencer's blocks_per_batch. Derive does not read the sequencer's profile, so init copies the value
+# from the sequencer config it just rendered; there is one number, set in chain.toml.
+blocks_per_batch = __BLOCKS_PER_BATCH__
+
+# The chain's own on-chain configuration decides the timestamp drift bound. Uncommenting this asserts a value; derive
+# refuses to start if it disagrees with the chain's.
+# max_drift_secs = 60
+
+# GET /metrics. The compose file publishes this on 127.0.0.1 only.
+metrics_addr = "0.0.0.0:9003"
+
+[reth]
+# The verifier node's plain RPC, used only to build blocks from an exact transaction list. This port exposes reth's
+# `testing` API, so it is never published beyond 127.0.0.1.
+rpc_url = "http://reth-verifier:8547"
+# The verifier node's authenticated Engine API.
+engine_url = "http://reth-verifier:8551"
+# The shared secret `rollup init` generates once.
+jwt_secret_path = "/data/jwt.hex"

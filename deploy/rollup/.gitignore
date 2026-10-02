@@ -1,0 +1,7 @@
+# What `./rollup init` renders, and what you provide: none of it belongs in version control.
+/rendered/
+/.env
+/chain.toml
+/keys/
+/vkey.json
+/elf/

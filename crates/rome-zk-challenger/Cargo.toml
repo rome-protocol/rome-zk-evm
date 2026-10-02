@@ -1,0 +1,12 @@
+[package]
+name = "rome-zk-challenger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "challenge flow client: non-exclusive one-block disputes, bonds, forced lane"
+
+[dependencies]
+
+[lints]
+workspace = true
