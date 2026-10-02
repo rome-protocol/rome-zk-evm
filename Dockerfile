@@ -37,7 +37,7 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --create-home --home-dir /home/rome --shell /usr/sbin/nologin rome \
-    && mkdir -p /data && chown rome:rome /data
+    && mkdir -p /data/reth && chown rome:rome /data /data/reth
 
 # rome-zk-derive's Cargo.toml pins `[[bin]] name = "rome-zk-derive"` (path `src/bin/rome_zk_derive.rs`)
 # — the binary on disk is `rome-zk-derive`, never the source file's underscored `rome_zk_derive` name.
