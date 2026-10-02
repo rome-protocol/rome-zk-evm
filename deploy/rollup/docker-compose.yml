@@ -7,7 +7,8 @@
 #                  can include arbitrary transactions, so it is published on 127.0.0.1 only.
 #   derive         rebuilds the chain from Solana alone and feeds reth-verifier. Private.
 #   batcher        reads the sequencer's log and posts it to Solana. Private.
-#   prover         required for settlement on Solana; needs one GPU. `./rollup up` starts it when PROVER=on in .env.
+#   prover         required for settlement; needs one NVIDIA GPU with more than 30 GB of memory.
+#                  `./rollup up` starts it when PROVER=on in .env.
 #   postgres       the prover's history, a local container. Starts with the prover.
 #
 # Everything except the sequencer's RPC publishes only on 127.0.0.1, and the Engine API (8551) is never published.
@@ -20,7 +21,7 @@
 # jwt.hex, and with PROVER=on prover.toml and prover-db-password.
 
 x-node: &node
-  # Public tags are pinned to the commit of the source export they were built from, so a tag names exactly one tree.
+  # Public tags match the source tree used to build the image.
   # Set ROME_ZK_TAG in .env to the tag your release notes give, or ROME_ZK_IMAGE to a full reference (an image you
   # built from this tree). `./rollup up` refuses to start while neither is set.
   image: ${ROME_ZK_IMAGE:-ghcr.io/rome-protocol/rome-zk-evm:${ROME_ZK_TAG:-unset}}
@@ -146,7 +147,9 @@ services:
       # The entrypoint checks the proving keys against this manifest before every start (see prover/check-keys.sh).
       - ./prover/check-keys.sh:/opt/prover/check-keys.sh:ro
       - ${PROVER_KEYS_MANIFEST:-./prover/keys.sha256}:/opt/prover/keys.sha256:ro
-      # About 77 GB of proving keys, downloaded once on the host.
+      # About 55 GB of proving keys on the host.
+      # The final proof step needs one NVIDIA GPU with more than 30 GB of memory.
+      # A 24 GB card is not enough.
       - ${ZISK_HOME:-/opt/zisk}:/opt/zisk:ro
       - zisk-cache:/opt/zisk/cache
       - prover-work:/data/work

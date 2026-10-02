@@ -2,24 +2,29 @@
 
 This folder runs one rollup chain on one machine with Docker Compose. You bring a Solana RPC endpoint, two key
 files and a machine with Docker. You do not need a cloud account, and nothing here calls a cloud service.
-Settling on Solana also needs one GPU for the prover.
+Settling on Solana also needs an NVIDIA GPU for the prover.
 
-You need bash, Docker with the compose plugin, curl, jq, openssl, Python 3.11 or newer, and rustup with cargo (the
-toolchain `rust-toolchain.toml` at the repository root pins; rustup installs it on first use). The first `./rollup init`
-compiles the client that reads your chain id from Solana, so it takes a few minutes. Docker Engine 28 or newer is
-required: older engines let other machines on your network reach container ports that are bound to 127.0.0.1.
+You need an x86-64 Linux machine with bash 4 or newer, Git, Docker Engine 28 or newer with the Compose plugin,
+curl, jq, openssl, the Solana CLI, Python 3.11 or newer, a C compiler, and rustup with cargo. The repository pins the Rust
+toolchain, and rustup installs it on the first build. On Debian or Ubuntu, run `sudo apt install build-essential`
+for the compiler. The first `./rollup init` compiles the client that reads your chain id from Solana, so it
+takes a few minutes. Older Docker engines can expose ports bound to 127.0.0.1 to other machines.
 
 ## What a full run needs
 
 A full run settles on Solana. It needs the rollup's Solana programs on the cluster you point at, a prover with
-one GPU, a verification key Rome has registered for your chain, and a guest built for your chain id. See
+one NVIDIA GPU with more than 30 GB of memory, a verification key Rome has registered for your chain,
+and a guest built for your chain's genesis. See
 [The prover is required for settlement](#the-prover-is-required-for-settlement).
 
 Rome's settlement programs are live on public Solana devnet. Their addresses are in
 [`programs.devnet.json`](programs.devnet.json), the default `PROGRAMS_JSON` in `.env.example`, so `init` and
 `check` now have the program-address file they need. The settlement program's global config enables
-permissionless registration, with a 5 SOL registration deposit, a fee of 0.001 SOL per batch and a reclaim
-window of 216000 slots.
+permissionless registration, with a 5 SOL registration deposit and a 0.001 SOL fee when a proved root is
+posted. The reclaim window is 6,480,000 slots, about 30 days at 400 ms per slot. After that, anyone
+can reclaim a chain that has never posted a root. Its root, registry and chain
+configuration accounts close. Their SOL, including the deposit, goes to the treasury, and its batcher
+stops. The deposit is refundable to the chain authority after one final root or ten posted roots.
 
 Set `SOLANA_RPC_URL` in `.env` to any Solana devnet RPC endpoint you use. A provider endpoint is more reliable
 than the public endpoint under load.
@@ -36,16 +41,15 @@ program derives it from your payer key and the number of chains that key has reg
 (the payer keypair must exist at `init`).
 
 ```
-./rollup init       # read your chain id from Solana, then write every config into rendered/
-./rollup register   # register the chain on Solana (see below)
-                    # then ask Rome to register your chain's verification key (see below)
-./rollup up         # start the node
-./rollup check      # one-screen health check
+./rollup init                # read your chain id from Solana and render the configs
+./rollup register --confirm  # register the chain on Solana
+./rollup up                  # start the node
+./rollup check               # health check
 ```
 
-The order is `init`, `register`, ask Rome for the key, `up`. `register` needs only your Solana RPC: if the sequencer is
-not running, it starts it for you (`./rollup up sequencer`), because registration records the genesis block it
-reads from the sequencer.
+The node can run after `init` and `register --confirm`. To settle roots, you need a guest built for your
+genesis and its verification key registered by Rome. If the sequencer is not running, registration starts
+it with `./rollup up sequencer` so it can read the genesis block.
 
 `init` records the payer's public key, its registration count (the nonce) and the derived chain id in
 `rendered/chain-id.env`, and renders the genesis and every config with that id. `register` reads the nonce again and
@@ -67,17 +71,18 @@ API key, that too.
 `register` needs one flag and has no default. `./rollup register --dry-run` prints the commands without running
 anything. `./rollup register --confirm` runs them and writes `rendered/pdas.env`. Your payer keypair signs the
 registration, and registration locks the chain deposit from it. The amount is set in the settlement program's global
-config (5 SOL on devnet), so check it there before you fund the payer: the deposit is on top of the fees the batcher
-pays.
+config (5 SOL on devnet), so check it there before you fund the payer. Without a prover, Solana fees and
+inbox account rent still use the payer's SOL. Watch its balance on a busy chain.
 
 `register --confirm` can be run again if it stopped after the registration was sent (for example the batch cursor
 step failed). It finds the chain's root account on Solana, says the chain is already registered, does not register a
 second time, and finishes the cursor and `rendered/pdas.env`. If it cannot read that account it stops with
 `RootLookupFailed` and sends nothing.
 
-`register` sends no verification key: the program refuses one on a permissionless chain. After it succeeds, send Rome
-your chain id (it is in `rendered/chain-id.env`) and ask for your chain's verification key to be registered. The
-chain has no verification key on Solana until Rome has registered it.
+`register` sends no verification key: the program refuses one on a permissionless chain. Once you have a guest
+built for your chain's genesis, [open an issue on rome-protocol/rome-zk-evm](https://github.com/rome-protocol/rome-zk-evm/issues) with the chain id from
+`rendered/chain-id.env` and the guest ELF's sha256. Rome registers the matching verification key through the
+registry authority. Until then, your chain has no verification key on Solana.
 
 `up` starts the services. `./rollup up sequencer` starts just that one. `check` tells you, by name, which service is
 missing or unhealthy, then compares the chain id, the heads, the batcher's progress, the inbox and the roots.
@@ -137,13 +142,15 @@ the genesis root written at registration. Withdrawals need a final root, so no w
 
 Proofs are checked against your chain's verification key. Ask Rome to register it after registering your chain,
 as described above. `VKEY_JSON` must describe that registered key, and `ELF_DIR` must contain the matching guest
-program built for your chain's id. The batch guest source is published at
-[`rome-protocol/rome-zk-guest`](https://github.com/rome-protocol/rome-zk-guest), tag `v0.1.0`. Clone it as
-`.fork/` inside a checkout of this repository, because it uses crates from this repository, then run
-`git submodule update --init --recursive` inside `.fork/` before building. The command that builds the guest
-for your chain id is not in this folder yet.
+program built for your chain's genesis. The batch guest source is published at
+[`rome-protocol/rome-zk-guest`](https://github.com/rome-protocol/rome-zk-guest), tag `v0.1.1`. From the root of
+this repository, run `git clone --branch v0.1.1 https://github.com/rome-protocol/rome-zk-guest.git .fork`,
+then `cd .fork && git submodule update --init --recursive`. The guest uses crates from this repository.
+Building it for your `rendered/genesis.json` is not automated yet. Without that guest, your chain cannot
+post a root.
 
-The prover needs one GPU and about 77 GB of proving keys downloaded once to the host. To turn it on, set `PROVER=on`
+The prover needs one NVIDIA GPU with more than 30 GB of memory and about 55 GB of proving keys on the host.
+The final proof step needs about 30 GB of GPU memory; a 24 GB card is not enough. To turn it on, set `PROVER=on`
 in `.env` together with `VKEY_JSON`, `ELF_DIR` and `ZISK_HOME`, then run `./rollup init` and `./rollup up`. A local
 postgres container starts with it to hold the prover's history. Leave `PROVER` unset and none of this is rendered
 or started.
@@ -177,16 +184,29 @@ image you built from this tree yourself, set `ROME_ZK_IMAGE` to its full referen
 ## Exits
 
 The genesis carries the exit portal, the contract where a withdrawal starts, at `0x4200000000000000000000000000000000000016`.
-Funds can leave the chain only after the settlement program's exit configuration names that portal. That configuration is
-set later, through the program's governance, so a new chain has no working exit path until it is.
+New chains start with no exit portal configured and an exit cap of zero, so exits are off. The chain authority
+can use the settlement client's `governance` example with `propose-exit-config` to set the portal,
+bridge program and cap.
+After at least one 172,800-slot challenge window, anyone can send `activate-exit-config`. A final root
+and a bridge program are also needed to release an exit. The devnet program set does not include a bridge yet.
 
 ## Key files
 
 Both are paths in `.env`, never the keys themselves. The containers run as uid 999, so the files must be
-readable by that user.
+readable by that user. From this directory, create them with the Solana CLI and openssl:
+
+```sh
+mkdir -p keys
+solana-keygen new -o keys/payer.json
+openssl rand -hex 32 > keys/sequencer.key
+sudo chgrp 999 keys/payer.json keys/sequencer.key && chmod 640 keys/payer.json keys/sequencer.key
+```
+
+Fund the payer with about 6 devnet SOL, for example from [Solana's faucet](https://faucet.solana.com).
+The host also reads the payer key during `init` and `register`. `.gitignore` in this directory excludes `keys/`.
 
 - `SEQUENCER_KEY_PATH`: the sequencer's signing key, 64 hex characters in a file.
-- `PAYER_KEYPAIR_PATH`: a Solana keypair (JSON) funded with SOL. It pays batch fees and is the chain authority.
+- `PAYER_KEYPAIR_PATH`: a Solana keypair (JSON) funded with SOL. It pays Solana fees and rent and is the chain authority.
 
 ## Running the tests
 

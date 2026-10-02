@@ -7,10 +7,10 @@
 # The prover is its own cargo workspace under crates/rome-zk-prover, so it builds from that directory rather than from
 # the repository root's workspace.
 #
-# The image does not contain the ZisK toolchain or the proving keys. Download them once on the host (about 77 GB)
-# and mount the directory at /opt/zisk; the compose file does that from ZISK_HOME. What the image does carry is what
-# the prover needs around them: the CUDA and OpenMPI runtime libraries, and Node with snarkjs, which the PLONK step
-# calls.
+# The image does not contain the ZisK toolchain or the proving keys (about 55 GB on the host).
+# The final proof step needs one NVIDIA GPU with more than 30 GB of memory.
+# A 24 GB card is not enough. Mount the keys at /opt/zisk from ZISK_HOME.
+# The image includes CUDA, OpenMPI, Node and snarkjs for the PLONK step.
 FROM rust:1.97.1-bookworm AS builder
 WORKDIR /build
 
