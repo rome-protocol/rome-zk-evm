@@ -32,7 +32,7 @@ fixtures/    proof and calldata fixtures the program tests load — never regene
 migrations/  Postgres (sqlx) migrations shared by the off-chain services
 ```
 
-The production guest lives in `rome-protocol/zisk-eth-client`, under `crates/clients/rome/guest`.
+The production guest lives in `rome-protocol/rome-zk-guest`, under `crates/clients/rome/guest`.
 Veritas ([`programs/veritas`](programs/veritas/README.md)) is Rome's own verifier for ZisK's PLONK proofs,
 written from Rome's own functional specification of the proof system. zk-settlement links it as a library
 and runs it inside `PostRootProved`; the prover runs the same check off-chain before posting.

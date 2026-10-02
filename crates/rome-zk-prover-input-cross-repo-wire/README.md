@@ -1,8 +1,8 @@
 # rome-zk-prover-input-cross-repo-wire
 
 Proves `rome-zk-prover-input`'s `wire::RomePublicInput`/`RomeWitnessInput` encode byte-for-byte
-compatibly with the private `zisk-eth-client` fork's own `guest_rome::input::{RomePublicInput,
-RomeWitnessInput}` (`rome-protocol/zisk-eth-client`, branch `rome-guest`,
+compatibly with `rome-zk-guest`'s own `guest_rome::input::{RomePublicInput,
+RomeWitnessInput}` (`rome-protocol/rome-zk-guest` (tag `v0.1.0`),
 `crates/clients/rome/guest/src/input.rs`) — in both directions. This is the correctness gap
 `rome-zk-prover-input/README.md`'s "Open questions" named as missing.
 
@@ -29,8 +29,8 @@ exercised by this proof, so the test binary links on a native host.
 root:
 
 ```sh
-git clone https://github.com/rome-protocol/zisk-eth-client <repo-root>/.fork
-cd <repo-root>/.fork && git checkout rome-guest
+git clone https://github.com/rome-protocol/rome-zk-guest <repo-root>/.fork
+cd <repo-root>/.fork && git checkout v0.1.0
 git submodule update --init third_party/ziskethone
 ```
 

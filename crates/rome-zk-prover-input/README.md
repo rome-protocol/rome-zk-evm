@@ -3,7 +3,7 @@
 Host-only input generator for the batch guest: reads a finalized
 batch's inbox chunk bodies + batch account from the Tiber devnet, fetches each block and its execution witness
 from a reth verifier, and writes the guest's two bincode inputs — `guest-rome`'s wire format
-(`rome-protocol/zisk-eth-client`, branch `rome-guest`, `crates/clients/rome/guest`). Never writes to any
+(`rome-protocol/rome-zk-guest` (tag `v0.1.0`), `crates/clients/rome/guest`). Never writes to any
 cluster; never generates a proof (proving is a separate step).
 
 Verified end to end against a real batch: see "Real batch, verified" below.
@@ -147,7 +147,7 @@ about this real batch's shape, not a gap papered over.
 ## `ZISK_GENESIS_PATH`: not present in the fork at the pinned tree
 
 A `ZISK_GENESIS_PATH` custom-chain patch on `crates/clients/reth/input/src/lib.rs` might be expected.
-Checked directly against the fork (v0.12.0, `rome-guest`'s own base), it is not present there:
+Checked directly against the fork (zisk-eth-client v0.12.0, the guest's base), it is not present there:
 `fetch_chain_config` in that file only recognizes four named chains (Mainnet/Sepolia/Hoodi/Holesky) and
 refuses any other chain id — which Tiber (200101) is. `src/genesis.rs` instead reads the chain's genesis
 file directly as a standard `alloy_genesis::Genesis` document (the same shape `fetch_chain_config`

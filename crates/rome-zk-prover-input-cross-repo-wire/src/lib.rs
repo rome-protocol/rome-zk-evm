@@ -1,7 +1,7 @@
 //! The cross-repo wire proof this repo's own README (rome-zk-prover-input, "Open
 //! questions") flagged as missing — `rome_zk_prover_input::wire::RomePublicInput`/`RomeWitnessInput`
 //! encode byte-for-byte compatibly with the fork's own `guest_rome::input::{RomePublicInput,
-//! RomeWitnessInput}` (`rome-protocol/zisk-eth-client`, branch `rome-guest`), in both directions.
+//! RomeWitnessInput}` (`rome-protocol/rome-zk-guest` (tag `v0.1.0`)), in both directions.
 //!
 //! **Why this is its own crate, not a dev-dependency of `rome-zk-prover-input` itself:** `guest-rome`'s own
 //! `Cargo.toml` enables `alloy-primitives`'s `native-keccak` feature (the ZisK guest's accelerated keccak hook). Cargo
@@ -25,8 +25,8 @@
 //! longer a dependency of this crate either.
 //!
 //! **Depends on a checkout of the fork at `../../.fork`** (two levels up from this crate: `crates/` →
-//! the rome-zk repo root → `.fork/`) — `git clone https://github.com/rome-protocol/zisk-eth-client
-//! <repo-root>/.fork && cd <repo-root>/.fork && git checkout rome-guest && git submodule update --init
+//! the rome-zk repo root → `.fork/`) — `git clone https://github.com/rome-protocol/rome-zk-guest
+//! <repo-root>/.fork && cd <repo-root>/.fork && git checkout v0.1.0 && git submodule update --init
 //! third_party/ziskethone`. If that checkout is absent, Cargo itself refuses to resolve this crate's
 //! manifest (a hard requirement — no path dependency can be made conditional at the Cargo.toml level);
 //! the wrapper script this crate's README documents (`crates/rome-zk-prover-input-cross-repo-wire/run.sh`)

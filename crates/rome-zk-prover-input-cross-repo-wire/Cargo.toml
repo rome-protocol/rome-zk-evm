@@ -3,7 +3,7 @@ name = "rome-zk-prover-input-cross-repo-wire"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Proves rome-zk-prover-input's wire::RomePublicInput/RomeWitnessInput encode with rome-zk-prover-input and decode with the fork's own guest_rome::input types byte for byte, and the reverse. Path-depends on the fork checkout at ../../.fork (rome-protocol/zisk-eth-client, branch rome-guest) — see this crate's README."
+description = "Proves rome-zk-prover-input's wire::RomePublicInput/RomeWitnessInput encode with rome-zk-prover-input and decode with the fork's own guest_rome::input types byte for byte, and the reverse. Path-depends on the fork checkout at ../../.fork (rome-protocol/rome-zk-guest v0.1.0) — see this crate's README."
 
 # Standalone workspace, its own Cargo.lock, excluded from both the rome-zk root workspace (root
 # Cargo.toml's exclude list) and rome-zk-prover-input's own standalone one: this crate's dependency on
@@ -19,7 +19,7 @@ description = "Proves rome-zk-prover-input's wire::RomePublicInput/RomeWitnessIn
 [dependencies]
 # The wire types under test — rome-zk-prover-input's own encode side.
 rome-zk-prover-input = { path = "../rome-zk-prover-input" }
-# The fork's own decode side (rome-protocol/zisk-eth-client, branch rome-guest) — a path dependency into
+# The fork's own decode side (rome-protocol/rome-zk-guest v0.1.0) — a path dependency into
 # a checkout expected at `.fork/` under the rome-zk repo root (this crate's own README + rome-zk-prover-
 # input's README document the exact clone command). NOT git: this fork's own CI has no established
 # credentials for the (also private) rome-zk repo, the same reason rome-zk-prover-input's own wire.rs is a

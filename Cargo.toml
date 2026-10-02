@@ -2,14 +2,14 @@
 resolver = "2"
 members = ["programs/*", "crates/*"]
 # rome-zk-prover-input (host-only): pins alloy-consensus/alloy-genesis/alloy-rpc-types-debug/ alloy-eips EXACT to
-# the private zisk-eth-client fork's own guest-rome versions (2.0.5/1.6.0), so its bincode wire format stays
+# rome-zk-guest's own guest-rome versions (2.0.5/1.6.0), so its bincode wire format stays
 # byte-compatible with what the guest reads. Sharing this workspace's one Cargo.lock is not possible:
 # rome-zk-batcher already needs `alloy = "^2.4"`, which conflicts with an exact 2.0.5 pin (verified: the resolver
 # refuses outright, not a style preference). Given its own workspace + Cargo.lock (like the fork's own bin/guests/*
 # ELF packages), built with `cd crates/rome-zk-prover-input && cargo test`, never `-p rome-zk-prover-input` from
 # here.
 #
-# rome-zk-prover-input-cross-repo-wire: the cross-repo wire proof against the private zisk-eth-client fork's own
+# rome-zk-prover-input-cross-repo-wire: the cross-repo wire proof against rome-zk-guest's own
 # guest-rome types — path-depends on a `.fork/` checkout (never committed, see .gitignore) and, like
 # rome-zk-prover-input, is its own workspace: guest-rome's `native-keccak` alloy-primitives feature would otherwise
 # unify across this whole workspace's one Cargo.lock and break every ordinary caller of

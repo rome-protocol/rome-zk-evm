@@ -1309,7 +1309,7 @@ image and a real `docker compose up` on a build machine.
   reason. See the Tiber deploy README's full-reset section for the chain-id-cannot-move argument (the guest ELF
   now embeds the chain's own genesis at build time).
 
-### Batch guest + prover input (`crates/rome-zk-prover-input`; guest in the private fork)
+### Batch guest + prover input (`crates/rome-zk-prover-input`; guest in rome-zk-guest)
 
 - **`rome-zk-layouts::public_values` gains `write`** (the encoder — `read` alone decoded a caller-supplied
   blob and was not its own inverse), pinned by a round-trip test. Needed so the guest can commit its own
@@ -1325,7 +1325,7 @@ image and a real `docker compose up` on a build machine.
   types encode byte-for-byte compatibly with the fork's own `guest_rome::input` types, both directions —
   path-depends on a `.fork/` checkout of the fork (never committed; `run.sh` skips loud with the clone
   command when that checkout is absent).
-- **New client `guest-rome`** in the private fork `rome-protocol/zisk-eth-client` (branch `rome-guest`,
+- **New client `guest-rome`** in `rome-protocol/rome-zk-guest` (
   not this repo): proves one finalized batch — DA binding (accelerated keccak via `alloy-primitives`'
   `native-keccak`, passed through `rome-zk-layouts`/`rome-zk-merkle`'s existing `HashV` trait), channel
   decode + block-for-block equality against the witnessed blocks, per-block chaining + a one-sided drift

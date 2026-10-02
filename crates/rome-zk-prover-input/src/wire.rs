@@ -1,6 +1,6 @@
 //! The guest's wire contract, **v2**, field-for-field
 //! identical to `guest-rome::input::{RomePublicInput, RomeWitnessInput}`
-//! (`rome-protocol/zisk-eth-client`, branch `rome-guest`, `crates/clients/rome/guest/src/input.rs`) —
+//! (`rome-protocol/rome-zk-guest` (tag `v0.1.0`), `crates/clients/rome/guest/src/input.rs`) —
 //! duplicated here rather than depended on across repos.
 //!
 //! **v2 drops `chain_config`:** v1 carried a host-supplied `chain_config`, which let a
@@ -10,7 +10,7 @@
 //! to match.
 //!
 //! **Why a copy, not a dependency on the fork:** this crate is built by rome-zk's own CI, which checks out
-//! only the rome-zk repo — a git dependency on the (also private) `zisk-eth-client` fork would need
+//! only the rome-zk repo — a git dependency on `rome-zk-guest` would need
 //! credentials that CI does not have today (untested, not silently assumed). A path dependency into a
 //! `.fork/` checkout (the shape `guest-rome` itself uses in the other direction, pointing at THIS repo)
 //! only resolves in a dev worktree that happens to have the fork cloned alongside it — not in a fresh CI

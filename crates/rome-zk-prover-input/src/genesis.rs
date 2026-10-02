@@ -1,5 +1,5 @@
 //! Chain config loading. A `ZISK_GENESIS_PATH` custom-chain patch on `crates/clients/reth/input/src/lib.rs` might be
-//! expected; checked directly against the fork at the pinned tree (v0.12.0, branch `rome-guest`'s own base), it is not
+//! expected; checked directly against the fork at the pinned tree (zisk-eth-client v0.12.0, the guest's base), it is not
 //! present there: `fetch_chain_config` in that file only recognizes four named chains
 //! (`Mainnet`/`Sepolia`/`Hoodi`/`Holesky`) and refuses any other chain id — which Tiber (200101) is. This module reads
 //! the chain's genesis file directly as a standard `alloy_genesis::Genesis` document (the same shape

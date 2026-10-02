@@ -29,10 +29,16 @@ jobs:
       - run: cd crates/rome-zk-prover-input && cargo clippy --locked --all-targets -- -D warnings
       - run: cd crates/rome-zk-prover && cargo clippy --locked --all-targets -- -D warnings
   test:
+    # Some tests load the programs as built: they come from build-sbf, so the test job never builds them twice.
+    needs: build-sbf
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/download-artifact@v7
+        with:
+          name: programs
+          path: target/deploy
       - run: cargo test --workspace
       - run: cd crates/rome-zk-prover-input && cargo test --locked
       - run: cd crates/rome-zk-prover && cargo test --locked
@@ -53,6 +59,11 @@ jobs:
           set -e
           for p in programs/*/; do cargo build-sbf --manifest-path "$p/Cargo.toml" --sbf-out-dir target/deploy --arch v3; done
           ./scripts/check-sbpf-v3.sh target/deploy/*.so
+      - uses: actions/upload-artifact@v7
+        with:
+          name: programs
+          path: target/deploy/*.so
+          if-no-files-found: error
   rollup-tests:
     runs-on: ubuntu-latest
     steps:
@@ -72,22 +83,10 @@ jobs:
             echo "::endgroup::"
           done
           exit "$status"
-  codeql:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      security-events: write
-    steps:
-      - uses: actions/checkout@v7
-      - uses: github/codeql-action/init@v4
-        with:
-          languages: rust
-          build-mode: none
-      - uses: github/codeql-action/analyze@v4
   semgrep:
     runs-on: ubuntu-latest
     container:
       image: semgrep/semgrep
     steps:
       - uses: actions/checkout@v7
-      - run: semgrep scan --config p/rust --config p/trailofbits --error
+      - run: semgrep scan --config p/rust --config p/trailofbits

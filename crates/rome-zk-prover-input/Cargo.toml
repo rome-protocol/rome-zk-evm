@@ -43,12 +43,12 @@ rome-zk-merkle = { path = "../rome-zk-merkle" }
 rome-zk-channel = { path = "../rome-zk-channel", default-features = false, features = ["zstd-c"] }
 
 # --- reth-verifier side: pinned to EXACTLY the fork's own versions (crates/clients/rome/{guest,input} in
-# rome-protocol/zisk-eth-client, branch rome-guest) — not rome-zk-derive's newer alloy-consensus 2.3 pin.
+# rome-protocol/rome-zk-guest v0.1.0) — not rome-zk-derive's newer alloy-consensus 2.3 pin.
 # `RomePublicInput`/`RomeWitnessInput` here are field-for-field copies of the guest's own wire types (a
 # cross-repo dependency on the fork was not used — see this crate's README), so bincode compatibility
 # depends on identical crate versions producing identical Rust types, not merely "the same shape".
 # Exact-pinned to what the fork's zec-rome ELF resolves to (its own standalone Cargo.lock,
-# rome-protocol/zisk-eth-client branch rome-guest, bin/guests/stateless-validator-rome) — a "2.0.0" range
+# rome-protocol/rome-zk-guest v0.1.0, bin/guests/stateless-validator-rome) — a "2.0.0" range
 # resolves to 2.4.2 in THIS workspace's own (much larger) dependency graph, and RomePublicInput's bincode
 # wire format is only guaranteed byte-compatible with the guest's own `alloy_consensus::Header`/
 # `reth_ethereum_primitives::Block` when both sides compile the identical crate version — see
