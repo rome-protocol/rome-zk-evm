@@ -15,10 +15,17 @@ A full run settles on Solana. It needs the rollup's Solana programs on the clust
 one GPU, a verification key Rome has registered for your chain, and a guest built for your chain id. See
 [The prover is required for settlement](#the-prover-is-required-for-settlement).
 
-The public devnet programs come later. Until they are published there is no program-address file to point
-`PROGRAMS_JSON` at, so `init` and `check` will stop on that. This folder contains the node and prover configuration
-and the `rollup` commands; it does not yet include the command to build your chain's guest. The tests here run
-without the Solana programs.
+Rome's settlement programs are live on public Solana devnet. Their addresses are in
+[`programs.devnet.json`](programs.devnet.json), the default `PROGRAMS_JSON` in `.env.example`, so `init` and
+`check` now have the program-address file they need. The settlement program's global config enables
+permissionless registration, with a 5 SOL registration deposit, a fee of 0.001 SOL per batch and a reclaim
+window of 216000 slots.
+
+Set `SOLANA_RPC_URL` in `.env` to any Solana devnet RPC endpoint you use. A provider endpoint is more reliable
+than the public endpoint under load.
+
+This folder contains the node and prover configuration and the `rollup` commands; it does not yet include the
+command to build your chain's guest. The tests here run without the Solana programs.
 
 ## The four commands
 
@@ -130,19 +137,22 @@ the genesis root written at registration. Withdrawals need a final root, so no w
 
 Proofs are checked against your chain's verification key. Ask Rome to register it after registering your chain,
 as described above. `VKEY_JSON` must describe that registered key, and `ELF_DIR` must contain the matching guest
-program built for your chain's id. The command that builds the guest for your chain id is not in this folder yet.
-It comes with a later release.
+program built for your chain's id. The batch guest source is published at
+[`rome-protocol/rome-zk-guest`](https://github.com/rome-protocol/rome-zk-guest), tag `v0.1.0`. Clone it as
+`.fork/` inside a checkout of this repository, because it uses crates from this repository, then run
+`git submodule update --init --recursive` inside `.fork/` before building. The command that builds the guest
+for your chain id is not in this folder yet.
 
 The prover needs one GPU and about 77 GB of proving keys downloaded once to the host. To turn it on, set `PROVER=on`
 in `.env` together with `VKEY_JSON`, `ELF_DIR` and `ZISK_HOME`, then run `./rollup init` and `./rollup up`. A local
 postgres container starts with it to hold the prover's history. Leave `PROVER` unset and none of this is rendered
 or started.
 
-The prover image is built from this tree: `prover/Dockerfile` is in this folder, and the first `./rollup up` with
-`PROVER=on` builds it (from the repository root, which the compose file passes as the build context). You can build it
-yourself with `docker build -f deploy/rollup/prover/Dockerfile -t rome-zk-prover:local .`. Pre-built images, for the
-prover and for the node, come with the public release. The image does not contain the proving keys or the ZisK
-toolchain: you download those to `ZISK_HOME` and the compose file mounts them.
+The prover image is built from this tree: `prover/Dockerfile` is in this folder, and the first `./rollup up`
+with `PROVER=on` builds it (from the repository root, which the compose file passes as the build context). You
+can build it yourself with `docker build -f deploy/rollup/prover/Dockerfile -t rome-zk-prover:local .`. The
+image does not contain the proving keys or the ZisK toolchain: you download those to `ZISK_HOME` and the
+compose file mounts them.
 
 Before every start the prover checks those keys against a manifest of hashes (`prover/keys.sha256`, checked by
 `prover/check-keys.sh`, both mounted into the container). The manifest in this folder ships unpinned until the
@@ -159,10 +169,10 @@ To keep the manifest somewhere else, set `PROVER_KEYS_MANIFEST` in `.env` to its
 
 ## The node image
 
-The compose file runs the node from `ghcr.io/rome-protocol/rome-zk-evm`. Public tags are pinned to the commit of the
-source export they were built from, so a tag names exactly one tree and never moves. Set `ROME_ZK_TAG` in `.env` to the
-tag in your release notes. `./rollup up` stops with `ImageTagNotSet` until you do. To run an image you built from this
-tree yourself, set `ROME_ZK_IMAGE` to its full reference instead.
+The compose file runs the published node image `ghcr.io/rome-protocol/rome-zk-evm:v0.1.0`. Public tags are
+pinned to the commit of the source export they were built from, so a tag names exactly one tree and never
+moves. Set `ROME_ZK_TAG=v0.1.0` in `.env`. `./rollup up` stops with `ImageTagNotSet` until you do. To run an
+image you built from this tree yourself, set `ROME_ZK_IMAGE` to its full reference instead.
 
 ## Exits
 

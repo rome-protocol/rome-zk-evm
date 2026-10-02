@@ -49,7 +49,9 @@ jobs:
       - run: rustup show active-toolchain || rustup toolchain install
       - name: Install the Solana tools
         run: |
-          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          # Pinned to the release the published programs are built with (cargo-build-sbf 4.1.0, platform-tools
+          # v1.54), so a build here matches the deployed bytes and the compute-unit tests.
+          sh -c "$(curl -sSfL https://release.anza.xyz/v4.1.0/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
       - run: cargo build-sbf --version
       - name: Platform-tools supports --arch v3

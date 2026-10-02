@@ -1,0 +1,9 @@
+{
+  "cluster": "devnet",
+  "payer": "2H8bMM3AUTU6RZap3zyFU5coNUazo6z5Xg7ighfCTJ3q",
+  "programs": {
+    "zk-inbox": "28948c2Qt1QtG2XJA823ytzCfj7U5cNNm3FuM2KoXsAa",
+    "zk-settlement": "8anSjJZu5vgfNbESPLoKudVBNEraDZASwKJnkDLTCaGo",
+    "veritas": "2cLGd9FKC7TiZrEHCvpw291AwXNcGgP9nDT4W3PHLe5k"
+  }
+}
