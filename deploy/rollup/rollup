@@ -299,7 +299,7 @@ cmd_init() {
   if [[ -n "$backed" ]]; then
     echo "backed genesis balance: $backed starts with $backed_lamports lamports (${backed_lamports}000000000 wei); every other balance is zero."
     echo "Before you ask Rome to register your verification key, lock exactly $backed_lamports lamports in your chain's vault with zk-bridge Fund. Rome checks that the vault holds it before it registers the key."
-    echo "The bridge program is not deployed on devnet yet, so there is no vault to lock it in today."
+    echo "On devnet the vault program is the shared zk-bridge in programs.devnet.json: create your chain's vault for the wrapped SOL mint (9 decimals) with init-vault, then lock the amount with fund."
   fi
 }
 

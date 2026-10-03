@@ -29,8 +29,31 @@ COPY . .
 
 # One cargo invocation, three bins (production build; the per-crate lib-only CI step — .github/
 # workflows/ci.yml's `clippy` job — already guards each crate's own feature masking standalone).
-RUN cargo build --release --locked \
-    -p rome-zk-sequencer -p rome-zk-batcher -p rome-zk-derive --bins
+#
+# Built with the `release-host` profile (Cargo.toml: thin LTO, 16 codegen units), not `release`: the workspace
+# `release` profile is fat LTO with one codegen unit because the Solana programs need it, and linking the sequencer
+# that way takes about 8 minutes. `release` itself is untouched, so the programs build exactly as before.
+#
+# The Cargo registry, the git checkouts and `target` live in BuildKit cache mounts, so the dependency build (reth and
+# the rest) is kept on the build host between builds and only the workspace crates are rebuilt. A cache mount is not
+# part of the image layer, so the three binaries are copied out of it, inside the same RUN, to /out. `target` is
+# mounted with `sharing=locked` so two builds on the same host never write it at once.
+#
+# Cargo decides whether a workspace crate is up to date by file mtime alone. `target` is now shared by every build on
+# the host, and COPY keeps the mtimes the files had in the build context (a checkout leaves an unchanged file with an
+# old mtime). So a source file could be older than the cached build output while holding different content, and cargo
+# would reuse the stale output and ship an image that does not match the commit. The `find ... touch` below sets every
+# source file's mtime to now, before cargo runs, so the workspace crates always rebuild; the registry and git
+# dependencies live outside the workspace and stay cached. The RUN layer then depends only on the content of the COPY
+# layer above it, which is what makes reusing that layer from BuildKit's cache correct.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    find . -path ./target -prune -o -type f -exec touch {} + \
+    && cargo build --profile release-host --locked \
+        -p rome-zk-sequencer -p rome-zk-batcher -p rome-zk-derive --bins \
+    && mkdir -p /out \
+    && cp target/release-host/rome-zk-sequencer target/release-host/rome-zk-batcher target/release-host/rome-zk-derive /out/
 
 FROM debian:bookworm-slim AS runtime
 
@@ -41,9 +64,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 
 # rome-zk-derive's Cargo.toml pins `[[bin]] name = "rome-zk-derive"` (path `src/bin/rome_zk_derive.rs`)
 # — the binary on disk is `rome-zk-derive`, never the source file's underscored `rome_zk_derive` name.
-COPY --from=builder /build/target/release/rome-zk-sequencer /usr/local/bin/rome-zk-sequencer
-COPY --from=builder /build/target/release/rome-zk-batcher /usr/local/bin/rome-zk-batcher
-COPY --from=builder /build/target/release/rome-zk-derive /usr/local/bin/rome-zk-derive
+COPY --from=builder /out/rome-zk-sequencer /usr/local/bin/rome-zk-sequencer
+COPY --from=builder /out/rome-zk-batcher /usr/local/bin/rome-zk-batcher
+COPY --from=builder /out/rome-zk-derive /usr/local/bin/rome-zk-derive
 
 USER rome
 WORKDIR /home/rome

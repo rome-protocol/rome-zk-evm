@@ -99,6 +99,18 @@ lto = "fat"
 codegen-units = 1
 overflow-checks = true
 
+# The host binaries the Docker image ships (sequencer, batcher, derive). They do not need the Solana programs'
+# fat-LTO, one-codegen-unit link, which is by far the slowest step of the image build; thin LTO with 16 codegen
+# units links in a fraction of the time. Overflow checks stay on, as in release. Only the Dockerfile uses this
+# profile (`cargo build --profile release-host`), and [profile.release] above is untouched, so the programs and
+# their CU pins build exactly as before.
+[profile.release-host]
+inherits = "release"
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+overflow-checks = true
+
 # solana_program::entrypoint! emits cfgs the host compiler does not know; declare them once (standard Anza advice).
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [

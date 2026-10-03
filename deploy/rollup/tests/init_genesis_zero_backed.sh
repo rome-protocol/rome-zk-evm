@@ -79,7 +79,7 @@ out="$(run_init "$WORK/o-p")"
 grep -q 'lock exactly 1500000000 lamports' <<<"$out" && pass "init tells the operator the exact lamport amount to lock" || fail "init prints the exact lamport amount" "$out"
 grep -q 'Fund' <<<"$out" && grep -qi 'before' <<<"$out" && grep -qi 'register' <<<"$out" && pass "init says to lock it with Fund before asking Rome to register the key" || fail "init names Fund and the order" "$out"
 grep -q "$B" <<<"$out" && pass "init names the backed address" || fail "init names the backed address" "$out"
-grep -qi 'bridge program is not deployed on devnet yet' <<<"$out" && pass "init says the bridge program is not deployed on devnet yet" || fail "init says the bridge program is not deployed on devnet yet" "$out"
+grep -qi "create your chain's vault for the wrapped SOL mint" <<<"$out" && pass "init says how to create the vault on the shared zk-bridge" || fail "init says how to create the vault on the shared zk-bridge" "$out"
 
 # ---- refusals by name ---------------------------------------------------------------------------------------------------
 # The old key. A chain.toml that still sets funded_address is refused, and the message says what replaced it.

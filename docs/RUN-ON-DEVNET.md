@@ -6,6 +6,8 @@ Registration is permissionless. Finalizing roots needs a prover and a verificati
 
 ## What is live on devnet
 
+Read the [devnet trust model](TRUST-MODEL.md) for the powers and limits of Rome's keys and your chain authority.
+
 Rome verified the program addresses and settlement settings on chain. The program addresses are also in
 [`deploy/rollup/programs.devnet.json`](../deploy/rollup/programs.devnet.json).
 
@@ -15,6 +17,7 @@ Rome verified the program addresses and settlement settings on chain. The progra
 | zk-inbox | `28948c2Qt1QtG2XJA823ytzCfj7U5cNNm3FuM2KoXsAa` |
 | zk-settlement | `8anSjJZu5vgfNbESPLoKudVBNEraDZASwKJnkDLTCaGo` |
 | veritas | `2cLGd9FKC7TiZrEHCvpw291AwXNcGgP9nDT4W3PHLe5k` |
+| zk-bridge | `27TbMDUyVynpFpqeKygpUMcDzWKHfW4k9aRN5yCysLEQ` — the vault that pays out exits, shared by every chain |
 | Settlement global config | `4F1ajEqgBK6tFc1RkrjbXghRJzVzFH2dg4mHsegpJf3y` |
 | Permissionless registration | On |
 | Registration deposit | 5 SOL |
@@ -23,7 +26,7 @@ Rome verified the program addresses and settlement settings on chain. The progra
 | Registry authority | `7CsvZgCML2C7i4f1Qd6Au3cxonB4c8uAWn3NmMmU9MDk` — Rome's key that registers verification keys |
 | Treasury | `2H8bMM3AUTU6RZap3zyFU5coNUazo6z5Xg7ighfCTJ3q` |
 | Program upgrade authority | `2H8bMM3AUTU6RZap3zyFU5coNUazo6z5Xg7ighfCTJ3q` — held by Rome |
-| Node image | `ghcr.io/rome-protocol/rome-zk-evm:v0.1.2` |
+| Node image | `ghcr.io/rome-protocol/rome-zk-evm:v0.1.3` |
 
 ## What you need
 
@@ -46,7 +49,7 @@ about 30 GB of GPU memory; a 24 GB card is not enough. You also need a guest bui
 ### 1. Clone and prepare the settings
 
 ```sh
-git clone --branch v0.1.2 https://github.com/rome-protocol/rome-zk-evm.git
+git clone --branch v0.1.3 https://github.com/rome-protocol/rome-zk-evm.git
 cd rome-zk-evm/deploy/rollup
 cp .env.example .env
 cp chain.toml.example chain.toml
@@ -73,7 +76,7 @@ Edit `.env`:
 - Set `SOLANA_RPC_URL` to your Solana devnet RPC endpoint.
 - Keep `PROGRAMS_JSON=programs.devnet.json`.
 - Set `PAYER_KEYPAIR_PATH` and `SEQUENCER_KEY_PATH` to your key files. These are paths, not key values.
-- Set `ROME_ZK_TAG=v0.1.2` to use the node image above.
+- Set `ROME_ZK_TAG=v0.1.3` to use the node image above.
 - Keep `RPC_BIND=127.0.0.1` for local access and leave `PROVER` unset for this first run.
 
 A new chain's genesis has no balances, and you do not need to set anything for that. The older
@@ -220,6 +223,8 @@ Your node, RPC service and prover have their own running costs.
   The final proof step needs about 30 GB of GPU memory; a 24 GB card is not enough.
 - Exits are off on a new chain: it has no exit portal configured and its exit cap is zero. The chain
   authority can use the settlement client's `governance` example to send `propose-exit-config`.
-  After at least one 172,800-slot challenge window, anyone can send `activate-exit-config`. Releasing an
-  exit also needs a bridge program, which the devnet program set does not include yet.
+  After at least one 172,800-slot challenge window, anyone can send `activate-exit-config`. Exits are
+  paid from the shared zk-bridge program listed above. Its vault for your chain is keyed by the settlement
+  program and your chain id; the chain authority creates it with the bridge client's `vault` example
+  (`init-vault`) and funds it with `fund`.
 - The devnet programs are upgradeable. Rome holds their upgrade authority.

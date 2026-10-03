@@ -18,7 +18,8 @@
 # renders wei = lamports x 1e9, so it always converts exactly. Write a plain whole number between 1 and
 # 18446744073709551615, with no decimals, quotes or units. The example below is 1.5 SOL. Use an address you control;
 # init refuses zero, the precompiles (0x00..00 to 0x00..ff) and the exit portal's address. Both keys or neither.
-# The bridge program is not deployed on devnet yet, so on devnet there is no vault to lock a backed balance in today.
+# On devnet the vault program is the shared zk-bridge listed in programs.devnet.json. Create your chain's vault for the
+# wrapped SOL mint (9 decimals) with the bridge client's vault init-vault, then lock the amount with fund.
 # backed_address = "0x0000000000000000000000000000000000000000"
 # backed_balance_lamports = 1_500_000_000
 # The address that receives the priority fees (tips) of the chain's transactions; the base fee is burned, as on Ethereum.

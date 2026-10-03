@@ -4,6 +4,7 @@
   "programs": {
     "zk-inbox": "28948c2Qt1QtG2XJA823ytzCfj7U5cNNm3FuM2KoXsAa",
     "zk-settlement": "8anSjJZu5vgfNbESPLoKudVBNEraDZASwKJnkDLTCaGo",
-    "veritas": "2cLGd9FKC7TiZrEHCvpw291AwXNcGgP9nDT4W3PHLe5k"
+    "veritas": "2cLGd9FKC7TiZrEHCvpw291AwXNcGgP9nDT4W3PHLe5k",
+    "zk-bridge": "27TbMDUyVynpFpqeKygpUMcDzWKHfW4k9aRN5yCysLEQ"
   }
 }
