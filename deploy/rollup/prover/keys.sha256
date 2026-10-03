@@ -1,7 +1,14 @@
-# Pinned aggregate sha256 of the ZisK proving keys (see check-keys.sh for the format and the hash recipe;
-# the file names are sorted bytewise, LC_ALL=C, so a pin does not depend on the locale of the host that made it).
-# This file ships unpinned: the public release replaces the placeholders with the hashes of the key set it was tested
-# with. Until then, pin the keys you downloaded yourself:
-#   ZISK_HOME=/opt/zisk MANIFEST=./prover/keys.sha256 bash ./prover/check-keys.sh --write
-UNPINNED_PENDING_FIRST_BOOTSTRAP  provingKey
-UNPINNED_PENDING_FIRST_BOOTSTRAP  provingKeySnark
+# Pinned aggregate sha256 of the ZisK 1.2.0-alpha proving keys that Rome's proofs were made with: provingKey (about 53.7 GB)
+# and provingKeySnark (about 27.0 GB). check-keys.sh checks them against this file before every prover start; see its
+# header for the format and the hash recipe. File names are sorted bytewise (LC_ALL=C), so a pin does not depend on the
+# locale of the host that checks it.
+#
+# The *.consttree files under provingKey are not hashed. ziskup generates them on the host when it installs the key (a
+# GPU install writes them its own way), so they are left out of the hash; each proof's local verify still uses them.
+#
+# These are the keys that `ziskup -v 1.2.0-alpha --provingkey` and `ziskup setup_snark` install (see docs/PROVER-HOST.md).
+# A different ZisK release has different keys: do not re-pin to make a mismatch go away, install the release this file was
+# made for. Pin a key set of your own, on purpose, with:
+#   ZISK_HOME=<where the keys are> MANIFEST=./prover/keys.sha256 bash ./prover/check-keys.sh --write
+7200c160f249ce49ab16ec00fa566210b6ec24ecc407ed402e4241e739c113b4  provingKey
+71056920ca412beed123096ebfcd764159534cf8f182b5832ec0f563fb56e912  provingKeySnark

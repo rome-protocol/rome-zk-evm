@@ -152,6 +152,9 @@ the port: add rules to the `DOCKER-USER` chain or use your cloud provider's fire
 | 9001 to 9004 | metrics of sequencer, batcher, derive and prover | 127.0.0.1 only |
 | 5432 | the prover's postgres | 127.0.0.1 only, and only with the prover |
 
+The numbers in the table are the defaults. Each host port can be moved in `.env` (`RPC_PORT`, `WS_PORT`, `VERIFIER_RPC_PORT`,
+`SEQUENCER_METRICS_PORT`, `BATCHER_METRICS_PORT`, `DERIVE_METRICS_PORT`, `PROVER_METRICS_PORT`); run `./rollup init` again afterwards.
+
 reth-verifier and derive are never reachable from outside the machine. reth-verifier also runs with peer discovery off,
 no peer slots and its peer listener on 127.0.0.1, so it never dials the public Ethereum network; derive is its only
 source of blocks. `./rollup check` fails if it ever has a peer. reth-verifier runs reth's `testing` API, which
@@ -192,7 +195,7 @@ then `cd .fork && git submodule update --init --recursive`. The guest uses crate
 Building it for your `rendered/genesis.json` is not automated yet. Without that guest, your chain cannot
 post a root.
 
-The prover needs one NVIDIA GPU with more than 30 GB of memory and the ZisK proving keys on the host: about 41 GB to
+The prover needs one NVIDIA GPU with more than 30 GB of memory and the ZisK proving keys on the host: about 26 GB to
 download, about 81 GB once installed (measured on a CPU host; a GPU host generates its own files, not measured yet).
 The final proof step needs about 30 GB of GPU memory; a 24 GB card is not enough. To turn it on, set `PROVER=on`
 in `.env` together with `VKEY_JSON`, `ELF_DIR` and `ZISK_HOME`, then run `./rollup init` and `./rollup up`. A local
@@ -206,9 +209,10 @@ image does not contain the proving keys or the ZisK toolchain: you download thos
 compose file mounts them.
 
 Before every start the prover checks those keys against a manifest of hashes (`prover/keys.sha256`, checked by
-`prover/check-keys.sh`, both mounted into the container). The manifest in this folder ships unpinned until the
-release pins it, and an unpinned manifest stops the prover by name (`KeysManifestUnpinned`). To pin the keys you
-downloaded, run this once on the host and keep the result:
+`prover/check-keys.sh`, both mounted into the container). The manifest in this folder is pinned to the keys of
+ZisK 1.2.0-alpha, and a mismatch stops the prover by name (`KeysShaMismatch`). The `*.consttree` files under
+`provingKey` are not part of the hash: ziskup generates them on the host at install. Only to pin a key set of your own,
+on purpose, run this once on the host and keep the result:
 
 ```
 ZISK_HOME=<the directory you downloaded the keys to> MANIFEST=./prover/keys.sha256 bash ./prover/check-keys.sh --write

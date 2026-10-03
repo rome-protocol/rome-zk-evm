@@ -40,7 +40,7 @@ Rome verified the program addresses and settlement settings on chain. The progra
 - An EVM address you control for the fee recipient (and, if you declare one, the backed balance).
 
 The steps below start the node without a prover. A full settlement setup also needs one NVIDIA GPU
-with more than 30 GB of memory and the ZisK proving keys on the host: about 41 GB to download, which grows to
+with more than 30 GB of memory and the ZisK proving keys on the host: about 26 GB to download, which grows to
 about 81 GB once installed (measured on a CPU host; a GPU host generates its own files, not measured yet). The final proof step needs
 about 30 GB of GPU memory; a 24 GB card is not enough. You also need a guest built for your chain's genesis.
 
@@ -90,8 +90,9 @@ If you need gas before deposits are available, you can declare one backed balanc
 `backed_address` (an address you control) and `backed_balance_lamports` (the amount in lamports, for example
 `1_500_000_000` for 1.5 SOL). Your chain gets that amount at genesis, 1 lamport as 1 gwei. You then lock the same
 amount in your chain's vault with the bridge program's `Fund`, and Rome checks the vault before it registers your
-verification key. `init` prints the exact amount to lock. The bridge program is not deployed on devnet yet, so a backed
-balance cannot be locked on devnet today.
+verification key. `init` prints the exact amount to lock. The shared zk-bridge program is deployed on devnet (see the
+table above). After `register`, your chain authority creates the chain's vault for wrapped SOL with the bridge client's
+`vault` example (`init-vault`), then locks the amount with `fund`. The exits item under Known limits has more on the vault.
 
 Set `genesis.fee_recipient` to an address you control as well. It receives the priority fees (tips) of the chain's
 transactions; the base fee is burned, as on Ethereum. Like the rest of the genesis, it cannot be changed after you
@@ -219,7 +220,7 @@ Your node, RPC service and prover have their own running costs.
 - Building a guest for your chain's genesis is not automated yet.
 - A new chain has no gas: its genesis has no balances, and deposits are not available yet. Until they are, it cannot send a transaction.
 - The prover needs one NVIDIA GPU with more than 30 GB of memory and about 81 GB of disk for the installed ZisK
-  proving keys (about 41 GB downloaded; measured on a CPU host).
+  proving keys (about 26 GB downloaded; measured on a CPU host).
   The final proof step needs about 30 GB of GPU memory; a 24 GB card is not enough.
 - Exits are off on a new chain: it has no exit portal configured and its exit cap is zero. The chain
   authority can use the settlement client's `governance` example to send `propose-exit-config`.

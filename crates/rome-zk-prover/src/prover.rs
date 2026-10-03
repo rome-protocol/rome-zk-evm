@@ -2,9 +2,14 @@
 //! (`cargo-zisk prove --plonk` behind a `Prover` trait). Verified against `cargo-zisk` 1.2.0-alpha:
 //! `-e/--elf`, `-i/--inputs`, `-o/--output`, `--plonk`, `-y/--verify-proof`; `-o <path>` produces the
 //! proof at that exact FILE path (not a directory); `--plonk` runs the STARK then the wrap in one
-//! invocation; there is no `-g`/GPU flag in this version — "GPU" is a property of which `cargo-zisk`
-//! build `zisk_home` points at, not a runtime flag, so `LocalCargoZisk::gpu` is reporting metadata only,
-//! never added to the command line.
+//! invocation.
+//!
+//! GPU: the GPU build of `cargo-zisk` has a runtime `-g/--gpu` flag on `prove`, and WITHOUT it the GPU
+//! build proves on the CPU. The CPU-only build has no such flag at all (it is compiled out) and prints
+//! `[cpu]` in its `--version` line where the GPU build prints `[gpu]`. So `LocalCargoZisk::gpu` is a real
+//! setting: when it is true, `prove()` passes `-g` and first refuses by name (`GpuBuildRequired`) when the
+//! `cargo-zisk` it would run is not the GPU build. Nothing proves on the CPU unless the config says
+//! `gpu = false` out loud.
 
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -49,6 +54,17 @@ pub enum ProveError {
     ProveFailed { exit: Option<i32>, tail: String },
     #[error("cargo-zisk did not finish within {0:?}")]
     ProveTimeout(Duration),
+    /// `gpu = true` is configured, but the `cargo-zisk` at `<zisk_home>/bin` is not the GPU build (its
+    /// `--version` line says `{found}`). Refused before any proving starts: a CPU build would take hours per
+    /// batch and the prover would look healthy while it did.
+    #[error(
+        "GpuBuildRequired: gpu = true but {bin} is not the GPU build of cargo-zisk (its --version line says \"{found}\"); \
+         install the GPU build (ziskup --gpu, see docs/PROVER-HOST.md) or set gpu = false to prove on the CPU on purpose"
+    )]
+    GpuBuildRequired { bin: PathBuf, found: String },
+    /// `cargo-zisk --version` ran but its answer carries neither `[gpu]` nor `[cpu]`, so the build cannot be told.
+    #[error("cargo-zisk --version of {bin} names neither a [gpu] nor a [cpu] build; it printed \"{found}\"")]
+    BuildUnknown { bin: PathBuf, found: String },
     #[error("cargo-zisk exited successfully but never printed a verified line:\n{tail}")]
     NotVerified { tail: String },
     /// A clean exit that DID print a verified line, but `-o out_file` was never actually written
@@ -70,9 +86,66 @@ pub trait Prover {
 /// type carries no attempt count of its own.
 pub struct LocalCargoZisk {
     pub zisk_home: PathBuf,
-    /// Reporting metadata only — see the module doc.
+    /// Prove on the GPU: passes `-g` and refuses to run unless `cargo-zisk` is the GPU build (see the module doc).
     pub gpu: bool,
     pub timeout: Duration,
+}
+
+/// Which build of `cargo-zisk` a binary is, read from the `[gpu]` / `[cpu]` tag in its `--version` line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildKind {
+    Gpu,
+    Cpu,
+}
+
+/// Reads the tag out of a `cargo-zisk --version` line, e.g. `cargo-zisk 1.2.0-alpha [gpu] (fbbc69b 2026-08-26T22:06:35Z)`.
+pub fn parse_build_kind(version_output: &str) -> Option<BuildKind> {
+    let mut found = None;
+    for line in version_output.lines() {
+        if line.contains("[gpu]") {
+            found = Some(BuildKind::Gpu);
+        } else if line.contains("[cpu]") && found.is_none() {
+            found = Some(BuildKind::Cpu);
+        }
+    }
+    found
+}
+
+/// Runs `<zisk_home>/bin/cargo-zisk --version` and refuses, by name, unless it is the GPU build.
+/// Called by `prove()` when `gpu` is set, and once at start-up by the binary so a wrong install stops the
+/// service before the first batch instead of after it.
+pub fn require_gpu_build(zisk_home: &Path) -> Result<(), ProveError> {
+    let bin = zisk_home.join("bin").join("cargo-zisk");
+    let out = Command::new(&bin)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|source| ProveError::Spawn {
+            bin: bin.clone(),
+            source,
+        })?;
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let first_line = text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    match parse_build_kind(&text) {
+        Some(BuildKind::Gpu) => Ok(()),
+        Some(BuildKind::Cpu) => Err(ProveError::GpuBuildRequired {
+            bin,
+            found: first_line,
+        }),
+        None => Err(ProveError::BuildUnknown {
+            bin,
+            found: first_line,
+        }),
+    }
 }
 
 fn tail_lines(s: &str, n: usize) -> String {
@@ -111,6 +184,9 @@ impl Prover for LocalCargoZisk {
         input_bin: &Path,
         out_file: &Path,
     ) -> Result<ProofFile, ProveError> {
+        if self.gpu {
+            require_gpu_build(&self.zisk_home)?;
+        }
         let call_started = Instant::now();
         // The wait loop below is bounded by `self.timeout`; the drain step after it gets a
         // further half of that as its own bound of last resort (a grandchild the process-group
@@ -120,14 +196,19 @@ impl Prover for LocalCargoZisk {
         let drain_deadline = wait_deadline + self.timeout / 2;
 
         let bin = self.zisk_home.join("bin").join("cargo-zisk");
-        let mut child = Command::new(&bin)
-            .arg("prove")
+        let mut cmd = Command::new(&bin);
+        cmd.arg("prove")
             .arg("-e")
             .arg(elf)
             .arg("-i")
             .arg(input_bin)
             .arg("--plonk")
-            .arg("-y")
+            .arg("-y");
+        if self.gpu {
+            // Without -g the GPU build of cargo-zisk proves on the CPU.
+            cmd.arg("-g");
+        }
+        let mut child = cmd
             .arg("-o")
             .arg(out_file)
             .stdout(Stdio::piped())
@@ -266,8 +347,6 @@ impl Prover for LocalCargoZisk {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
-
     /// Every `tests/fake-cargo-zisk/*.sh` script is installed as `<its own tempdir>/bin/cargo-zisk`
     /// exactly ONCE for the whole test binary (not once per test), computed the first time any
     /// test asks for one. Each script needs its own `zisk_home`, since `LocalCargoZisk` always
@@ -292,6 +371,8 @@ mod tests {
                 "fast-exit-leaves-helper.sh",
                 "partial-output-then-hangs.sh",
                 "partial-output-then-fails.sh",
+                "cpu-build.sh",
+                "no-tag-build.sh",
             ];
             SCRIPTS
                 .iter()
@@ -305,11 +386,8 @@ mod tests {
                     ))
                     .join(name);
                     let dest = bin_dir.join("cargo-zisk");
-                    std::fs::copy(&src, &dest)
-                        .unwrap_or_else(|e| panic!("copy {src:?} -> {dest:?}: {e}"));
-                    let mut perms = std::fs::metadata(&dest).unwrap().permissions();
-                    perms.set_mode(0o755);
-                    std::fs::set_permissions(&dest, perms).unwrap();
+                    std::os::unix::fs::symlink(&src, &dest)
+                        .unwrap_or_else(|e| panic!("symlink {src:?} -> {dest:?}: {e}"));
                     (name, home)
                 })
                 .collect()
@@ -644,5 +722,127 @@ mod tests {
             matches!(err, ProveError::Spawn { .. }),
             "expected Spawn, got {err:?}"
         );
+    }
+
+    /// A fake home of its own (not the shared one `fake_home` hands out): the tests that read back the arguments the
+    /// fake recorded must not see the arguments of another test running at the same time.
+    fn own_fake_home(script_name: &str) -> tempfile::TempDir {
+        let home = tempfile::tempdir().expect("tempdir");
+        let bin_dir = home.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let src = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fake-cargo-zisk"
+        ))
+        .join(script_name);
+        let dest = bin_dir.join("cargo-zisk");
+        std::os::unix::fs::symlink(&src, &dest)
+            .unwrap_or_else(|e| panic!("symlink {src:?} -> {dest:?}: {e}"));
+        home
+    }
+
+    fn gpu_prover(zisk_home: &Path) -> LocalCargoZisk {
+        LocalCargoZisk {
+            zisk_home: zisk_home.to_path_buf(),
+            gpu: true,
+            timeout: Duration::from_secs(5),
+        }
+    }
+
+    #[test]
+    fn the_version_tag_is_read_as_gpu_or_cpu() {
+        assert_eq!(
+            parse_build_kind("cargo-zisk 1.2.0-alpha [gpu] (fbbc69b 2026-08-26T22:06:35Z)"),
+            Some(BuildKind::Gpu)
+        );
+        assert_eq!(
+            parse_build_kind("cargo-zisk 1.2.0-alpha [cpu] (fbbc69b 2026-08-26T22:06:35Z)"),
+            Some(BuildKind::Cpu)
+        );
+        assert_eq!(parse_build_kind("cargo-zisk 1.2.0-alpha"), None);
+    }
+
+    #[test]
+    fn gpu_true_passes_dash_g_to_cargo_zisk() {
+        let tmp = own_fake_home("gpu-build.sh");
+        let home = tmp.path().to_path_buf();
+        let out_dir = tempfile::tempdir().unwrap();
+        gpu_prover(&home)
+            .prove(
+                Path::new("elf"),
+                Path::new("input.bin"),
+                &out_dir.path().join("proof"),
+            )
+            .expect("the GPU build proves");
+        let args = std::fs::read_to_string(home.join("bin").join("args.txt")).unwrap();
+        let words: Vec<&str> = args.split_whitespace().collect();
+        assert!(words.contains(&"-g"), "-g missing from: {args}");
+        assert!(words.contains(&"--plonk"), "--plonk missing from: {args}");
+    }
+
+    #[test]
+    fn gpu_false_never_passes_dash_g() {
+        let tmp = own_fake_home("gpu-build.sh");
+        let home = tmp.path().to_path_buf();
+        let out_dir = tempfile::tempdir().unwrap();
+        prover(&home, Duration::from_secs(5))
+            .prove(
+                Path::new("elf"),
+                Path::new("input.bin"),
+                &out_dir.path().join("proof"),
+            )
+            .expect("an explicit CPU run still proves");
+        let args = std::fs::read_to_string(home.join("bin").join("args.txt")).unwrap();
+        assert!(
+            !args.split_whitespace().any(|w| w == "-g"),
+            "-g must not be passed when gpu = false: {args}"
+        );
+    }
+
+    #[test]
+    fn gpu_required_with_a_cpu_build_is_refused_by_name_before_any_proving() {
+        let home = fake_home("cpu-build.sh");
+        let out_dir = tempfile::tempdir().unwrap();
+        let out_file = out_dir.path().join("proof");
+        let err = gpu_prover(&home)
+            .prove(Path::new("elf"), Path::new("input.bin"), &out_file)
+            .unwrap_err();
+        assert!(
+            matches!(err, ProveError::GpuBuildRequired { .. }),
+            "expected GpuBuildRequired, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.starts_with("GpuBuildRequired:"), "{msg}");
+        assert!(
+            msg.contains("[cpu]"),
+            "the message quotes what it found: {msg}"
+        );
+        assert!(!out_file.exists(), "no proof may be produced");
+        assert!(
+            !home.join("bin").join("proved").exists(),
+            "the CPU build must never have been asked to prove"
+        );
+        assert!(matches!(
+            require_gpu_build(&home),
+            Err(ProveError::GpuBuildRequired { .. })
+        ));
+    }
+
+    #[test]
+    fn gpu_required_with_an_untagged_build_is_refused_by_name() {
+        let home = fake_home("no-tag-build.sh");
+        assert!(matches!(
+            require_gpu_build(&home),
+            Err(ProveError::BuildUnknown { .. })
+        ));
+    }
+
+    #[test]
+    fn gpu_required_with_nothing_installed_is_a_named_spawn_error() {
+        let empty_home = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            require_gpu_build(empty_home.path()),
+            Err(ProveError::Spawn { .. })
+        ));
     }
 }

@@ -273,6 +273,7 @@ mod tests {
             acc,
             finalize_cursor: 1,
             open_unix_ts: 1_789_337_436,
+            deposit: None,
         };
         let batch_data = rome_zk_layouts::batch::write_header(&batch_header);
 
@@ -326,6 +327,7 @@ mod tests {
             acc,
             finalize_cursor: 1,
             open_unix_ts: 1_789_337_436,
+            deposit: None,
         };
         let batch_data = rome_zk_layouts::batch::write_header(&batch_header);
 
@@ -410,6 +412,7 @@ mod tests {
             acc,
             finalize_cursor: 1,
             open_unix_ts: 1,
+            deposit: None,
         };
         let batch_data = rome_zk_layouts::batch::write_header(&batch_header);
 
@@ -508,6 +511,7 @@ mod tests {
             acc,
             finalize_cursor: n,
             open_unix_ts: 1_789_337_436,
+            deposit: None,
         };
         let batch_data = rome_zk_layouts::batch::write_header(&batch_header);
 

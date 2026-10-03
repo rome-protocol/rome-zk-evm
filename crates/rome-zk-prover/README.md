@@ -79,14 +79,19 @@ pub trait Prover {
 }
 ```
 
-`LocalCargoZisk` runs `<zisk_home>/bin/cargo-zisk prove -e <elf> -i <input> --plonk -y -o <out_file>`
+`LocalCargoZisk` runs `<zisk_home>/bin/cargo-zisk prove -e <elf> -i <input> --plonk -y [-g] -o <out_file>`
 as a subprocess, spawned as the leader of its own new process group. Verified
 (`cargo-zisk` 1.2.0-alpha): `-o <path>` produces the proof at that exact file path (not a directory);
-`--plonk` runs the STARK step and the SNARK wrap in one invocation; there is no `-g`/GPU flag in this
-version — which `cargo-zisk` build `zisk_home` points at (CPU or GPU) is what makes a run GPU-accelerated,
-not a runtime flag, so `LocalCargoZisk::gpu` is reporting metadata only. Per-stage walls
+`--plonk` runs the STARK step and the SNARK wrap in one invocation.
+
+GPU. The GPU build of `cargo-zisk` has a runtime `-g` flag on `prove`, and without it that build proves on the CPU.
+The CPU-only build has no such flag at all. The two builds tell themselves apart in the `--version` line, `[gpu]` or
+`[cpu]`. So `gpu` in the config is a required setting with no default: `gpu = true` passes `-g` and makes the prover
+refuse to start, by name (`GpuBuildRequired`), when the `cargo-zisk` it finds is not the GPU build (the binary checks at
+start-up, `prove()` checks again before every run); `gpu = false` proves on the CPU on purpose. A config that leaves
+`gpu` out is refused, so no node ends up on the CPU by accident. Per-stage walls
 (`GENERATING_WRAPPER_SNARK_PROOF`'s duration, the STARK proof's own wall and step count, whether a
-"verified" line was ever printed) are parsed straight from the subprocess's own stdout/stderr —
+"verified" line was ever printed) are parsed straight from the subprocess's own stdout/stderr -
 never invented when a line does not appear.
 
 A timeout kills the WHOLE process group (`killpg`), not only the direct child pid — a tool that

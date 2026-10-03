@@ -534,6 +534,7 @@ mod tests {
             acc: [0u8; 32],
             finalize_cursor: expected_count,
             open_unix_ts: 1,
+            deposit: None,
         })
         .to_vec()
     }

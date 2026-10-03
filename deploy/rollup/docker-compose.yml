@@ -12,6 +12,8 @@
 #   postgres       the prover's history, a local container. Starts with the prover.
 #
 # Everything except the sequencer's RPC publishes only on 127.0.0.1, and the Engine API (8551) is never published.
+# The host side of every published port can be moved in .env (RPC_PORT, WS_PORT, VERIFIER_RPC_PORT and the four
+# *_METRICS_PORT settings, see .env.example); the numbers above are the defaults. The container side never changes.
 # Each service serves GET /metrics on the port listed with it; scrape them with whatever you run.
 #
 # Files you provide (paths in .env; the container user is uid 999, so the files must be readable by it):
@@ -43,10 +45,10 @@ services:
       - ${SEQUENCER_KEY_PATH:?SEQUENCER_KEY_PATH is not set - run ./rollup init}:/data/sequencer.key:ro
       - sequencer-data:/data/reth
     ports:
-      - "${RPC_BIND:-127.0.0.1}:8545:8545"
-      - "${RPC_BIND:-127.0.0.1}:8546:8546"
+      - "${RPC_BIND:-127.0.0.1}:${RPC_PORT:-8545}:8545"
+      - "${RPC_BIND:-127.0.0.1}:${WS_PORT:-8546}:8546"
       # metrics
-      - "127.0.0.1:9001:9001"
+      - "127.0.0.1:${SEQUENCER_METRICS_PORT:-9001}:9001"
     healthcheck:
       test: ["CMD", "curl", "-sf", "-X", "POST", "-H", "content-type: application/json",
              "--data", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_chainId\",\"params\":[]}",
@@ -73,7 +75,7 @@ services:
       - verifier-data:/root/.local/share/reth
     ports:
       # RPC with the `testing` API: this machine only.
-      - "127.0.0.1:8547:8547"
+      - "127.0.0.1:${VERIFIER_RPC_PORT:-8547}:8547"
     # The reth image has bash but no curl, so the probe speaks HTTP over bash's /dev/tcp.
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8547 && printf 'POST / HTTP/1.0\r\nContent-Type: application/json\r\nContent-Length: 59\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_chainId\",\"params\":[]}' >&3 && timeout 3 grep -q result <&3"]
@@ -94,7 +96,7 @@ services:
       - ${RENDERED_DIR:-./rendered}/jwt.hex:/data/jwt.hex:ro
     ports:
       # metrics
-      - "127.0.0.1:9003:9003"
+      - "127.0.0.1:${DERIVE_METRICS_PORT:-9003}:9003"
     depends_on:
       reth-verifier:
         condition: service_healthy
@@ -111,7 +113,7 @@ services:
       - sequencer-data:/data/reth:ro
     ports:
       # metrics
-      - "127.0.0.1:9002:9002"
+      - "127.0.0.1:${BATCHER_METRICS_PORT:-9002}:9002"
     depends_on:
       sequencer:
         condition: service_healthy
@@ -132,6 +134,11 @@ services:
       options:
         max-size: "100m"
         max-file: "3"
+    # cargo-zisk locks (pins) a large amount of memory while it proves and refuses to run with the default limit.
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
     deploy:
       resources:
         reservations:
@@ -148,7 +155,7 @@ services:
       # The entrypoint checks the proving keys against this manifest before every start (see prover/check-keys.sh).
       - ./prover/check-keys.sh:/opt/prover/check-keys.sh:ro
       - ${PROVER_KEYS_MANIFEST:-./prover/keys.sha256}:/opt/prover/keys.sha256:ro
-      # The ZisK proving keys: about 41 GB to download, about 81 GB once installed (measured on a CPU host).
+      # The ZisK proving keys: about 26 GB to download, about 81 GB once installed (measured on a CPU host).
       # The final proof step needs one NVIDIA GPU with more than 30 GB of memory.
       # A 24 GB card is not enough.
       - ${ZISK_HOME:-/opt/zisk}:/opt/zisk:ro
@@ -156,7 +163,7 @@ services:
       - prover-work:/data/work
     ports:
       # metrics
-      - "127.0.0.1:9004:9004"
+      - "127.0.0.1:${PROVER_METRICS_PORT:-9004}:9004"
     depends_on:
       reth-verifier:
         condition: service_healthy

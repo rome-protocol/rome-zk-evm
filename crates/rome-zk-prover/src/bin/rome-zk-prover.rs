@@ -265,6 +265,11 @@ fn main() -> anyhow::Result<()> {
 
     let cfg = rome_zk_prover::config::Config::load(&args.config)?;
     let vkey = cfg.load_vkey_of_record()?;
+    // gpu = true: stop here, by name, when cargo-zisk is not the GPU build, before any state is touched. A dry run
+    // never proves, so it does not need the GPU build.
+    if cfg.gpu && !args.dry_run {
+        rome_zk_prover::prover::require_gpu_build(&cfg.zisk_home)?;
+    }
     let settlement_program = Pubkey::from_str(&cfg.settlement_program_id)?;
     let inbox_program = Pubkey::from_str(&cfg.inbox_program_id)?;
 

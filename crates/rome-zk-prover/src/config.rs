@@ -69,7 +69,9 @@ pub struct Config {
     pub elf_path: PathBuf,
     pub vkey_json: PathBuf,
     pub zisk_home: PathBuf,
-    #[serde(default)]
+    /// Required, never defaulted: `true` makes the prover pass `-g` and refuse to start unless `cargo-zisk` is the
+    /// GPU build; `false` proves on the CPU on purpose. A config that says nothing is refused, so no node ends up
+    /// proving on the CPU by accident.
     pub gpu: bool,
     pub work_dir: PathBuf,
     pub payer_key_path: PathBuf,
@@ -514,9 +516,31 @@ mod tests {
         elf_path = "elf"
         vkey_json = "vkey.json"
         zisk_home = "/nonexistent/zisk"
+        gpu = true
         work_dir = "/tmp/rome-zk-prover-work"
         payer_key_path = "/nonexistent/payer.json"
     "#;
+
+    #[test]
+    fn a_config_without_the_gpu_setting_is_refused_by_name() {
+        let toml = MINIMAL_VALID_TOML.replace("gpu = true", "");
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(toml.as_bytes()).unwrap();
+        let err = Config::load(f.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, ConfigError::Parse { .. }) && msg.contains("gpu"),
+            "expected a Parse error naming gpu, got {err:?} ({msg})"
+        );
+    }
+
+    #[test]
+    fn gpu_false_is_accepted_when_written_out() {
+        let toml = MINIMAL_VALID_TOML.replace("gpu = true", "gpu = false");
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(toml.as_bytes()).unwrap();
+        assert!(!Config::load(f.path()).unwrap().gpu);
+    }
 
     #[test]
     fn a_minimal_valid_toml_loads_clean() {

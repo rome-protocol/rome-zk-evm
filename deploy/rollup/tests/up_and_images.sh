@@ -53,10 +53,14 @@ else
   echo "SKIP: compose config checks for the prover (docker compose not available; the text checks above ran)"
 fi
 
-# 4. The shipped verify script refuses the shipped placeholder manifest by name and accepts a pinned copy.
+# 4. The shipped manifest is pinned: it refuses a key set that is not Rome's by name. A manifest that still holds the
+# placeholder is refused by name too, and a pinned copy of any key set verifies.
 KH="$WORK/zisk"; mkdir -p "$KH/provingKey" "$KH/provingKeySnark"; echo a > "$KH/provingKey/f1"; echo b > "$KH/provingKeySnark/f2"
 out="$(ZISK_HOME="$KH" bash "$PROVER_DIR/check-keys.sh" 2>&1)"; rc=$?
-[[ $rc == 11 ]] && grep -q KeysManifestUnpinned <<<"$out" && pass "the shipped manifest is a placeholder: KeysManifestUnpinned, exit 11" || fail "the shipped manifest is refused by name" "rc=$rc $out"
+[[ $rc == 12 ]] && grep -q KeysShaMismatch <<<"$out" && pass "the shipped manifest is pinned: another key set is KeysShaMismatch, exit 12" || fail "the shipped manifest refuses another key set by name" "rc=$rc $out"
+printf 'UNPINNED_PENDING_FIRST_BOOTSTRAP  provingKey\nUNPINNED_PENDING_FIRST_BOOTSTRAP  provingKeySnark\n' > "$WORK/placeholder.sha256"
+out="$(ZISK_HOME="$KH" MANIFEST="$WORK/placeholder.sha256" bash "$PROVER_DIR/check-keys.sh" 2>&1)"; rc=$?
+[[ $rc == 11 ]] && grep -q KeysManifestUnpinned <<<"$out" && pass "a placeholder manifest is refused: KeysManifestUnpinned, exit 11" || fail "a placeholder manifest is refused by name" "rc=$rc $out"
 cp "$PROVER_DIR/keys.sha256" "$WORK/keys.sha256"
 ZISK_HOME="$KH" MANIFEST="$WORK/keys.sha256" bash "$PROVER_DIR/check-keys.sh" --write >/dev/null 2>&1
 ZISK_HOME="$KH" MANIFEST="$WORK/keys.sha256" bash "$PROVER_DIR/check-keys.sh" >/dev/null 2>&1 && pass "a manifest pinned with --write verifies" || fail "a pinned manifest verifies" "refused"

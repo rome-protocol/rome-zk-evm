@@ -101,6 +101,7 @@ mod tests {
         rome_zk_layouts::cursor::write(&rome_zk_layouts::cursor::CursorFields {
             chain_id,
             next_batch,
+            deposit: None,
         })
         .to_vec()
     }

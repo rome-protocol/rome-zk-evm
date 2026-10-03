@@ -31,6 +31,7 @@ pub mod chainid;
 pub mod chunk;
 pub mod cursor;
 pub mod deposit;
+pub mod deposit_queue;
 pub mod exit;
 pub mod frame;
 pub mod global_config;

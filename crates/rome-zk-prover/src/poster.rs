@@ -577,6 +577,7 @@ mod tests {
             acc,
             finalize_cursor: gate_expected_chunk_count(),
             open_unix_ts: GATE_OPEN_UNIX_TS,
+            deposit: None,
         })
         .to_vec()
     }

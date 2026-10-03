@@ -210,6 +210,7 @@ mod tests {
             acc: [0u8; 32],
             finalize_cursor: 0,
             open_unix_ts: PLAUSIBLE_OPEN_UNIX_TS,
+            deposit: None,
         });
         let mut d = vec![0u8; rome_zk_layouts::batch::account_len(expected_count)];
         d[..rome_zk_layouts::batch::HEADER_LEN].copy_from_slice(&header);
@@ -220,6 +221,7 @@ mod tests {
         rome_zk_layouts::cursor::write(&rome_zk_layouts::cursor::CursorFields {
             chain_id,
             next_batch,
+            deposit: None,
         })
         .to_vec()
     }

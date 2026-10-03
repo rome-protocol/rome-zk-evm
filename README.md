@@ -75,10 +75,10 @@ The portable [`deploy/rollup/`](deploy/rollup/) directory is available, with set
 [Run on Solana devnet](docs/RUN-ON-DEVNET.md) walks through running your own chain on Rome's shared settlement.
 [Devnet trust model](docs/TRUST-MODEL.md) explains who controls the shared programs and what they enforce.
 [Monitoring one rollup](docs/MONITORING.md) covers health checks and example alerts for that chain.
+[Prover host](docs/PROVER-HOST.md) sets up the GPU machine that proves your chain's batches.
 For the available services and their configuration, start with
 [Deployment](docs/ARCHITECTURE.md#deployment) and the [component READMEs](docs/ARCHITECTURE.md#components).
 
 ## License
 
-The public repository will use Apache-2.0. The workspace already declares it in `Cargo.toml`;
-the root `LICENSE` file is still pending.
+Apache-2.0. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).

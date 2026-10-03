@@ -28,13 +28,6 @@ ENV_FILE="$(abs "${ROLLUP_ENV:-$ROLLUP_DIR/.env}")"
 CHAIN_TOML="$(abs "${CHAIN_TOML:-$ROLLUP_DIR/chain.toml}")"
 OUT="$(abs "${ROLLUP_OUT:-$ROLLUP_DIR/rendered}")"
 
-# Where the node's own ports are, on this machine.
-SEQUENCER_RPC="http://127.0.0.1:8545"
-VERIFIER_RPC="http://127.0.0.1:8547"
-METRICS_SEQUENCER="http://127.0.0.1:9001/metrics"
-METRICS_BATCHER="http://127.0.0.1:9002/metrics"
-METRICS_PROVER="http://127.0.0.1:9004/metrics"
-
 die() { echo "$1: $2" >&2; exit 1; }
 
 # cfg KEY [DEFAULT] -> the process environment wins, then the .env file, then the default.
@@ -43,6 +36,25 @@ cfg() {
   [[ -n "$v" ]] || v="$(rz_env_get "$ENV_FILE" "$key")"
   printf '%s' "${v:-$def}"
 }
+
+# Where the node's own ports are, on this machine. The host side of each port comes from the same settings the
+# compose file reads (see .env.example), with today's numbers as the defaults.
+RPC_PORT="$(cfg RPC_PORT 8545)"
+WS_PORT="$(cfg WS_PORT 8546)"
+VERIFIER_RPC_PORT="$(cfg VERIFIER_RPC_PORT 8547)"
+SEQUENCER_METRICS_PORT="$(cfg SEQUENCER_METRICS_PORT 9001)"
+BATCHER_METRICS_PORT="$(cfg BATCHER_METRICS_PORT 9002)"
+DERIVE_METRICS_PORT="$(cfg DERIVE_METRICS_PORT 9003)"
+PROVER_METRICS_PORT="$(cfg PROVER_METRICS_PORT 9004)"
+PORT_VARS=(RPC_PORT WS_PORT VERIFIER_RPC_PORT SEQUENCER_METRICS_PORT BATCHER_METRICS_PORT DERIVE_METRICS_PORT PROVER_METRICS_PORT)
+for _v in "${PORT_VARS[@]}"; do
+  [[ "${!_v}" =~ ^[0-9]+$ && "${!_v}" -ge 1 && "${!_v}" -le 65535 ]] || die PortInvalid "$_v is '${!_v}', expected a port number from 1 to 65535"
+done
+SEQUENCER_RPC="http://127.0.0.1:$RPC_PORT"
+VERIFIER_RPC="http://127.0.0.1:$VERIFIER_RPC_PORT"
+METRICS_SEQUENCER="http://127.0.0.1:$SEQUENCER_METRICS_PORT/metrics"
+METRICS_BATCHER="http://127.0.0.1:$BATCHER_METRICS_PORT/metrics"
+METRICS_PROVER="http://127.0.0.1:$PROVER_METRICS_PORT/metrics"
 
 load_env() {
   [[ -f "$ENV_FILE" ]] || die EnvMissing "$ENV_FILE does not exist (copy .env.example to .env and edit it)"
@@ -265,6 +277,7 @@ cmd_init() {
     echo "SEQUENCER_KEY_PATH=$seq_key"
     echo "PAYER_KEYPAIR_PATH=$payer_key"
     echo "RPC_BIND=$(cfg RPC_BIND 127.0.0.1)"
+    for opt in "${PORT_VARS[@]}"; do echo "$opt=${!opt}"; done
     echo "PROVER_DB_PASSWORD_FILE=$OUT/prover-db-password"
     for opt in ROME_ZK_IMAGE ROME_ZK_TAG ROME_ZK_PROVER_IMAGE VERIFIER_PROOF_WINDOW; do
       v="$(cfg "$opt")"; [[ -z "$v" ]] || echo "$opt=$v"

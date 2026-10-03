@@ -475,6 +475,9 @@ pub struct BatchAccount {
     /// v2: the committed `Clock::unix_timestamp` `OpenBatch` wrote alongside `open_slot` — the anchor
     /// `rome-zk-derive`'s one-sided drift bound checks every block's timestamp against. Not part of `acc`.
     pub open_unix_ts: i64,
+    /// v3: the batch's deposit range `[from, to)` and the queue's hash-chain values at its ends.
+    /// `None` for a v2 header.
+    pub deposit: Option<rome_zk_layouts::batch::BatchDeposit>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -515,6 +518,7 @@ pub fn decode_batch_account(d: &[u8]) -> Result<BatchAccount, DecodeError> {
         acc: f.acc,
         finalize_cursor: f.finalize_cursor,
         open_unix_ts: f.open_unix_ts,
+        deposit: f.deposit,
     })
 }
 
@@ -523,6 +527,8 @@ pub fn decode_batch_account(d: &[u8]) -> Result<BatchAccount, DecodeError> {
 pub struct BatchCursor {
     pub chain_id: u64,
     pub next_batch: u64,
+    /// v2: the deposit cursor. `None` for a v1 cursor.
+    pub deposit: Option<rome_zk_layouts::cursor::CursorDeposit>,
 }
 
 /// Decodes via `rome_zk_layouts::cursor::read` — the single definition of this layout, shared with the
@@ -538,6 +544,7 @@ pub fn decode_batch_cursor(d: &[u8]) -> Result<BatchCursor, DecodeError> {
     Ok(BatchCursor {
         chain_id: f.chain_id,
         next_batch: f.next_batch,
+        deposit: f.deposit,
     })
 }
 
@@ -816,6 +823,32 @@ pub fn reference_commitment(
     open_slot: u64,
     chunk_hashes: &[[u8; 32]],
 ) -> ([u8; 32], [u8; 32], [u8; 32]) {
+    reference_commitment_with_deposits(
+        chain_id,
+        batch,
+        open_slot,
+        chunk_hashes,
+        &rome_zk_layouts::batch::BatchDeposit {
+            from: 0,
+            to: 0,
+            hash_from: [0; 32],
+            hash_to: [0; 32],
+        },
+    )
+}
+
+/// [`reference_commitment`] for a batch whose deposit range is `range` (a v3 header's
+/// `deposit_from`, `deposit_to` and the two hash-chain values): `forced_root` is
+/// `rome_zk_layouts::deposit::forced_root` over the range, so an empty range (`from == to`, whatever
+/// the hashes) gives the constant `forced_empty_root` and the same `(root, forced_root, acc)` as
+/// [`reference_commitment`], which is this function's empty-range wrapper.
+pub fn reference_commitment_with_deposits(
+    chain_id: u64,
+    batch: u64,
+    open_slot: u64,
+    chunk_hashes: &[[u8; 32]],
+    range: &rome_zk_layouts::batch::BatchDeposit,
+) -> ([u8; 32], [u8; 32], [u8; 32]) {
     let sk = rome_zk_merkle::keccak256 as fn(&[&[u8]]) -> [u8; 32];
     let leaves: Vec<[u8; 32]> = chunk_hashes
         .iter()
@@ -823,7 +856,13 @@ pub fn reference_commitment(
         .map(|(i, h)| rome_zk_merkle::indexed_leaf(&sk, i as u32, h))
         .collect();
     let root = rome_zk_merkle::root(&sk, &leaves);
-    let forced_root = rome_zk_layouts::forced_empty_root(&sk);
+    let forced_root = rome_zk_layouts::deposit::forced_root(
+        &sk,
+        range.from,
+        range.to,
+        &range.hash_from,
+        &range.hash_to,
+    );
     let expected_count = chunk_hashes.len() as u32;
     let acc = rome_zk_layouts::acc(
         &sk,
@@ -1016,6 +1055,131 @@ mod tests {
         assert_eq!(root, expected_leaf, "single-leaf root is the leaf itself");
     }
 
+    fn hex32(h: &str) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap();
+        }
+        out
+    }
+
+    // The deposit range goldens below are the deposit module's (settlement program [0x33; 32],
+    // chain 7, the three records in its tests); the `acc` values come from an independent Python
+    // keccak over chain 7, batch 1, open_slot 1000, one chunk hash [9; 32] (leaf = keccak(0u32 le
+    // ‖ hash) = the root of a one-leaf tree).
+    const SEED: &str = "7b62297f72fe3a90eecade8f81e0197b8fef15f5b4c5a10930e1fd3bffd777f3";
+    const AFTER_1: &str = "8c6b4a978661d6d251ed888e8f89a4cf6b18dfdfe9cd1d1a472d6196273cdf86";
+    const AFTER_3: &str = "68cd40fac4d5ed9f0cdcf6f38a56a8eaf65dd1b11cc1d23e96b70eed7a85e1b2";
+    const FORCED_ROOT_0_3: &str =
+        "34f7c42e5502c795aea99b9dc9b34a1095ea347f975609863ac1d0351b8dfee8";
+    const FORCED_ROOT_1_3: &str =
+        "0f101d970e8e9e8ff754ad5c5d86950026a3353ee17449c9191511cbbeb245dc";
+    const ACC_0_3: &str = "af938948e05a4125e80ef5389c3679441f8418a9ed839818a5c3173c1e8f3468";
+    const ACC_1_3: &str = "38f6ff87a66d8d17466e3aa342800034e8fa588440dd9ce35fd1dd16cfaf32db";
+    const ACC_EMPTY: &str = "90b0e9679983dfa450a33d8f5bdf1ab83d5d6e7965e16d032526a757b986c6ff";
+
+    /// With an empty range the new commitment equals the old function's, whatever hashes ride along.
+    #[test]
+    fn reference_commitment_with_an_empty_range_equals_the_old_one() {
+        let hashes = [[9u8; 32]];
+        let old = reference_commitment(7, 1, 1000, &hashes);
+        assert_eq!(
+            hex_of(&old.2),
+            ACC_EMPTY,
+            "the old function's acc is unchanged"
+        );
+        for (from, to) in [(0u64, 0u64), (5, 5)] {
+            let range = rome_zk_layouts::batch::BatchDeposit {
+                from,
+                to,
+                hash_from: [0xaa; 32],
+                hash_to: [0xbb; 32],
+            };
+            assert_eq!(
+                reference_commitment_with_deposits(7, 1, 1000, &hashes, &range),
+                old
+            );
+        }
+    }
+
+    fn hex_of(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// With a real range, `forced_root` and `acc` equal the independently computed goldens; the root
+    /// (inbox leaves) does not depend on the range.
+    #[test]
+    fn reference_commitment_with_a_range_matches_the_goldens() {
+        let hashes = [[9u8; 32]];
+        let (root0, _, _) = reference_commitment(7, 1, 1000, &hashes);
+        for (from, to, h_from, h_to, want_forced, want_acc) in [
+            (0u64, 3u64, SEED, AFTER_3, FORCED_ROOT_0_3, ACC_0_3),
+            (1, 3, AFTER_1, AFTER_3, FORCED_ROOT_1_3, ACC_1_3),
+        ] {
+            let range = rome_zk_layouts::batch::BatchDeposit {
+                from,
+                to,
+                hash_from: hex32(h_from),
+                hash_to: hex32(h_to),
+            };
+            let (root, forced, acc) =
+                reference_commitment_with_deposits(7, 1, 1000, &hashes, &range);
+            assert_eq!(root, root0);
+            assert_eq!(hex_of(&forced), want_forced);
+            assert_eq!(hex_of(&acc), want_acc);
+        }
+    }
+
+    #[test]
+    fn decode_batch_account_reads_a_v3_header_and_a_v2_header() {
+        let v3 = rome_zk_layouts::batch::BatchFields {
+            chain_id: 7,
+            batch: 3,
+            open_slot: 100,
+            expected_count: 9,
+            leaves_present: 0,
+            finalized: false,
+            settlement_program: [1; 32],
+            authority: [2; 32],
+            root: [3; 32],
+            forced_root: [4; 32],
+            acc: [5; 32],
+            finalize_cursor: 0,
+            open_unix_ts: 11,
+            deposit: Some(rome_zk_layouts::batch::BatchDeposit {
+                from: 4,
+                to: 6,
+                hash_from: [6; 32],
+                hash_to: [7; 32],
+            }),
+        };
+        let mut d = vec![0u8; rome_zk_layouts::batch::account_len_for(3, 9).unwrap()];
+        d[..rome_zk_layouts::batch::HEADER_LEN_V3]
+            .copy_from_slice(&rome_zk_layouts::batch::write_header_v3(&v3).unwrap());
+        let a = decode_batch_account(&d).unwrap();
+        assert_eq!(a.deposit, v3.deposit);
+        assert_eq!(a.open_unix_ts, 11);
+        assert_eq!(a.expected_count, 9);
+
+        let mut d2 = vec![0u8; rome_zk_layouts::batch::account_len(9)];
+        d2[..rome_zk_layouts::batch::HEADER_LEN].copy_from_slice(
+            &rome_zk_layouts::batch::write_header(&rome_zk_layouts::batch::BatchFields {
+                deposit: None,
+                ..v3
+            }),
+        );
+        let a2 = decode_batch_account(&d2).unwrap();
+        assert_eq!(a2.deposit, None);
+        assert_eq!(a2.open_unix_ts, 11);
+
+        // Version 4 is refused by name.
+        d[4] = 4;
+        assert!(matches!(
+            decode_batch_account(&d).unwrap_err(),
+            DecodeError::BadVersion
+        ));
+    }
+
     /// `chunk_account_index`/`batch_account_index` must agree with every real `*_ix` builder's own `AccountMeta`
     /// order — decode the builder's own instruction data back into an `InboxIx` (the same round trip a consumer
     /// does) and check the index against the builder's own `accounts` list, never a hand-copied literal.
@@ -1154,6 +1318,44 @@ mod tests {
         let c = decode_batch_cursor(&d).unwrap();
         assert_eq!(c.chain_id, 11);
         assert_eq!(c.next_batch, 3);
+    }
+
+    #[test]
+    fn decode_batch_cursor_reads_a_v2_cursor_and_a_v1_cursor() {
+        use rome_zk_layouts::cursor;
+        let v2 = cursor::write_v2(&cursor::CursorFields {
+            chain_id: 11,
+            next_batch: 3,
+            deposit: Some(cursor::CursorDeposit {
+                next: 5,
+                hash: [8; 32],
+                final_: 4,
+            }),
+        })
+        .unwrap();
+        assert_eq!(v2.len(), 69);
+        let c = decode_batch_cursor(&v2).unwrap();
+        assert_eq!((c.chain_id, c.next_batch), (11, 3));
+        assert_eq!(
+            c.deposit,
+            Some(cursor::CursorDeposit {
+                next: 5,
+                hash: [8; 32],
+                final_: 4
+            })
+        );
+        let mut d = v2.to_vec();
+        d[4] = 3;
+        assert!(matches!(
+            decode_batch_cursor(&d).unwrap_err(),
+            DecodeError::BadVersion
+        ));
+        let v1 = cursor::write(&cursor::CursorFields {
+            chain_id: 11,
+            next_batch: 3,
+            deposit: None,
+        });
+        assert_eq!(decode_batch_cursor(&v1).unwrap().deposit, None);
     }
 
     /// `account_len(312) = 10,225 <= MAX_PERMITTED_DATA_INCREASE` (10,240): `OpenBatch` alone reaches

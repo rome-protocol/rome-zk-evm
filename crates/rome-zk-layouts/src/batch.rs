@@ -24,9 +24,25 @@
 //! Merkle/acc chain. There is no migration: a v1 account (`OFF_VERSION == 1`) is refused by every reader
 //! (`BadVersion`) — Tiber's v1 batches are wiped by the chain reset, never
 //! upgraded in place.
+//!
+//! **Header version 3** appends the batch's deposit range after `open_unix_ts`, the same way v2
+//! appended that field:
+//!
+//! ```text
+//! | (v3 only) deposit_from u64 | deposit_to u64 | deposit_hash_from [32] | deposit_hash_to [32]
+//! ```
+//!
+//! The header goes from 210 to 290 bytes and every v2 offset stays where it is. [`read`] accepts v2 and
+//! v3. [`write_header`] still writes v2 (the inbox keeps writing v2 until it learns deposits) and
+//! [`write_header_v3`] writes v3. Because the header length now depends on the account's version, the
+//! version-taking [`header_len`], [`leaves_offset_for`] and [`account_len_for`] sit beside the old
+//! one-version names, which stay for v2 until every caller passes its version.
 
 pub const MAGIC: u32 = 0x5a4b_4254; // "ZKBT"
+/// The version [`write_header`] produces.
 pub const VERSION: u8 = 2;
+/// The version with the deposit range appended; see the module doc.
+pub const VERSION_V3: u8 = 3;
 
 pub const OFF_MAGIC: usize = 0;
 pub const OFF_VERSION: usize = 4;
@@ -45,9 +61,28 @@ pub const OFF_FINALIZE_CURSOR: usize = 198;
 /// v2: the committed Solana clock reading `OpenBatch` takes alongside `open_slot` —
 /// see this module's doc for why it lives here (appended, not part of `acc`).
 pub const OFF_OPEN_UNIX_TS: usize = 202;
-/// End of the fixed header; the presence bitmap starts here. v1 was 202 (no `open_unix_ts`); every v1
-/// account is refused (`BadVersion`), never read at the old length.
+/// v3: first deposit index of the batch's range.
+pub const OFF_DEPOSIT_FROM: usize = 210;
+/// v3: end (exclusive) of the batch's deposit range.
+pub const OFF_DEPOSIT_TO: usize = 218;
+/// v3: the queue's hash-chain value before deposit `deposit_from`.
+pub const OFF_DEPOSIT_HASH_FROM: usize = 226;
+/// v3: the queue's hash-chain value before deposit `deposit_to`.
+pub const OFF_DEPOSIT_HASH_TO: usize = 258;
+/// End of the fixed v2 header; the presence bitmap starts here. v1 was 202 (no `open_unix_ts`); every v1
+/// account is refused (`BadVersion`), never read at the old length. A v3 header is [`HEADER_LEN_V3`].
 pub const HEADER_LEN: usize = 210;
+/// End of the fixed v3 header (v2's 210 plus the 80-byte deposit range).
+pub const HEADER_LEN_V3: usize = 290;
+
+/// Fixed header length for the account's `version` byte (2 or 3); `BadVersion` for any other.
+pub fn header_len(version: u8) -> Result<usize, crate::LayoutError> {
+    match version {
+        VERSION => Ok(HEADER_LEN),
+        VERSION_V3 => Ok(HEADER_LEN_V3),
+        _ => Err(crate::LayoutError::BadVersion),
+    }
+}
 
 /// `ceil(expected_count / 8)` bytes for the leaf-presence bitmap.
 pub fn bitmap_len(expected_count: u32) -> usize {
@@ -62,6 +97,16 @@ pub fn leaves_offset(expected_count: u32) -> usize {
 /// Total account size for `expected_count` leaves.
 pub fn account_len(expected_count: u32) -> usize {
     leaves_offset(expected_count) + 32 * expected_count as usize
+}
+
+/// [`leaves_offset`] for an account of `version` (2 or 3).
+pub fn leaves_offset_for(version: u8, expected_count: u32) -> Result<usize, crate::LayoutError> {
+    Ok(header_len(version)? + bitmap_len(expected_count))
+}
+
+/// [`account_len`] for an account of `version` (2 or 3).
+pub fn account_len_for(version: u8, expected_count: u32) -> Result<usize, crate::LayoutError> {
+    Ok(leaves_offset_for(version, expected_count)? + 32 * expected_count as usize)
 }
 
 /// `["batch", settlement_program, chain_id, batch]` — owned by the inbox program. The settlement program is
@@ -114,6 +159,19 @@ pub struct BatchFields {
     /// v2: the committed `Clock::unix_timestamp` `OpenBatch` wrote alongside
     /// `open_slot`. Not part of `acc`.
     pub open_unix_ts: i64,
+    /// `Some` for a v3 header, `None` for v2.
+    pub deposit: Option<BatchDeposit>,
+}
+
+/// The v3 deposit range: the four fields appended after `open_unix_ts`. The range is `[from, to)`;
+/// `hash_from` and `hash_to` are the queue's hash-chain values before deposit `from` and before
+/// deposit `to`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchDeposit {
+    pub from: u64,
+    pub to: u64,
+    pub hash_from: [u8; 32],
+    pub hash_to: [u8; 32],
 }
 
 /// Validates magic + version + minimum length and decodes the fixed header. Does not check the
@@ -124,7 +182,10 @@ pub struct BatchFields {
 /// bytes; a length check ahead of the version check would report a v1 account as merely `TooShort`
 /// rather than naming the real cause. So magic and version are checked as soon as there are enough bytes
 /// to read them (`OFF_VERSION + 1`), and only a header that passes both is then checked against the full
-/// v2 `HEADER_LEN` — a v1 account gets `BadVersion`, never `TooShort`.
+/// header length of the version it names — a v1 account gets `BadVersion`, never `TooShort`.
+///
+/// Accepts v2 (`deposit: None`, 210-byte header) and v3 (`deposit: Some`, 290-byte header); any other
+/// version is `BadVersion`.
 pub fn read(d: &[u8]) -> Result<BatchFields, crate::LayoutError> {
     if d.len() < OFF_VERSION + 1 {
         return Err(crate::LayoutError::TooShort {
@@ -135,14 +196,9 @@ pub fn read(d: &[u8]) -> Result<BatchFields, crate::LayoutError> {
     if u32::from_le_bytes(d[OFF_MAGIC..OFF_MAGIC + 4].try_into().unwrap()) != MAGIC {
         return Err(crate::LayoutError::BadMagic);
     }
-    if d[OFF_VERSION] != VERSION {
-        return Err(crate::LayoutError::BadVersion);
-    }
-    if d.len() < HEADER_LEN {
-        return Err(crate::LayoutError::TooShort {
-            need: HEADER_LEN,
-            got: d.len(),
-        });
+    let need = header_len(d[OFF_VERSION])?;
+    if d.len() < need {
+        return Err(crate::LayoutError::TooShort { need, got: d.len() });
     }
     let u32_at = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
     let u64_at = |o: usize| u64::from_le_bytes(d[o..o + 8].try_into().unwrap());
@@ -162,14 +218,22 @@ pub fn read(d: &[u8]) -> Result<BatchFields, crate::LayoutError> {
         acc: b32_at(OFF_ACC),
         finalize_cursor: u32_at(OFF_FINALIZE_CURSOR),
         open_unix_ts: i64_at(OFF_OPEN_UNIX_TS),
+        deposit: (d[OFF_VERSION] == VERSION_V3).then(|| BatchDeposit {
+            from: u64_at(OFF_DEPOSIT_FROM),
+            to: u64_at(OFF_DEPOSIT_TO),
+            hash_from: b32_at(OFF_DEPOSIT_HASH_FROM),
+            hash_to: b32_at(OFF_DEPOSIT_HASH_TO),
+        }),
     })
 }
 
-/// Encodes a batch account's fixed header (the inverse of [`read`], for the header portion only — the
-/// caller writes the presence bitmap and leaf hashes itself via [`leaves_offset`]). Returns exactly
-/// [`HEADER_LEN`] bytes.
+/// Encodes a **v2** batch account's fixed header (the inverse of [`read`] for a v2 header, for the
+/// header portion only — the caller writes the presence bitmap and leaf hashes itself via
+/// [`leaves_offset`]). Returns exactly [`HEADER_LEN`] bytes. A v2 header cannot carry a deposit
+/// range, so `f.deposit` must be `None`; use [`write_header_v3`] for one that has it.
 #[inline]
 pub fn write_header(f: &BatchFields) -> [u8; HEADER_LEN] {
+    debug_assert!(f.deposit.is_none(), "a v2 header has no deposit range");
     let mut d = [0u8; HEADER_LEN];
     d[OFF_MAGIC..OFF_MAGIC + 4].copy_from_slice(&MAGIC.to_le_bytes());
     d[OFF_VERSION] = VERSION;
@@ -188,6 +252,25 @@ pub fn write_header(f: &BatchFields) -> [u8; HEADER_LEN] {
         .copy_from_slice(&f.finalize_cursor.to_le_bytes());
     d[OFF_OPEN_UNIX_TS..OFF_OPEN_UNIX_TS + 8].copy_from_slice(&f.open_unix_ts.to_le_bytes());
     d
+}
+
+/// Encodes a **v3** batch account's fixed header: [`write_header`]'s bytes with the version byte 3 and
+/// the deposit range appended. Returns exactly [`HEADER_LEN_V3`] bytes, or `None` when `f.deposit` is
+/// `None` (there is nothing to put in the appended fields).
+#[inline]
+pub fn write_header_v3(f: &BatchFields) -> Option<[u8; HEADER_LEN_V3]> {
+    let dep = f.deposit.as_ref()?;
+    let mut d = [0u8; HEADER_LEN_V3];
+    d[..HEADER_LEN].copy_from_slice(&write_header(&BatchFields {
+        deposit: None,
+        ..f.clone()
+    }));
+    d[OFF_VERSION] = VERSION_V3;
+    d[OFF_DEPOSIT_FROM..OFF_DEPOSIT_FROM + 8].copy_from_slice(&dep.from.to_le_bytes());
+    d[OFF_DEPOSIT_TO..OFF_DEPOSIT_TO + 8].copy_from_slice(&dep.to.to_le_bytes());
+    d[OFF_DEPOSIT_HASH_FROM..OFF_DEPOSIT_HASH_FROM + 32].copy_from_slice(&dep.hash_from);
+    d[OFF_DEPOSIT_HASH_TO..OFF_DEPOSIT_HASH_TO + 32].copy_from_slice(&dep.hash_to);
+    Some(d)
 }
 
 #[cfg(test)]
@@ -216,6 +299,7 @@ mod tests {
             acc: [0x55u8; 32],
             finalize_cursor: 9,
             open_unix_ts: 1_700_000_000,
+            deposit: None,
         };
         let d = write_header(&f);
         #[rustfmt::skip]
@@ -268,6 +352,186 @@ mod tests {
         ];
         assert_eq!(d, expected);
         assert_eq!(read(&d).unwrap(), f);
+    }
+
+    fn v3_fields() -> BatchFields {
+        BatchFields {
+            chain_id: 7,
+            batch: 3,
+            open_slot: 100,
+            expected_count: 5,
+            leaves_present: 2,
+            finalized: true,
+            settlement_program: [0x11u8; 32],
+            authority: [0x22u8; 32],
+            root: [0x33u8; 32],
+            forced_root: [0x44u8; 32],
+            acc: [0x55u8; 32],
+            finalize_cursor: 9,
+            open_unix_ts: 1_700_000_000,
+            deposit: Some(BatchDeposit {
+                from: 4,
+                to: 6,
+                hash_from: [0x66u8; 32],
+                hash_to: [0x77u8; 32],
+            }),
+        }
+    }
+
+    /// Byte-golden test for v3: a **literal** 290-byte vector (no `OFF_*`). Bytes 0..210 are the v2
+    /// literal above with the version byte changed to 3; the deposit range sits at 210, 218, 226, 258.
+    #[test]
+    fn write_header_v3_produces_a_known_byte_vector() {
+        let f = v3_fields();
+        let d = write_header_v3(&f).unwrap();
+        #[rustfmt::skip]
+        let expected: [u8; 290] = [
+            // magic 'ZKBT' = 0x5a4b_4254 LE
+            0x54, 0x42, 0x4b, 0x5a,
+            // version = 3
+            3,
+            // chain_id = 7, batch = 3, open_slot = 100 (LE u64 each)
+            7, 0, 0, 0, 0, 0, 0, 0,
+            3, 0, 0, 0, 0, 0, 0, 0,
+            100, 0, 0, 0, 0, 0, 0, 0,
+            // expected_count = 5, leaves_present = 2 (LE u32 each)
+            5, 0, 0, 0,
+            2, 0, 0, 0,
+            // finalized
+            1,
+            // settlement_program (offset 38): 32 bytes of 0x11
+            0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+            0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+            0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+            0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+            // authority (70): 0x22
+            0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
+            0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
+            0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
+            0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
+            // root (102): 0x33
+            0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33,
+            0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33,
+            0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33,
+            0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33,
+            // forced_root (134): 0x44
+            0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44,
+            0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44,
+            0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44,
+            0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44,
+            // acc (166): 0x55
+            0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+            0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+            0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+            0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+            // finalize_cursor = 9 (198)
+            9, 0, 0, 0,
+            // open_unix_ts = 1_700_000_000 (202)
+            0x00, 0xf1, 0x53, 0x65, 0x00, 0x00, 0x00, 0x00,
+            // deposit_from = 4 (210)
+            4, 0, 0, 0, 0, 0, 0, 0,
+            // deposit_to = 6 (218)
+            6, 0, 0, 0, 0, 0, 0, 0,
+            // deposit_hash_from (226): 0x66
+            0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+            0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+            0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+            0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+            // deposit_hash_to (258): 0x77
+            0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77,
+            0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77,
+            0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77,
+            0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77,
+        ];
+        assert_eq!(d, expected);
+        assert_eq!(read(&d).unwrap(), f);
+    }
+
+    /// A v2 header reads exactly as before: version 2, 210 bytes, no deposit range, and the same
+    /// fields as the v3 literal's first 210 bytes.
+    #[test]
+    fn a_v2_header_reads_with_no_deposit_range() {
+        let v3 = v3_fields();
+        let v2 = BatchFields {
+            deposit: None,
+            ..v3.clone()
+        };
+        let d = write_header(&v2);
+        assert_eq!(d.len(), 210);
+        assert_eq!(d[OFF_VERSION], 2);
+        assert_eq!(read(&d).unwrap(), v2);
+        // v3 and v2 differ only in the version byte and the appended range.
+        let d3 = write_header_v3(&v3).unwrap();
+        assert_eq!(d3[..OFF_VERSION], d[..OFF_VERSION]);
+        assert_eq!(d3[OFF_VERSION + 1..HEADER_LEN], d[OFF_VERSION + 1..]);
+        // A v2 account whose allocation is longer than the header (bitmap, leaves) is still v2.
+        let mut full = d.to_vec();
+        full.resize(account_len(5), 0xee);
+        assert_eq!(read(&full).unwrap().deposit, None);
+    }
+
+    #[test]
+    fn a_v3_header_shorter_than_290_bytes_is_too_short() {
+        let d = write_header_v3(&v3_fields()).unwrap();
+        assert_eq!(
+            read(&d[..HEADER_LEN_V3 - 1]).unwrap_err(),
+            crate::LayoutError::TooShort {
+                need: HEADER_LEN_V3,
+                got: HEADER_LEN_V3 - 1
+            }
+        );
+        // 210 bytes with the v3 version byte is not enough either.
+        let mut short = write_header(&BatchFields {
+            deposit: None,
+            ..v3_fields()
+        });
+        short[OFF_VERSION] = 3;
+        assert!(matches!(
+            read(&short).unwrap_err(),
+            crate::LayoutError::TooShort { need: 290, .. }
+        ));
+    }
+
+    #[test]
+    fn versions_other_than_2_and_3_are_refused() {
+        for v in [0u8, 1, 4, 0xff] {
+            let mut d = write_header_v3(&v3_fields()).unwrap();
+            d[OFF_VERSION] = v;
+            assert_eq!(read(&d).unwrap_err(), crate::LayoutError::BadVersion, "{v}");
+            assert_eq!(header_len(v), Err(crate::LayoutError::BadVersion));
+            assert_eq!(account_len_for(v, 1), Err(crate::LayoutError::BadVersion));
+        }
+    }
+
+    #[test]
+    fn write_header_v3_needs_a_deposit_range() {
+        let f = BatchFields {
+            deposit: None,
+            ..v3_fields()
+        };
+        assert!(write_header_v3(&f).is_none());
+    }
+
+    #[test]
+    fn version_taking_lengths_match_the_old_names_for_v2_and_add_80_for_v3() {
+        assert_eq!(header_len(2), Ok(210));
+        assert_eq!(header_len(3), Ok(290));
+        for n in [0u32, 1, 8, 9, 900] {
+            assert_eq!(leaves_offset_for(2, n), Ok(leaves_offset(n)));
+            assert_eq!(account_len_for(2, n), Ok(account_len(n)));
+            assert_eq!(leaves_offset_for(3, n), Ok(leaves_offset(n) + 80));
+            assert_eq!(account_len_for(3, n), Ok(account_len(n) + 80));
+        }
+    }
+
+    /// 900 leaves in a v3 account: 290 + 113 (bitmap) + 28,800 (leaf hashes) = 29,203 bytes, inside
+    /// the open allocation plus two grows (30,720 bytes).
+    #[test]
+    fn a_v3_account_for_900_leaves_is_29_203_bytes() {
+        assert_eq!(account_len_for(3, 900), Ok(29_203));
+        assert_eq!(leaves_offset_for(3, 900), Ok(403));
+        // Open plus two grows at 10,240 bytes each.
+        assert!(account_len_for(3, 900).unwrap() <= 3 * 10_240);
     }
 
     /// A v1-shaped account (version byte 1, the old 202-byte length, no

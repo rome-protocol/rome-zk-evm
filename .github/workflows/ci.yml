@@ -119,6 +119,34 @@ jobs:
             echo "::endgroup::"
           done
           exit "$status"
+  # The outside path, end to end, on a GitHub-hosted runner: what a stranger does with this repository, against a local
+  # validator. It builds the node image from this commit, starts solana-test-validator with zk-inbox, zk-settlement and
+  # veritas from the build-sbf artifact, sets up the settlement global config, runs ./rollup init, ./rollup register
+  # (permissionless) and ./rollup up without the prover, sends L2 transactions, waits for FinalizeBatch on the inbox and
+  # checks that derive's head is the sequencer's and that the verifier has no peers. Nothing here reaches a public
+  # Solana cluster or a public Ethereum network. The image build is cold on a hosted runner, so the limit is generous.
+  outsider-path:
+    needs: build-sbf
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - name: Free disk space for the image build
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h / | tail -1
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/download-artifact@v7
+        with:
+          name: programs
+          path: target/deploy
+      - name: Install the Solana tools
+        run: |
+          # The same release as the build-sbf job, for solana-test-validator, solana and solana-keygen.
+          sh -c "$(curl -sSfL https://release.anza.xyz/v4.1.0/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+      - name: Run the outside path against a local validator
+        run: bash deploy/rollup/tests/outsider/outsider_path_local.sh
   semgrep:
     runs-on: ubuntu-latest
     container:

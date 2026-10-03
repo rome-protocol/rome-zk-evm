@@ -2231,6 +2231,7 @@ mod tests {
                 acc: gate_acc(),
                 finalize_cursor: fx.chunk_bodies.len() as u32,
                 open_unix_ts: Self::open_unix_ts_for(st, batch),
+                deposit: None,
             })
             .to_vec()
         }
@@ -2268,6 +2269,7 @@ mod tests {
                 acc,
                 finalize_cursor: fx.chunk_bodies.len() as u32,
                 open_unix_ts: Self::open_unix_ts_for(st, batch),
+                deposit: None,
             })
             .to_vec()
         }
