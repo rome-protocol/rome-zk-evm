@@ -4,6 +4,34 @@ This changelog describes the system as built on `main`, grouped by component. It
 release-tag cadence yet — see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for what each component does
 and how they fit together.
 
+## Inbox accounts keyed by the settlement program
+
+- A chain's inbox accounts are keyed by its settlement program, so they can only be created through it.
+  The batch cursor is now `["batch_cursor", settlement_program, chain_id]`, a batch is
+  `["batch", settlement_program, chain_id, batch]` and a chunk is
+  `["inbox", settlement_program, chain_id, batch, idx]`, all under the inbox program. No instruction
+  gains a field and transaction sizes are unchanged.
+- Chunk `Open` and `SealLeaf` read the settlement program from the batch account. A chunk `Close` takes
+  it from the owner of the root account it is given and requires the root, chunk and batch addresses to
+  be the ones derived under it. Settlement derives the inbox batch with its own program id and checks the
+  batch's recorded settlement program (`WrongInboxAccount`).
+- The batcher, derive, prover, prover-input, clients and bench tooling derive inbox addresses with the
+  chain's settlement program. The settlement watcher does not derive a batch address: `run_once` and
+  `decode_inbox_tx` take the settlement program it follows, record an `OpenBatch` only when the
+  instruction names that program, and record a chunk `Open` only when the chunk account is the address
+  derived under it. An open for the same chain and batch under another settlement program creates no row
+  and cannot take an existing one. `rome-zk-prover-input`'s `fetch_and_verify_batch` and
+  `fetch_real_batch --settlement-program` take it as a new argument.
+- Chunk `Close` now derives three addresses, so it costs more compute. A packed group of closes in the
+  batcher asks for one chunk compute budget per close.
+- The guest, the public values and the verification key are unchanged.
+- Existing deployments: accounts created under the old chain-id-only addresses are not read after the
+  upgrade, so finish or abandon open batches and close their chunks first, then initialise the cursor at
+  its new address with `next_batch = root.head_pending_batch + 1`. Never set it higher: settlement posts
+  only that id next, so a higher cursor halts the chain. `examples/find_max_batch_id` now reads the
+  root under the configured settlement program and prints that value; it ignores inbox accounts that
+  belong to another settlement program.
+
 ## Permissionless chain registration and proved finality
 
 - `InitChainV2` on a permissionless id (`chain_id >= 2^32`) now refuses a non-empty `registry_entries`
@@ -26,6 +54,41 @@ and how they fit together.
 - `SetRegistryEntry` refuses layout 2 (the header fallback) on a permissionless chain with
   `HeaderFallbackNotAllowed` (85), before any write: layout 2 binds neither the chain id nor the inbox
   commitment, so a permissionless chain registers layout-1 keys only. Reserved chains still accept layout 2.
+
+## Zero-balance genesis in `rollup init` (2026-10-03)
+
+- `./rollup init` now renders a genesis with no balances. The exit portal predeploy stays, at balance 0. The
+  `genesis.funded_address` key, which minted 1e27 wei to one address, is gone, and `init` refuses a `chain.toml`
+  that still sets it with `FundedAddressRemoved`, naming the keys that replace it. A genesis cannot change after
+  registration, and a genesis that mints coins could never take deposits safely: its holder could exit coins that
+  other people's deposits paid for.
+- A chain can declare one backed balance for first gas with `genesis.backed_address` and
+  `genesis.backed_balance_lamports`, both or neither. The amount is a whole number of lamports from 1 to
+  18446744073709551615, and `init` renders wei as lamports times 1e9, so it converts exactly into the vault's
+  wrapped SOL (1 lamport is 1 gwei). The address is refused by name for zero, the precompiles and the exit portal
+  (`BackedAddressReserved`), or if malformed (`BackedAddressInvalid`). A balance that is not a plain integer in
+  range is refused with `BackedBalanceInvalid`, and one key without the other with `BackedAddressMissing` or
+  `BackedBalanceMissing`. Any other key under `[genesis]` is refused with `GenesisKeyUnknown`.
+- With a backed balance, `init` prints the exact lamport amount to lock in the chain's vault with `Fund`
+  before asking Rome to register the key, and says the bridge program is not deployed on devnet yet. Rome checks the
+  lock before it registers the key.
+- The README, `chain.toml.example` and the devnet guide now describe zero balances and the optional backed balance.
+- A chain initialised with `funded_address` keeps that genesis and can never take deposits. To use this version, start a
+  new chain: move `rendered/` aside, remove `funded_address` from `chain.toml`, and run `init` with a new payer key.
+
+## Chain id range and fee recipient in `rollup init` (2026-10-03)
+
+- `./rollup init` now refuses a derived chain id above 4503599627370476 with `ChainIdNotWalletSafe`, before
+  the chain is registered and before anything is sent. That is MetaMask's `MAX_SAFE_CHAIN_ID`, and wallets like it
+  cannot add a chain with a larger id; about half of all permissionless ids are above it. The message tells the
+  operator to create a new payer key (`solana-keygen new`) and run `init` again. If the chain is already registered
+  (`rendered/pdas.env` exists, or the payer's nonce has moved past the recorded one), the id is fixed, so `init`
+  prints `ChainIdNotWalletSafe` as a warning once and carries on.
+- `chain.toml` takes a required `genesis.fee_recipient`, and the rendered genesis coinbase is that address
+  (the template used to hard-code zero, so a chain's priority fees went to an address nobody can spend from). `init` refuses it by name when it is
+  missing (`FeeRecipientMissing`), malformed (`FeeRecipientInvalid`) or reserved (`FeeRecipientReserved`: zero, a
+  precompile address `0x00..00` to `0x00..ff`, or the exit portal at `0x42..16`). The sequencer and derive read the
+  fee recipient from the genesis coinbase, so nothing else needs to change.
 
 ## Portable rollup deploy for outside operators (2026-10-02)
 
@@ -2664,8 +2727,9 @@ the batch id the cursor should start counting from. Batch ids are 1-based: for a
 1`, so a cursor bootstrapped at 0 can never post its first batch. `crates/zk-inbox-client/examples/
 init_cursor.rs` defaults to 1 and refuses `--next-batch 0` unless `--allow-zero` is explicitly passed. For
 a chain that already has batch history elsewhere (a chain being migrated onto this inbox program), it
-must be initialized **above every batch id that chain has ever opened** — initializing it too low would
-let a future `OpenBatch` reuse an id whose data availability may already have been reclaimed. A second
+must be initialized at **`head_pending_batch + 1` of the chain's settlement root** (the id settlement
+accepts next) — initializing it too low would let a future `OpenBatch` reuse an id whose data availability
+may already have been reclaimed, and initializing it above that id halts the chain. A second
 `InitBatchCursor` call for the same chain is rejected; there is no re-run path.
 
 ### Bringing a pre-existing chain into the registration-and-revenue scheme (`MigrateChain`)

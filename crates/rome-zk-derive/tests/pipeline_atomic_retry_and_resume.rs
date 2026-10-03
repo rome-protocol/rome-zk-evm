@@ -23,6 +23,9 @@ use rome_zk_derive::traversal::SolanaTraversal;
 use rome_zk_derive::PipelineError;
 use solana_program::pubkey::Pubkey;
 
+/// Stand-in settlement program the test chain is registered under (inbox accounts are keyed by it).
+const SETTLEMENT_PROGRAM: Pubkey = Pubkey::new_from_array([9u8; 32]);
+
 const CHAIN_ID: u64 = 200_101;
 
 fn block(number: u64) -> Block {
@@ -89,13 +92,20 @@ fn seed_batch(
     let bodies: Vec<Vec<u8>> = frames.iter().map(|f| f.to_bytes()).collect();
     let body_refs: Vec<&[u8]> = bodies.iter().map(|b| b.as_slice()).collect();
 
-    let (batch_pda, _) = zk_inbox_client::batch_pda(program_id, chain_id, batch);
+    let (batch_pda, _) =
+        zk_inbox_client::batch_pda(program_id, &SETTLEMENT_PROGRAM, chain_id, batch);
     reader.accounts.insert(
         batch_pda,
         batch_account_bytes(chain_id, batch, open_slot, frames.len() as u32, &body_refs),
     );
     for (idx, body) in bodies.iter().enumerate() {
-        let (chunk_pda, _) = zk_inbox_client::chunk_pda(program_id, chain_id, batch, idx as u32);
+        let (chunk_pda, _) = zk_inbox_client::chunk_pda(
+            program_id,
+            &SETTLEMENT_PROGRAM,
+            chain_id,
+            batch,
+            idx as u32,
+        );
         let mut chunk = vec![0u8; zk_inbox::HEADER_LEN + body.len()];
         chunk[zk_inbox::OFF_MAGIC..zk_inbox::OFF_MAGIC + 4]
             .copy_from_slice(&zk_inbox::MAGIC.to_le_bytes());
@@ -181,8 +191,9 @@ async fn a_temporary_mid_batch_is_retryable_not_a_spurious_critical() {
         &[block(1), block(2), block(3)],
     );
 
-    let traversal = SolanaTraversal::new(reader.clone(), program_id, CHAIN_ID, 0);
-    let inbox = InboxRetrieval::new(reader, program_id);
+    let traversal =
+        SolanaTraversal::new(reader.clone(), program_id, SETTLEMENT_PROGRAM, CHAIN_ID, 0);
+    let inbox = InboxRetrieval::new(reader, program_id, SETTLEMENT_PROGRAM);
     // Block 1 is the 1st build_forced_block call, block 2 the 2nd — fail exactly that one, once.
     let flaky = FlakyOnce {
         inner: MockEngineApi::default(),
@@ -245,8 +256,9 @@ async fn two_correctly_continuing_batches_both_derive() {
         &[block(3), block(4)],
     );
 
-    let traversal = SolanaTraversal::new(reader.clone(), program_id, CHAIN_ID, 0);
-    let inbox = InboxRetrieval::new(reader, program_id);
+    let traversal =
+        SolanaTraversal::new(reader.clone(), program_id, SETTLEMENT_PROGRAM, CHAIN_ID, 0);
+    let inbox = InboxRetrieval::new(reader, program_id, SETTLEMENT_PROGRAM);
     let engine = EngineController::new(MockEngineApi::default(), B256::ZERO, 0);
     let mut pipeline = DerivePipeline::new(
         traversal,
@@ -298,8 +310,9 @@ async fn a_gap_between_batches_is_critical_after_the_first_derives() {
         &[block(4), block(5)],
     );
 
-    let traversal = SolanaTraversal::new(reader.clone(), program_id, CHAIN_ID, 0);
-    let inbox = InboxRetrieval::new(reader, program_id);
+    let traversal =
+        SolanaTraversal::new(reader.clone(), program_id, SETTLEMENT_PROGRAM, CHAIN_ID, 0);
+    let inbox = InboxRetrieval::new(reader, program_id, SETTLEMENT_PROGRAM);
     let engine = EngineController::new(MockEngineApi::default(), B256::ZERO, 0);
     let mut pipeline = DerivePipeline::new(
         traversal,
@@ -353,8 +366,9 @@ async fn a_temporary_failure_on_the_second_batch_does_not_corrupt_continuity_for
         &[block(3), block(4)],
     );
 
-    let traversal = SolanaTraversal::new(reader.clone(), program_id, CHAIN_ID, 0);
-    let inbox = InboxRetrieval::new(reader, program_id);
+    let traversal =
+        SolanaTraversal::new(reader.clone(), program_id, SETTLEMENT_PROGRAM, CHAIN_ID, 0);
+    let inbox = InboxRetrieval::new(reader, program_id, SETTLEMENT_PROGRAM);
     // batch 0 uses build calls 1-2; batch 1's first block is the 3rd build call overall.
     let flaky = FlakyOnce {
         inner: MockEngineApi::default(),
@@ -410,8 +424,9 @@ async fn old_always_from_batch_zero_is_stuck_once_batch_zero_is_closed() {
         &[block(6), block(7), block(8)],
     );
 
-    let traversal = SolanaTraversal::new(reader.clone(), program_id, CHAIN_ID, 0); // old: always 0
-    let inbox = InboxRetrieval::new(reader, program_id);
+    let traversal =
+        SolanaTraversal::new(reader.clone(), program_id, SETTLEMENT_PROGRAM, CHAIN_ID, 0); // old: always 0
+    let inbox = InboxRetrieval::new(reader, program_id, SETTLEMENT_PROGRAM);
     let engine = EngineController::from_engine_head(mock_with_genesis())
         .await
         .unwrap(); // old default
@@ -562,8 +577,14 @@ async fn resume_anchor_derives_batch_one_after_batch_zero_was_closed() {
     assert_eq!(last_design_block, Some(5));
     assert_eq!(number, 5);
 
-    let traversal = SolanaTraversal::new(reader.clone(), program_id, CHAIN_ID, start_at_batch);
-    let inbox = InboxRetrieval::new(reader, program_id);
+    let traversal = SolanaTraversal::new(
+        reader.clone(),
+        program_id,
+        SETTLEMENT_PROGRAM,
+        CHAIN_ID,
+        start_at_batch,
+    );
+    let inbox = InboxRetrieval::new(reader, program_id, SETTLEMENT_PROGRAM);
     let engine = EngineController::new(engine_mock, block_hash, number);
     let mut pipeline = DerivePipeline::new(
         traversal,
@@ -669,8 +690,14 @@ async fn a_fresh_chain_at_the_genesis_sentinel_derives_its_first_batch() {
     );
     assert_eq!(number, 0);
 
-    let traversal = SolanaTraversal::new(reader.clone(), program_id, CHAIN_ID, start_at_batch);
-    let inbox = InboxRetrieval::new(reader, program_id);
+    let traversal = SolanaTraversal::new(
+        reader.clone(),
+        program_id,
+        SETTLEMENT_PROGRAM,
+        CHAIN_ID,
+        start_at_batch,
+    );
+    let inbox = InboxRetrieval::new(reader, program_id, SETTLEMENT_PROGRAM);
     let engine = EngineController::new(engine_mock, block_hash, number);
     let mut pipeline = DerivePipeline::new(
         traversal,

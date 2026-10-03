@@ -1,5 +1,5 @@
 //! The zk-inbox `batch_cursor` account layout ("ZKBC", PDA `["batch_cursor",
-//! chain_id]`, one per chain, owned by the inbox program). Holds `next_batch`, the only batch id
+//! settlement_program, chain_id]`, one per (settlement program, chain), owned by the inbox program). Holds `next_batch`, the only batch id
 //! `OpenBatch` may open next; `OpenBatch` requires `batch == next_batch` and increments it on success,
 //! and nothing — not even `AbandonBatch` — ever decrements it. An id, once assigned, can never be
 //! reused: this is what stops a stale chunk PDA left over from an abandoned attempt at some id from ever
@@ -21,22 +21,28 @@ pub const OFF_NEXT_BATCH: usize = 13;
 /// Total account size — fixed, no variable-length tail.
 pub const LEN: usize = 21;
 
-/// `["batch_cursor", chain_id]`.
+/// `["batch_cursor", settlement_program, chain_id]`. The settlement program is part of the key so a
+/// chain's inbox accounts can only be created through its own settlement program.
 #[inline]
-pub fn seeds(chain_id: u64) -> [Vec<u8>; 2] {
-    [b"batch_cursor".to_vec(), chain_id.to_le_bytes().to_vec()]
+pub fn seeds(settlement_program: &[u8; 32], chain_id: u64) -> [Vec<u8>; 3] {
+    [
+        b"batch_cursor".to_vec(),
+        settlement_program.to_vec(),
+        chain_id.to_le_bytes().to_vec(),
+    ]
 }
 
-/// Derives the batch-cursor PDA under `program_id` (the inbox program) — the one place this derivation
-/// is computed.
+/// Derives the batch-cursor PDA under `program_id` (the inbox program) for the chain registered with
+/// `settlement_program` — the one place this derivation is computed.
 #[cfg(feature = "solana")]
 #[inline]
 pub fn pda(
     program_id: &solana_program::pubkey::Pubkey,
+    settlement_program: &solana_program::pubkey::Pubkey,
     chain_id: u64,
 ) -> (solana_program::pubkey::Pubkey, u8) {
-    let s = seeds(chain_id);
-    solana_program::pubkey::Pubkey::find_program_address(&[&s[0], &s[1]], program_id)
+    let s = seeds(&settlement_program.to_bytes(), chain_id);
+    solana_program::pubkey::Pubkey::find_program_address(&[&s[0], &s[1], &s[2]], program_id)
 }
 
 /// Field-for-field decode of a cursor account. Pubkeys are raw `[u8; 32]` elsewhere in this crate (only
@@ -148,19 +154,24 @@ mod tests {
 
     #[test]
     fn seeds_golden_bytes_for_a_fixed_chain_id() {
-        let s = seeds(0x0102_0304_0506_0708);
+        let s = seeds(&[0x5Au8; 32], 0x0102_0304_0506_0708);
         assert_eq!(s[0], b"batch_cursor".to_vec());
-        assert_eq!(s[1], vec![0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
+        assert_eq!(s[1], vec![0x5Au8; 32]);
+        assert_eq!(s[2], vec![0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
     }
 
     #[cfg(feature = "solana")]
     #[test]
     fn pda_is_deterministic_and_varies_with_chain_id() {
         let program = solana_program::pubkey::Pubkey::new_unique();
-        let (a1, _) = pda(&program, 7);
-        let (a2, _) = pda(&program, 7);
+        let settlement = solana_program::pubkey::Pubkey::new_unique();
+        let other_settlement = solana_program::pubkey::Pubkey::new_unique();
+        let (a1, _) = pda(&program, &settlement, 7);
+        let (a2, _) = pda(&program, &settlement, 7);
         assert_eq!(a1, a2);
-        let (b, _) = pda(&program, 8);
+        let (b, _) = pda(&program, &settlement, 8);
         assert_ne!(a1, b);
+        let (c, _) = pda(&program, &other_settlement, 7);
+        assert_ne!(a1, c);
     }
 }

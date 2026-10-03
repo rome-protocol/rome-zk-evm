@@ -49,6 +49,57 @@ for dotted in sys.argv[2:]:
 PY
 }
 
+# rz_toml_kind FILE KEY -> what the dotted KEY is in the file: absent, str, int, float, bool, table, list or other.
+# Unlike rz_toml_get it tells an empty string from a missing key, and an integer from a string that looks like one.
+# Needs python3 >= 3.11 (tomllib).
+rz_toml_kind() {
+  python3 - "$1" "$2" <<'PY'
+import sys
+try:
+    import tomllib
+except ModuleNotFoundError:
+    sys.exit("Python311Required: python3 3.11 or newer is needed to read chain.toml (found %s)" % sys.version.split()[0])
+with open(sys.argv[1], "rb") as f:
+    data = tomllib.load(f)
+cur = data
+for part in sys.argv[2].split("."):
+    if not isinstance(cur, dict) or part not in cur:
+        print("absent"); sys.exit(0)
+    cur = cur[part]
+for kind, name in ((bool, "bool"), (int, "int"), (float, "float"), (str, "str"), (dict, "table"), (list, "list")):
+    if isinstance(cur, kind):
+        print(name); sys.exit(0)
+print("other")
+PY
+}
+
+# rz_toml_keys FILE TABLE -> the name of every key in [TABLE], one per line, whatever its value.
+rz_toml_keys() {
+  python3 - "$1" "$2" <<'PY'
+import sys
+try:
+    import tomllib
+except ModuleNotFoundError:
+    sys.exit("Python311Required: python3 3.11 or newer is needed to read chain.toml (found %s)" % sys.version.split()[0])
+with open(sys.argv[1], "rb") as f:
+    data = tomllib.load(f)
+for k in (data.get(sys.argv[2]) or {}):
+    print(k)
+PY
+}
+
+# rz_lamports_to_wei_hex LAMPORTS -> the amount as 0x-prefixed hex wei (wei = lamports x 1e9: the vault's wrapped SOL has
+# 9 decimals and the chain's native coin has 18). Refuses anything but a whole number from 1 to the largest u64.
+rz_lamports_to_wei_hex() {
+  python3 - "$1" <<'PY'
+import re, sys
+v = sys.argv[1]
+if not re.fullmatch(r"[1-9][0-9]*", v) or int(v) > 2**64 - 1:
+    sys.exit(1)
+print("0x%x" % (int(v) * 10**9))
+PY
+}
+
 # rz_toml_table FILE TABLE -> `key=value` lines for every scalar in [TABLE] (integers and strings).
 rz_toml_table() {
   python3 - "$1" "$2" <<'PY'

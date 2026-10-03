@@ -115,12 +115,14 @@ async fn main() -> eyre::Result<()> {
     let traversal = SolanaTraversal::new(
         RpcAccountReader::new(config.solana_rpc_url.clone()),
         config.inbox_program_id,
+        config.settlement_program_id,
         config.chain_id,
         start_at_batch,
     );
     let inbox = rome_zk_derive::inbox::InboxRetrieval::new(
         RpcAccountReader::new(config.solana_rpc_url.clone()),
         config.inbox_program_id,
+        config.settlement_program_id,
     );
 
     // The chain's own `chain_config.max_drift_secs` is authoritative —

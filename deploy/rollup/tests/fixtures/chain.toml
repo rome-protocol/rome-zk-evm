@@ -2,7 +2,7 @@
 # No chain_id: init reads the derived one from Solana (the tests stub that call).
 
 [genesis]
-funded_address = "0x1111111111111111111111111111111111111111"
+fee_recipient = "0x3333333333333333333333333333333333333333"
 
 [profile]
 sub_block_ms = 40

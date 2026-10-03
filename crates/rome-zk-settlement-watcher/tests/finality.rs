@@ -114,6 +114,7 @@ async fn track_finality_upgrades_only_the_signatures_solana_now_reports_finalize
         &pg.pool,
         &mut source,
         &program_id,
+        &Pubkey::new_unique(),
         ProgramKind::Inbox,
         WatcherConfig::default(),
     )
@@ -177,6 +178,7 @@ async fn track_finality_terminates_a_none_status_row_past_the_dropped_horizon() 
         &pg.pool,
         &mut source,
         &program_id,
+        &Pubkey::new_unique(),
         ProgramKind::Inbox,
         WatcherConfig::default(),
     )

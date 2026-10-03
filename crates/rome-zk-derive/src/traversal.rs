@@ -56,15 +56,24 @@ pub struct BatchRef {
 pub struct SolanaTraversal<R> {
     reader: R,
     program_id: Pubkey,
+    /// The settlement program the chain is registered under — batch and cursor addresses are keyed by it.
+    settlement_program: Pubkey,
     chain_id: u64,
     next_batch: u64,
 }
 
 impl<R: AccountReader> SolanaTraversal<R> {
-    pub fn new(reader: R, program_id: Pubkey, chain_id: u64, start_at_batch: u64) -> Self {
+    pub fn new(
+        reader: R,
+        program_id: Pubkey,
+        settlement_program: Pubkey,
+        chain_id: u64,
+        start_at_batch: u64,
+    ) -> Self {
         Self {
             reader,
             program_id,
+            settlement_program,
             chain_id,
             next_batch: start_at_batch,
         }
@@ -85,8 +94,12 @@ impl<R: AccountReader> SolanaTraversal<R> {
     /// batch or a genuine "nothing yet".
     pub async fn next(&mut self) -> Result<Option<BatchRef>, PipelineError> {
         loop {
-            let (batch_pda, _) =
-                zk_inbox_client::batch_pda(&self.program_id, self.chain_id, self.next_batch);
+            let (batch_pda, _) = zk_inbox_client::batch_pda(
+                &self.program_id,
+                &self.settlement_program,
+                self.chain_id,
+                self.next_batch,
+            );
             let Some(data) = self.reader.get_account_data(batch_pda).await? else {
                 if self.id_already_passed_by_cursor().await? {
                     // The batcher's own cursor has already moved past this id with no account ever
@@ -133,7 +146,8 @@ impl<R: AccountReader> SolanaTraversal<R> {
     /// traversal ever seeing it finalized. `false` if the cursor itself does not exist yet (nothing to
     /// compare against — ordinary "not posted yet") or has not reached this id.
     async fn id_already_passed_by_cursor(&mut self) -> Result<bool, PipelineError> {
-        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&self.program_id, self.chain_id);
+        let (cursor_pda, _) =
+            zk_inbox_client::cursor_pda(&self.program_id, &self.settlement_program, self.chain_id);
         let Some(data) = self.reader.get_account_data(cursor_pda).await? else {
             return Ok(false);
         };
@@ -213,31 +227,35 @@ mod tests {
     #[tokio::test]
     async fn returns_none_when_the_batch_account_does_not_exist_yet() {
         let program_id = Pubkey::new_unique();
-        let mut t = SolanaTraversal::new(FakeReader::default(), program_id, 7, 0);
+        let settlement_program = Pubkey::new_unique();
+        let mut t =
+            SolanaTraversal::new(FakeReader::default(), program_id, settlement_program, 7, 0);
         assert_eq!(t.next().await.unwrap(), None);
     }
 
     #[tokio::test]
     async fn returns_none_when_the_batch_account_exists_but_is_not_finalized_yet() {
         let program_id = Pubkey::new_unique();
-        let (pda, _) = zk_inbox_client::batch_pda(&program_id, 7, 0);
+        let settlement_program = Pubkey::new_unique();
+        let (pda, _) = zk_inbox_client::batch_pda(&program_id, &settlement_program, 7, 0);
         let mut reader = FakeReader::default();
         reader
             .accounts
             .insert(pda, batch_account_bytes(7, 0, 100, 3, false));
-        let mut t = SolanaTraversal::new(reader, program_id, 7, 0);
+        let mut t = SolanaTraversal::new(reader, program_id, settlement_program, 7, 0);
         assert_eq!(t.next().await.unwrap(), None);
     }
 
     #[tokio::test]
     async fn returns_the_batch_ref_once_finalized_and_advance_moves_to_the_next_id() {
         let program_id = Pubkey::new_unique();
-        let (pda0, _) = zk_inbox_client::batch_pda(&program_id, 7, 0);
+        let settlement_program = Pubkey::new_unique();
+        let (pda0, _) = zk_inbox_client::batch_pda(&program_id, &settlement_program, 7, 0);
         let mut reader = FakeReader::default();
         reader
             .accounts
             .insert(pda0, batch_account_bytes(7, 0, 100, 3, true));
-        let mut t = SolanaTraversal::new(reader, program_id, 7, 0);
+        let mut t = SolanaTraversal::new(reader, program_id, settlement_program, 7, 0);
 
         let got = t.next().await.unwrap().expect("batch 0 is finalized");
         assert_eq!(
@@ -264,10 +282,11 @@ mod tests {
     #[tokio::test]
     async fn a_decode_failure_is_critical_not_temporary() {
         let program_id = Pubkey::new_unique();
-        let (pda, _) = zk_inbox_client::batch_pda(&program_id, 7, 0);
+        let settlement_program = Pubkey::new_unique();
+        let (pda, _) = zk_inbox_client::batch_pda(&program_id, &settlement_program, 7, 0);
         let mut reader = FakeReader::default();
         reader.accounts.insert(pda, vec![0xff; 4]); // too short, bad magic
-        let mut t = SolanaTraversal::new(reader, program_id, 7, 0);
+        let mut t = SolanaTraversal::new(reader, program_id, settlement_program, 7, 0);
         let err = t.next().await.unwrap_err();
         assert!(matches!(err, PipelineError::Critical(_)));
     }
@@ -279,9 +298,10 @@ mod tests {
     #[tokio::test]
     async fn a_large_open_slot_gap_between_consecutive_batches_is_not_a_reset() {
         let program_id = Pubkey::new_unique();
+        let settlement_program = Pubkey::new_unique();
         let mut reader = FakeReader::default();
-        let (pda0, _) = zk_inbox_client::batch_pda(&program_id, 7, 100);
-        let (pda1, _) = zk_inbox_client::batch_pda(&program_id, 7, 101);
+        let (pda0, _) = zk_inbox_client::batch_pda(&program_id, &settlement_program, 7, 100);
+        let (pda1, _) = zk_inbox_client::batch_pda(&program_id, &settlement_program, 7, 101);
         reader
             .accounts
             .insert(pda0, batch_account_bytes(7, 100, 1_000, 3, true));
@@ -290,7 +310,7 @@ mod tests {
             .accounts
             .insert(pda1, batch_account_bytes(7, 101, 6_000, 3, true));
 
-        let mut t = SolanaTraversal::new(reader, program_id, 7, 100);
+        let mut t = SolanaTraversal::new(reader, program_id, settlement_program, 7, 100);
         let first = t.next().await.unwrap().expect("batch 100 is finalized");
         assert_eq!(first.open_slot, 1_000);
         t.advance();
@@ -309,20 +329,21 @@ mod tests {
     #[tokio::test]
     async fn an_id_the_cursor_has_already_passed_is_skipped_not_waited_on() {
         let program_id = Pubkey::new_unique();
+        let settlement_program = Pubkey::new_unique();
         let mut reader = FakeReader::default();
         // Batch 5 was abandoned: no account ever lands at its PDA.
         // Batch 6 finalized normally.
-        let (pda6, _) = zk_inbox_client::batch_pda(&program_id, 7, 6);
+        let (pda6, _) = zk_inbox_client::batch_pda(&program_id, &settlement_program, 7, 6);
         reader
             .accounts
             .insert(pda6, batch_account_bytes(7, 6, 1_000, 2, true));
         // The cursor has moved to 7 (batches 5 and 6 both resolved, one way or another).
-        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&program_id, 7);
+        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&program_id, &settlement_program, 7);
         reader
             .accounts
             .insert(cursor_pda, cursor_account_bytes(7, 7));
 
-        let mut t = SolanaTraversal::new(reader, program_id, 7, 5);
+        let mut t = SolanaTraversal::new(reader, program_id, settlement_program, 7, 5);
         let got = t.next().await.unwrap().expect("must skip 5 and find 6");
         assert_eq!(got.batch, 6);
         assert_eq!(
@@ -337,8 +358,9 @@ mod tests {
     #[tokio::test]
     async fn a_missing_batch_with_no_cursor_account_yet_is_idle_not_skipped() {
         let program_id = Pubkey::new_unique();
+        let settlement_program = Pubkey::new_unique();
         let reader = FakeReader::default(); // nothing seeded at all
-        let mut t = SolanaTraversal::new(reader, program_id, 7, 5);
+        let mut t = SolanaTraversal::new(reader, program_id, settlement_program, 7, 5);
         assert_eq!(t.next().await.unwrap(), None);
         assert_eq!(t.next_batch(), 5, "must not have skipped ahead");
     }

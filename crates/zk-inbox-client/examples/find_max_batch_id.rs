@@ -1,27 +1,24 @@
-//! Scans a chain's accounts (`getProgramAccounts` + memcmp, both account kinds — chunk `ZKIB` and batch `ZKBT`,
-//! `zk_inbox_client::scan`) to find the highest batch id ever touched there, and prints the `next_batch`
-//! `InitBatchCursor` must be bootstrapped with — one past the highest id found, so a chain with prior batch history
-//! (e.g. Tiber, which already has batches opened under the pre-cursor program) can never have its cursor start
-//! below an id that already exists on chain (which would let `OpenBatch` re-open it).
+//! Proposes the `next_batch` `InitBatchCursor` must be bootstrapped with: `head_pending_batch + 1`, read from the
+//! chain's root account under the configured settlement program. That is the id settlement's `PostRoot` accepts
+//! next, so a cursor there lets the chain start posting, and a cursor ABOVE it halts the chain for good.
 //!
-//! The earlier id-by-id `batch_pda(chain, 0)`, `batch_pda(chain, 1)`, ... scan had two bugs, both closed here. (1)
-//! It only ever probed batch PDAs — `AbandonBatch`/ `CloseBatch` delete the *batch* account (never the chunk PDAs
-//! opened under it), so the highest id it ever missed is exactly the one a crashed prior run left chunk PDAs for;
-//! the first batcher run at that id would then hard-error `CursorBatchAlreadyTouched`. (2) `Err(_)` from
-//! `get_account` (a transient RPC failure, not "no such account") was silently folded into "missing", so 50
-//! transient errors in a row ended the scan early and `--submit` made that permanent. Both are gone now:
-//! `getProgramAccounts` enumerates every matching account directly (no per-id probing, no early-termination
-//! heuristic to get wrong), and a genuine RPC error propagates as a hard failure rather than being read as "nothing
-//! here".
+//! Anyone can create inbox accounts for any chain id under their own settlement program, so a scan of the inbox
+//! program's accounts by chain id is never an input to the proposal. The scan below (batch accounts only, `ZKBT`)
+//! keeps only accounts that sit at this settlement program's own `batch_pda` address AND record this settlement
+//! program; it is a safety check, not a source: if a batch of this chain under this settlement program already
+//! exists at `head_pending_batch + 1` or above, the tool refuses to propose, because a cursor there would collide
+//! with it. A foreign batch (another settlement program's, however large its id) is ignored.
 //!
-//! Read-only by default — pass `--submit --keypair PATH` to also send `InitBatchCursor` at the computed
-//! `next_batch` (the keypair must be the chain's root `authority`; never printed or logged). Findings are
-//! always printed before `--submit` ever sends anything.
+//! `--next-batch N` may lower the value; a value above `head_pending_batch + 1` is refused.
+//!
+//! Read-only by default; pass `--submit --keypair PATH` to also send `InitBatchCursor` at the proposed
+//! `next_batch` (the keypair must be the chain's root `authority`; never printed or logged). Findings are always
+//! printed before `--submit` ever sends anything.
 //!
 //! Usage:
 //!   cargo run --features devnet-driver -p zk-inbox-client --example find_max_batch_id -- \
-//!     [--rpc-url URL] [--program-id ID] --chain-id ID \
-//!     [--submit --keypair PATH --settlement-program ID [--next-batch N]]
+//!     [--rpc-url URL] [--program-id ID] --chain-id ID --settlement-program ID \
+//!     [--submit --keypair PATH [--next-batch N]]
 
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcProgramAccountsConfig;
@@ -34,7 +31,7 @@ use solana_sdk::{
     transaction::Transaction,
 };
 use std::{path::PathBuf, str::FromStr};
-use zk_inbox_client::scan;
+use zk_inbox_client::{cursor_proposal, scan};
 
 const DEVNET_PROGRAM_ID: &str = "EtAXw56BCmxH4Ew9JdLTjmxq21UadQjAoyLWERVNzBdL";
 
@@ -44,7 +41,7 @@ struct Args {
     chain_id: u64,
     submit: bool,
     keypair: Option<PathBuf>,
-    settlement_program: Option<Pubkey>,
+    settlement_program: Pubkey,
     next_batch_override: Option<u64>,
 }
 
@@ -90,7 +87,7 @@ fn parse_args() -> Args {
         chain_id: chain_id.expect("--chain-id is required"),
         submit,
         keypair,
-        settlement_program,
+        settlement_program: settlement_program.expect("--settlement-program is required"),
         next_batch_override,
     }
 }
@@ -119,12 +116,13 @@ fn program_accounts_config(
     }
 }
 
-async fn max_batch_id(
+/// Fetches every account matching `filters` under `program_id`, decoded to plain bytes. A real RPC error (node
+/// down, rate-limited, malformed response) propagates as `Err` — never silently read as "no accounts".
+async fn fetch_accounts(
     rpc: &RpcClient,
     program_id: &Pubkey,
     filters: Vec<solana_client::rpc_filter::RpcFilterType>,
-    extract: impl Fn(&[u8]) -> Option<u64>,
-) -> Result<Option<u64>, String> {
+) -> Result<Vec<(Pubkey, Vec<u8>)>, String> {
     // `get_program_accounts_with_config` (returning `Vec<(Pubkey, Account)>` directly) no longer exists in the
     // Agave 4.x line (API fallout) — only `get_program_accounts` (no config) and
     // `get_program_ui_accounts_with_config` (returns `UiAccount`, needing `.to_account()` to decode back to a plain
@@ -133,25 +131,25 @@ async fn max_batch_id(
         .get_program_ui_accounts_with_config(program_id, program_accounts_config(filters))
         .await
         .map_err(|e| e.to_string())?;
-    highest_batch_id(&accounts, extract)
+    decode_accounts(&accounts)
 }
 
-/// The highest batch id over the fetched accounts. An account that cannot be decoded is an ERROR that
-/// stops the scan, never a silent skip: the 2.1.6 client failed the whole call with a parse error in
-/// that case, and a maximum computed over fewer accounts than the node returned could hand the
-/// operator a too-low `next_batch`.
-fn highest_batch_id(
+/// An account that cannot be decoded is an ERROR that stops the scan, never a silent skip: a check computed
+/// over fewer accounts than the node returned could miss a colliding batch.
+fn decode_accounts(
     accounts: &[(Pubkey, solana_account_decoder_client_types::UiAccount)],
-    extract: impl Fn(&[u8]) -> Option<u64>,
-) -> Result<Option<u64>, String> {
-    let mut highest: Option<u64> = None;
-    for (address, ui_account) in accounts {
-        let account = ui_account.to_account().ok_or_else(|| {
-            format!("account {address} could not be decoded; refusing to scan past it")
-        })?;
-        highest = highest.max(extract(&account.data));
-    }
-    Ok(highest)
+) -> Result<Vec<(Pubkey, Vec<u8>)>, String> {
+    accounts
+        .iter()
+        .map(|(address, ui_account)| {
+            ui_account
+                .to_account()
+                .map(|a| (*address, a.data))
+                .ok_or_else(|| {
+                    format!("account {address} could not be decoded; refusing to scan past it")
+                })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -229,7 +227,7 @@ mod config_tests {
                 UiAccountEncoding::Base64,
             )),
         );
-        let err = highest_batch_id(&[good, bad], |d| d.first().map(|b| *b as u64))
+        let err = decode_accounts(&[good, bad])
             .expect_err("a decode failure must be an error, not a skipped account");
         assert!(
             err.contains(&bad_key.to_string()),
@@ -238,17 +236,11 @@ mod config_tests {
     }
 
     #[test]
-    fn the_highest_batch_id_over_decodable_accounts() {
-        let accounts = [
-            (Pubkey::new_unique(), encoded(&[3])),
-            (Pubkey::new_unique(), encoded(&[9])),
-            (Pubkey::new_unique(), encoded(&[5])),
-        ];
-        assert_eq!(
-            highest_batch_id(&accounts, |d| d.first().map(|b| *b as u64)),
-            Ok(Some(9))
-        );
-        assert_eq!(highest_batch_id(&[], |_| Some(1)), Ok(None));
+    fn decodable_accounts_come_back_with_their_bytes() {
+        let a = (Pubkey::new_unique(), encoded(&[3, 4]));
+        let decoded = decode_accounts(&[a.clone()]).unwrap();
+        assert_eq!(decoded, vec![(a.0, vec![3, 4])]);
+        assert_eq!(decode_accounts(&[]), Ok(vec![]));
     }
 }
 
@@ -256,61 +248,84 @@ mod config_tests {
 async fn main() {
     let args = parse_args();
     let rpc = RpcClient::new_with_commitment(args.rpc_url.clone(), CommitmentConfig::confirmed());
+    let settlement_program = args.settlement_program;
 
-    let highest_chunk = max_batch_id(
-        &rpc,
-        &args.program_id,
-        scan::chunk_account_filters(args.chain_id),
-        scan::chunk_batch_id,
-    )
-    .await
-    .unwrap_or_else(|e| panic!("getProgramAccounts (chunk accounts) failed: {e}"));
-    let highest_batch = max_batch_id(
+    // The root account under the configured settlement program is the source of truth: settlement accepts only
+    // `head_pending_batch + 1` as the next batch.
+    let (root_address, _) = zk_inbox_client::root_pda(&settlement_program, args.chain_id);
+    let root_data = rpc
+        .get_account_with_commitment(&root_address, CommitmentConfig::confirmed())
+        .await
+        .unwrap_or_else(|e| panic!("reading the root account {root_address} failed: {e}"))
+        .value
+        .unwrap_or_else(|| {
+            panic!(
+                "no root account at {root_address}: chain {} is not registered under settlement program {settlement_program}",
+                args.chain_id
+            )
+        })
+        .data;
+    let root = rome_zk_layouts::root::read(&root_data)
+        .unwrap_or_else(|e| panic!("root account {root_address} could not be decoded: {e:?}"));
+
+    // Safety check only: batch accounts of this chain under THIS settlement program (settlement-keyed address and
+    // recorded settlement program). Foreign accounts are ignored however large their ids.
+    let scanned = fetch_accounts(
         &rpc,
         &args.program_id,
         scan::batch_account_filters(args.chain_id),
-        scan::batch_batch_id,
     )
     .await
     .unwrap_or_else(|e| panic!("getProgramAccounts (batch accounts) failed: {e}"));
+    let own_ids: Vec<u64> = scanned
+        .iter()
+        .filter_map(|(address, data)| {
+            cursor_proposal::settlement_keyed_batch_id(
+                &args.program_id,
+                &settlement_program,
+                args.chain_id,
+                address,
+                data,
+            )
+        })
+        .collect();
 
-    let highest = [highest_chunk, highest_batch].into_iter().flatten().max();
-    let next_batch = args
-        .next_batch_override
-        .unwrap_or_else(|| highest.map(|h| h + 1).unwrap_or(0));
-
-    // Findings are always printed before --submit ever sends anything.
     println!(
-        "chain {}: highest chunk-account batch id = {:?}, highest batch-account batch id = {:?}",
-        args.chain_id, highest_chunk, highest_batch
+        "chain {}: root.head_pending_batch = {}, batch accounts returned by the scan = {}, of which under settlement program {settlement_program} = {}",
+        args.chain_id,
+        root.head_pending_batch,
+        scanned.len(),
+        own_ids.len()
     );
-    match highest {
-        Some(h) => println!(
-            "chain {}: highest touched batch id (either account kind) = {h}; InitBatchCursor next_batch >= {next_batch}",
-            args.chain_id
+    let proposed = cursor_proposal::propose_next_batch(root.head_pending_batch, &own_ids)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let next_batch = match args.next_batch_override {
+        Some(n) if n > proposed => panic!(
+            "--next-batch {n} is above head_pending_batch + 1 = {proposed}: a cursor there halts the chain \
+             (settlement posts only head_pending_batch + 1)"
         ),
-        None => println!(
-            "chain {}: no existing batch or chunk accounts found; InitBatchCursor next_batch = {next_batch}",
-            args.chain_id
-        ),
-    }
+        Some(n) => n,
+        None => proposed,
+    };
+    println!(
+        "chain {}: InitBatchCursor next_batch = {next_batch} (head_pending_batch + 1 = {proposed})",
+        args.chain_id
+    );
 
     if !args.submit {
         return;
     }
     let keypair_path = args.keypair.expect("--submit requires --keypair");
-    let settlement_program = args
-        .settlement_program
-        .expect("--submit requires --settlement-program");
     let authority = read_keypair_file(&keypair_path)
         .unwrap_or_else(|e| panic!("reading {keypair_path:?}: {e}"));
 
-    // Final sanity check, using the same "Ok(None) = missing, Err propagates" discipline the scan
-    // itself follows: the computed next_batch's own batch PDA must not already exist. This is a
-    // best-effort belt-and-suspenders check on top of the scan above, not a substitute for it (the scan
-    // already covers chunk PDAs the batch-PDA-only check below cannot see).
-    let (candidate_pda, _) =
-        zk_inbox_client::batch_pda(&args.program_id, args.chain_id, next_batch);
+    // Final sanity check: the computed next_batch's own batch PDA must not already exist.
+    let (candidate_pda, _) = zk_inbox_client::batch_pda(
+        &args.program_id,
+        &settlement_program,
+        args.chain_id,
+        next_batch,
+    );
     match rpc
         .get_account_with_commitment(&candidate_pda, CommitmentConfig::confirmed())
         .await

@@ -27,16 +27,27 @@ use zk_inbox_client::{
 
 const CHAIN_ID: i64 = 200_101;
 
+/// Stand-in settlement program the scripted chain is registered under (inbox accounts are keyed by it).
+const SETTLEMENT_PROGRAM: Pubkey = Pubkey::new_from_array([7u8; 32]);
+
 async fn run_inbox_to_completion(
     pool: &sqlx::PgPool,
     source: &mut FixtureSource,
     cfg: WatcherConfig,
 ) {
     let program_id = source.inbox_program_id();
+    let settlement_program = source.settlement_program_id();
     loop {
-        match run_once(pool, source, &program_id, ProgramKind::Inbox, cfg)
-            .await
-            .expect("run_once")
+        match run_once(
+            pool,
+            source,
+            &program_id,
+            &settlement_program,
+            ProgramKind::Inbox,
+            cfg,
+        )
+        .await
+        .expect("run_once")
         {
             PageOutcome::NoNewSignatures => break,
             PageOutcome::Processed { .. } => continue,
@@ -51,9 +62,16 @@ async fn run_root_to_completion(
 ) {
     let program_id = source.settlement_program_id();
     loop {
-        match run_once(pool, source, &program_id, ProgramKind::Root, cfg)
-            .await
-            .expect("run_once")
+        match run_once(
+            pool,
+            source,
+            &program_id,
+            &program_id,
+            ProgramKind::Root,
+            cfg,
+        )
+        .await
+        .expect("run_once")
         {
             PageOutcome::NoNewSignatures => break,
             PageOutcome::Processed { .. } => continue,
@@ -282,9 +300,16 @@ async fn watcher_killed_mid_page_resumes_with_no_gap_or_duplicate() {
     // not have moved at all yet.
     let program_id = FixtureSource::load().inbox_program_id();
     let mut failing = FailAfter::new(FixtureSource::load(), 250);
-    let err = run_once(&pg.pool, &mut failing, &program_id, ProgramKind::Inbox, cfg)
-        .await
-        .expect_err("the injected failure must propagate");
+    let err = run_once(
+        &pg.pool,
+        &mut failing,
+        &program_id,
+        &FixtureSource::load().settlement_program_id(),
+        ProgramKind::Inbox,
+        cfg,
+    )
+    .await
+    .expect_err("the injected failure must propagate");
     let _ = err; // just needs to be an error; message not asserted (source-specific)
 
     let cursor_after_kill = read_cursor(&pg.pool, ProgramKind::Inbox).await.unwrap();
@@ -416,6 +441,7 @@ async fn measures_ingest_throughput_against_local_postgres() {
     let pg = TestPg::start().await;
     let mut source = FixtureSource::load();
     let program_id = source.inbox_program_id();
+    let settlement_program = source.settlement_program_id();
     let cfg = WatcherConfig {
         rpc_page_size: 1_000,
         commit_batch_size: 500,
@@ -425,9 +451,16 @@ async fn measures_ingest_throughput_against_local_postgres() {
     let mut pages = 0usize;
     let mut rows = 0usize;
     loop {
-        match run_once(&pg.pool, &mut source, &program_id, ProgramKind::Inbox, cfg)
-            .await
-            .unwrap()
+        match run_once(
+            &pg.pool,
+            &mut source,
+            &program_id,
+            &settlement_program,
+            ProgramKind::Inbox,
+            cfg,
+        )
+        .await
+        .unwrap()
         {
             PageOutcome::NoNewSignatures => break,
             PageOutcome::Processed {
@@ -459,6 +492,67 @@ fn payer() -> Pubkey {
     Pubkey::new_unique()
 }
 
+/// The inbox program is shared by every settlement program, and `batch` is keyed on `(chain_id, batch_id)`. An
+/// `OpenBatch` for the same `(chain_id, batch)` under another settlement program must neither create the row
+/// nor take it from the real one, whichever of the two lands first.
+#[tokio::test]
+async fn a_foreign_open_batch_for_the_same_chain_and_batch_neither_creates_nor_overrides_the_row() {
+    let pg = TestPg::start().await;
+    let program_id = Pubkey::new_unique();
+    let foreign_settlement = Pubkey::new_unique();
+    let payer = payer();
+
+    // Only the foreign open: no row.
+    let mut source = ScriptedSource::new(program_id);
+    let foreign_ix = open_batch_ix(&program_id, &payer, 200_101, 1, 99, &foreign_settlement);
+    source.push_newest(
+        "1foreign0000000000000000000000000000000000000000000000000",
+        100,
+        raw_message_from_ixs(&payer, &[foreign_ix]),
+        false,
+    );
+    run_inbox_to_completion_scripted(&pg.pool, &mut source, &program_id).await;
+    derive_to_completion(&pg.pool).await;
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT expected_count, batch_pda FROM batch WHERE chain_id = 200101 AND batch_id = 1",
+    )
+    .fetch_all(&pg.pool)
+    .await
+    .unwrap();
+    assert!(
+        rows.is_empty(),
+        "a foreign OpenBatch created a row: {rows:?}"
+    );
+
+    // The real open lands after the foreign one, then a second foreign open lands after it: the row is the real one.
+    let own_ix = open_batch_ix(&program_id, &payer, 200_101, 1, 10, &SETTLEMENT_PROGRAM);
+    source.push_newest(
+        "2own000000000000000000000000000000000000000000000000000000",
+        101,
+        raw_message_from_ixs(&payer, &[own_ix]),
+        false,
+    );
+    let later_foreign_ix = open_batch_ix(&program_id, &payer, 200_101, 1, 77, &foreign_settlement);
+    source.push_newest(
+        "3foreign0000000000000000000000000000000000000000000000000",
+        102,
+        raw_message_from_ixs(&payer, &[later_foreign_ix]),
+        false,
+    );
+    run_inbox_to_completion_scripted(&pg.pool, &mut source, &program_id).await;
+    derive_to_completion(&pg.pool).await;
+    let own_pda = zk_inbox_client::batch_pda(&program_id, &SETTLEMENT_PROGRAM, 200_101, 1)
+        .0
+        .to_string();
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT expected_count, batch_pda FROM batch WHERE chain_id = 200101 AND batch_id = 1",
+    )
+    .fetch_all(&pg.pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, vec![(10, own_pda)]);
+}
+
 /// RED before the fix: a partial `FinalizeBatch { step: 1 }` (fewer leaves than `expected_count`) must
 /// leave the batch `'open'`, mirroring `programs/zk-inbox/src/batch.rs::finalize_batch_inner` exactly --
 /// only a call whose cursor reaches `expected_count` may set `status = 'finalized'`.
@@ -469,14 +563,14 @@ async fn partial_finalize_batch_leaves_the_batch_open_until_the_cursor_completes
     let payer = payer();
     let mut source = ScriptedSource::new(program_id);
 
-    let open_ix = open_batch_ix(&program_id, &payer, 200_101, 1, 10, &Pubkey::new_unique());
+    let open_ix = open_batch_ix(&program_id, &payer, 200_101, 1, 10, &SETTLEMENT_PROGRAM);
     source.push_newest(
         "1open00000000000000000000000000000000000000000000000000000",
         100,
         raw_message_from_ixs(&payer, &[open_ix]),
         false,
     );
-    let step1_ix = finalize_batch_ix(&program_id, &payer, 200_101, 1, 1);
+    let step1_ix = finalize_batch_ix(&program_id, &payer, &SETTLEMENT_PROGRAM, 200_101, 1, 1);
     source.push_newest(
         "2step1000000000000000000000000000000000000000000000000000",
         101,
@@ -497,7 +591,7 @@ async fn partial_finalize_batch_leaves_the_batch_open_until_the_cursor_completes
     assert_eq!(status, "open", "step=1 of 10 must not finalize the batch");
 
     // The completing call: step=0 means "the rest, in this call".
-    let step0_ix = finalize_batch_ix(&program_id, &payer, 200_101, 1, 0);
+    let step0_ix = finalize_batch_ix(&program_id, &payer, &SETTLEMENT_PROGRAM, 200_101, 1, 0);
     source.push_newest(
         "3step0000000000000000000000000000000000000000000000000000",
         102,
@@ -527,7 +621,16 @@ async fn seal_only_transaction_creates_no_inbox_chunk_row() {
     let payer = payer();
     let mut source = ScriptedSource::new(program_id);
 
-    let seal_ix = seal_chunk_ix(&program_id, &payer, 200_101, 1, 17, 3_681, [7u8; 32]);
+    let seal_ix = seal_chunk_ix(
+        &program_id,
+        &payer,
+        &SETTLEMENT_PROGRAM,
+        200_101,
+        1,
+        17,
+        3_681,
+        [7u8; 32],
+    );
     source.push_newest(
         "1seal00000000000000000000000000000000000000000000000000000",
         100,
@@ -555,14 +658,31 @@ async fn open_then_seal_in_separate_transactions_produce_one_sealed_row() {
     let payer = payer();
     let mut source = ScriptedSource::new(program_id);
 
-    let open_ix = open_chunk_ix(&program_id, &payer, 200_101, 1, 17, 3_681);
+    let open_ix = open_chunk_ix(
+        &program_id,
+        &payer,
+        &SETTLEMENT_PROGRAM,
+        200_101,
+        1,
+        17,
+        3_681,
+    );
     source.push_newest(
         "1openA000000000000000000000000000000000000000000000000000",
         100,
         raw_message_from_ixs(&payer, &[open_ix]),
         false,
     );
-    let seal_ix = seal_chunk_ix(&program_id, &payer, 200_101, 1, 17, 3_681, [7u8; 32]);
+    let seal_ix = seal_chunk_ix(
+        &program_id,
+        &payer,
+        &SETTLEMENT_PROGRAM,
+        200_101,
+        1,
+        17,
+        3_681,
+        [7u8; 32],
+    );
     source.push_newest(
         "2sealB000000000000000000000000000000000000000000000000000",
         200,
@@ -595,14 +715,31 @@ async fn derive_applies_lifecycle_events_in_slot_order_not_ingest_arrival_order(
     let payer = payer();
     let mut source = ScriptedSource::new(program_id);
 
-    let open_ix = open_chunk_ix(&program_id, &payer, 200_101, 1, 17, 3_681);
+    let open_ix = open_chunk_ix(
+        &program_id,
+        &payer,
+        &SETTLEMENT_PROGRAM,
+        200_101,
+        1,
+        17,
+        3_681,
+    );
     source.push_newest(
         "1openOld0000000000000000000000000000000000000000000000000",
         100, // older slot
         raw_message_from_ixs(&payer, &[open_ix]),
         false,
     );
-    let seal_ix = seal_chunk_ix(&program_id, &payer, 200_101, 1, 17, 3_681, [7u8; 32]);
+    let seal_ix = seal_chunk_ix(
+        &program_id,
+        &payer,
+        &SETTLEMENT_PROGRAM,
+        200_101,
+        1,
+        17,
+        3_681,
+        [7u8; 32],
+    );
     source.push_newest(
         "2sealNew0000000000000000000000000000000000000000000000000",
         200, // newer slot -- ingested FIRST because the walk goes backward from the tip
@@ -617,9 +754,16 @@ async fn derive_applies_lifecycle_events_in_slot_order_not_ingest_arrival_order(
         commit_batch_size: 1,
     };
     loop {
-        match run_once(&pg.pool, &mut source, &program_id, ProgramKind::Inbox, cfg)
-            .await
-            .unwrap()
+        match run_once(
+            &pg.pool,
+            &mut source,
+            &program_id,
+            &SETTLEMENT_PROGRAM,
+            ProgramKind::Inbox,
+            cfg,
+        )
+        .await
+        .unwrap()
         {
             PageOutcome::NoNewSignatures => break,
             PageOutcome::Processed { .. } => continue,
@@ -662,14 +806,31 @@ async fn same_slot_open_then_seal_ends_sealed_regardless_of_rpc_page_size() {
     let payer = payer();
     let mut source = ScriptedSource::new(program_id);
 
-    let open_ix = open_chunk_ix(&program_id, &payer, 200_101, 1, 17, 3_681);
+    let open_ix = open_chunk_ix(
+        &program_id,
+        &payer,
+        &SETTLEMENT_PROGRAM,
+        200_101,
+        1,
+        17,
+        3_681,
+    );
     source.push_newest(
         "1openSameSlot0000000000000000000000000000000000000000000000",
         100,
         raw_message_from_ixs(&payer, &[open_ix]),
         false,
     );
-    let seal_ix = seal_chunk_ix(&program_id, &payer, 200_101, 1, 17, 3_681, [7u8; 32]);
+    let seal_ix = seal_chunk_ix(
+        &program_id,
+        &payer,
+        &SETTLEMENT_PROGRAM,
+        200_101,
+        1,
+        17,
+        3_681,
+        [7u8; 32],
+    );
     source.push_newest(
         "2sealSameSlot0000000000000000000000000000000000000000000000",
         100, // SAME slot as Open -- Seal is the later on-chain instruction, so the newer signature.
@@ -684,9 +845,16 @@ async fn same_slot_open_then_seal_ends_sealed_regardless_of_rpc_page_size() {
         commit_batch_size: 1,
     };
     loop {
-        match run_once(&pg.pool, &mut source, &program_id, ProgramKind::Inbox, cfg)
-            .await
-            .unwrap()
+        match run_once(
+            &pg.pool,
+            &mut source,
+            &program_id,
+            &SETTLEMENT_PROGRAM,
+            ProgramKind::Inbox,
+            cfg,
+        )
+        .await
+        .unwrap()
         {
             PageOutcome::NoNewSignatures => break,
             PageOutcome::Processed { .. } => continue,
@@ -717,7 +885,15 @@ async fn a_transient_null_body_is_retried_not_silently_skipped() {
     let program_id = Pubkey::new_unique();
     let payer = payer();
     let mut inner = ScriptedSource::new(program_id);
-    let open_ix = open_chunk_ix(&program_id, &payer, 200_101, 1, 17, 3_681);
+    let open_ix = open_chunk_ix(
+        &program_id,
+        &payer,
+        &SETTLEMENT_PROGRAM,
+        200_101,
+        1,
+        17,
+        3_681,
+    );
     let sig = "1nullOnceThenReal00000000000000000000000000000000000000000".to_string();
     inner.push_newest(
         sig.clone(),
@@ -734,6 +910,7 @@ async fn a_transient_null_body_is_retried_not_silently_skipped() {
             &pg.pool,
             &mut source,
             &program_id,
+            &SETTLEMENT_PROGRAM,
             ProgramKind::Inbox,
             WatcherConfig::default(),
         )
@@ -771,14 +948,31 @@ async fn derive_is_gated_while_an_ingest_walk_is_unfinished() {
 
     fn scripted(program_id: Pubkey, payer: &Pubkey) -> ScriptedSource {
         let mut source = ScriptedSource::new(program_id);
-        let open_ix = open_chunk_ix(&program_id, payer, 200_101, 1, 17, 3_681);
+        let open_ix = open_chunk_ix(
+            &program_id,
+            payer,
+            &SETTLEMENT_PROGRAM,
+            200_101,
+            1,
+            17,
+            3_681,
+        );
         source.push_newest(
             "1openOlder000000000000000000000000000000000000000000000000",
             100,
             raw_message_from_ixs(payer, &[open_ix]),
             false,
         );
-        let seal_ix = seal_chunk_ix(&program_id, payer, 200_101, 1, 17, 3_681, [7u8; 32]);
+        let seal_ix = seal_chunk_ix(
+            &program_id,
+            payer,
+            &SETTLEMENT_PROGRAM,
+            200_101,
+            1,
+            17,
+            3_681,
+            [7u8; 32],
+        );
         source.push_newest(
             "2sealNewer000000000000000000000000000000000000000000000000",
             200,
@@ -795,9 +989,16 @@ async fn derive_is_gated_while_an_ingest_walk_is_unfinished() {
     // Seal's own fetch (call 1) succeeds; Open's (call 2) fails -- the walk aborts with the newer
     // signature already durably committed but the older one not ingested at all.
     let mut failing = FailAfter::new(scripted(program_id, &payer), 2);
-    let err = run_once(&pg.pool, &mut failing, &program_id, ProgramKind::Inbox, cfg)
-        .await
-        .expect_err("the injected failure must propagate");
+    let err = run_once(
+        &pg.pool,
+        &mut failing,
+        &program_id,
+        &SETTLEMENT_PROGRAM,
+        ProgramKind::Inbox,
+        cfg,
+    )
+    .await
+    .expect_err("the injected failure must propagate");
     let _ = err;
 
     let cursor = read_cursor(&pg.pool, ProgramKind::Inbox).await.unwrap();
@@ -824,9 +1025,16 @@ async fn derive_is_gated_while_an_ingest_walk_is_unfinished() {
     // Resume with a working source and let the walk finish.
     let mut source = scripted(program_id, &payer);
     loop {
-        match run_once(&pg.pool, &mut source, &program_id, ProgramKind::Inbox, cfg)
-            .await
-            .unwrap()
+        match run_once(
+            &pg.pool,
+            &mut source,
+            &program_id,
+            &SETTLEMENT_PROGRAM,
+            ProgramKind::Inbox,
+            cfg,
+        )
+        .await
+        .unwrap()
         {
             PageOutcome::NoNewSignatures => break,
             PageOutcome::Processed { .. } => continue,
@@ -869,7 +1077,7 @@ async fn a_db_fault_mid_chunk_never_advances_the_cursor_past_uncommitted_rows() 
         } else {
             format!("sig{i}00000000000000000000000000000000000000000000000000000")
         };
-        let ix = open_chunk_ix(&program_id, &payer, 1, i, 0, 1);
+        let ix = open_chunk_ix(&program_id, &payer, &SETTLEMENT_PROGRAM, 1, i, 0, 1);
         source.push_newest(sig, 100 + i / 2, raw_message_from_ixs(&payer, &[ix]), false);
     }
 
@@ -886,9 +1094,16 @@ async fn a_db_fault_mid_chunk_never_advances_the_cursor_past_uncommitted_rows() 
         rpc_page_size: 2,
         commit_batch_size: 2,
     };
-    let err = run_once(&pg.pool, &mut source, &program_id, ProgramKind::Inbox, cfg)
-        .await
-        .expect_err("the poisoned row must make its whole page's transaction fail");
+    let err = run_once(
+        &pg.pool,
+        &mut source,
+        &program_id,
+        &SETTLEMENT_PROGRAM,
+        ProgramKind::Inbox,
+        cfg,
+    )
+    .await
+    .expect_err("the poisoned row must make its whole page's transaction fail");
     let _ = err;
 
     let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM settlement_tx")
@@ -934,14 +1149,14 @@ async fn block_status_reports_the_confirmed_suffix_until_the_finalizing_tx_itsel
     let payer = payer();
     let mut source = ScriptedSource::new(program_id);
 
-    let open_ix = open_batch_ix(&program_id, &payer, 200_101, 1, 1, &Pubkey::new_unique());
+    let open_ix = open_batch_ix(&program_id, &payer, 200_101, 1, 1, &SETTLEMENT_PROGRAM);
     source.push_newest(
         "1open00000000000000000000000000000000000000000000000000000",
         100,
         raw_message_from_ixs(&payer, &[open_ix]),
         false,
     );
-    let finalize_ix = finalize_batch_ix(&program_id, &payer, 200_101, 1, 0);
+    let finalize_ix = finalize_batch_ix(&program_id, &payer, &SETTLEMENT_PROGRAM, 200_101, 1, 0);
     source.push_newest(
         "2finalize0000000000000000000000000000000000000000000000000",
         101,
@@ -984,6 +1199,7 @@ async fn run_inbox_to_completion_scripted(
             pool,
             source,
             program_id,
+            &SETTLEMENT_PROGRAM,
             ProgramKind::Inbox,
             WatcherConfig::default(),
         )
@@ -1069,21 +1285,21 @@ async fn a_closed_finalized_batch_still_reads_data_posted() {
     let payer = payer();
     let mut source = ScriptedSource::new(program_id);
 
-    let open_ix = open_batch_ix(&program_id, &payer, 200_101, 1, 1, &Pubkey::new_unique());
+    let open_ix = open_batch_ix(&program_id, &payer, 200_101, 1, 1, &SETTLEMENT_PROGRAM);
     source.push_newest(
         "1open00000000000000000000000000000000000000000000000000000",
         100,
         raw_message_from_ixs(&payer, &[open_ix]),
         false,
     );
-    let finalize_ix = finalize_batch_ix(&program_id, &payer, 200_101, 1, 0);
+    let finalize_ix = finalize_batch_ix(&program_id, &payer, &SETTLEMENT_PROGRAM, 200_101, 1, 0);
     source.push_newest(
         "2finalize0000000000000000000000000000000000000000000000000",
         101,
         raw_message_from_ixs(&payer, &[finalize_ix]),
         false,
     );
-    let settlement_program = Pubkey::new_unique();
+    let settlement_program = SETTLEMENT_PROGRAM;
     let close_ix = close_batch_ix(&program_id, &payer, &settlement_program, 200_101, 1);
     source.push_newest(
         "3close000000000000000000000000000000000000000000000000000",
@@ -1120,21 +1336,21 @@ async fn abandon_then_close_never_touches_finalized_tx() {
     let payer = payer();
     let mut source = ScriptedSource::new(program_id);
 
-    let open_ix = open_batch_ix(&program_id, &payer, 200_101, 1, 10, &Pubkey::new_unique());
+    let open_ix = open_batch_ix(&program_id, &payer, 200_101, 1, 10, &SETTLEMENT_PROGRAM);
     source.push_newest(
         "1open00000000000000000000000000000000000000000000000000000",
         100,
         raw_message_from_ixs(&payer, &[open_ix]),
         false,
     );
-    let abandon_ix = abandon_batch_ix(&program_id, &payer, 200_101, 1);
+    let abandon_ix = abandon_batch_ix(&program_id, &payer, &SETTLEMENT_PROGRAM, 200_101, 1);
     source.push_newest(
         "2abandon00000000000000000000000000000000000000000000000000",
         101,
         raw_message_from_ixs(&payer, &[abandon_ix]),
         false,
     );
-    let settlement_program = Pubkey::new_unique();
+    let settlement_program = SETTLEMENT_PROGRAM;
     let close_ix = close_batch_ix(&program_id, &payer, &settlement_program, 200_101, 1);
     source.push_newest(
         "3close000000000000000000000000000000000000000000000000000",
@@ -1180,14 +1396,14 @@ async fn a_dropped_finalizing_tx_shows_data_posted_dropped() {
     let payer = payer();
     let mut source = ScriptedSource::new(program_id);
 
-    let open_ix = open_batch_ix(&program_id, &payer, 200_101, 1, 1, &Pubkey::new_unique());
+    let open_ix = open_batch_ix(&program_id, &payer, 200_101, 1, 1, &SETTLEMENT_PROGRAM);
     source.push_newest(
         "1open00000000000000000000000000000000000000000000000000000",
         100,
         raw_message_from_ixs(&payer, &[open_ix]),
         false,
     );
-    let finalize_ix = finalize_batch_ix(&program_id, &payer, 200_101, 1, 0);
+    let finalize_ix = finalize_batch_ix(&program_id, &payer, &SETTLEMENT_PROGRAM, 200_101, 1, 0);
     source.push_newest(
         "2finalize0000000000000000000000000000000000000000000000000",
         101,
@@ -1223,14 +1439,14 @@ async fn re_deriving_after_a_cursor_reset_does_not_double_count_a_finalize_step(
     let payer = payer();
     let mut source = ScriptedSource::new(program_id);
 
-    let open_ix = open_batch_ix(&program_id, &payer, 200_101, 1, 10, &Pubkey::new_unique());
+    let open_ix = open_batch_ix(&program_id, &payer, 200_101, 1, 10, &SETTLEMENT_PROGRAM);
     source.push_newest(
         "1open00000000000000000000000000000000000000000000000000000",
         100,
         raw_message_from_ixs(&payer, &[open_ix]),
         false,
     );
-    let step_ix = finalize_batch_ix(&program_id, &payer, 200_101, 1, 1);
+    let step_ix = finalize_batch_ix(&program_id, &payer, &SETTLEMENT_PROGRAM, 200_101, 1, 1);
     source.push_newest(
         "2step100000000000000000000000000000000000000000000000000",
         101,
@@ -1283,14 +1499,14 @@ async fn derive_skips_an_undecodable_events_row_without_panicking() {
     let payer = payer();
     let mut source = ScriptedSource::new(program_id);
 
-    let open1 = open_chunk_ix(&program_id, &payer, 200_101, 1, 1, 100);
+    let open1 = open_chunk_ix(&program_id, &payer, &SETTLEMENT_PROGRAM, 200_101, 1, 1, 100);
     source.push_newest(
         "1garbage000000000000000000000000000000000000000000000000000",
         100,
         raw_message_from_ixs(&payer, &[open1]),
         false,
     );
-    let open2 = open_chunk_ix(&program_id, &payer, 200_101, 1, 2, 100);
+    let open2 = open_chunk_ix(&program_id, &payer, &SETTLEMENT_PROGRAM, 200_101, 1, 2, 100);
     source.push_newest(
         "2good00000000000000000000000000000000000000000000000000000",
         101,
@@ -1337,14 +1553,14 @@ async fn block_status_abandoned_suffix_reflects_the_abandoning_transactions_own_
     let payer = payer();
     let mut source = ScriptedSource::new(program_id);
 
-    let open_ix = open_batch_ix(&program_id, &payer, 200_101, 1, 10, &Pubkey::new_unique());
+    let open_ix = open_batch_ix(&program_id, &payer, 200_101, 1, 10, &SETTLEMENT_PROGRAM);
     source.push_newest(
         "1open00000000000000000000000000000000000000000000000000000",
         100,
         raw_message_from_ixs(&payer, &[open_ix]),
         false,
     );
-    let abandon_ix = abandon_batch_ix(&program_id, &payer, 200_101, 1);
+    let abandon_ix = abandon_batch_ix(&program_id, &payer, &SETTLEMENT_PROGRAM, 200_101, 1);
     source.push_newest(
         "2abandon00000000000000000000000000000000000000000000000000",
         101,
@@ -1446,14 +1662,29 @@ async fn source_max_slot_never_regresses_across_a_resumed_walk() {
     // (the second signature, slot 200) is killed -- `backfill_before` has moved past the first signature,
     // but the walk is far from finished.
     let mut failing = FailAfter::new(build_source(program_id, payer), 2);
-    let _ = run_once(&pg.pool, &mut failing, &program_id, ProgramKind::Inbox, cfg).await;
+    let _ = run_once(
+        &pg.pool,
+        &mut failing,
+        &program_id,
+        &SETTLEMENT_PROGRAM,
+        ProgramKind::Inbox,
+        cfg,
+    )
+    .await;
 
     // Resume with a fresh, working source until the walk finishes.
     let mut resumed = build_source(program_id, payer);
     loop {
-        match run_once(&pg.pool, &mut resumed, &program_id, ProgramKind::Inbox, cfg)
-            .await
-            .expect("resumed run_once")
+        match run_once(
+            &pg.pool,
+            &mut resumed,
+            &program_id,
+            &SETTLEMENT_PROGRAM,
+            ProgramKind::Inbox,
+            cfg,
+        )
+        .await
+        .expect("resumed run_once")
         {
             PageOutcome::NoNewSignatures => break,
             PageOutcome::Processed { .. } => continue,

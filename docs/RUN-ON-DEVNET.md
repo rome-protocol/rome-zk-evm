@@ -34,7 +34,7 @@ Rome verified the program addresses and settlement settings on chain. The progra
 - A Solana devnet RPC endpoint. A provider endpoint is more reliable under load.
 - A Solana payer keypair in a JSON file, funded with about 6 SOL on devnet. It is also your chain authority.
 - A sequencer signing key: 64 hex characters in a file. Both key files must be readable by container user 999.
-- An EVM address you control for the genesis allocation.
+- An EVM address you control for the fee recipient (and, if you declare one, the backed balance).
 
 The steps below start the node without a prover. A full settlement setup also needs one NVIDIA GPU
 with more than 30 GB of memory and about 55 GB of proving keys on the host. The final proof step needs
@@ -75,10 +75,29 @@ Edit `.env`:
 - Set `ROME_ZK_TAG=v0.1.1` to use the node image above.
 - Keep `RPC_BIND=127.0.0.1` for local access and leave `PROVER` unset for this first run.
 
-In `chain.toml`, replace `genesis.funded_address` with your EVM address.
-The example's zero address is a placeholder; `init` refuses it. Use an address you control.
+A new chain's genesis has no balances, and you do not need to set anything for that. The older
+`genesis.funded_address` key is gone: it minted coins to one address, and a genesis that mints coins can never take
+deposits safely, because its holder could exit coins that other people's deposits paid for. The genesis cannot
+change after you register, so a chain starts with zero balances. `init` refuses a `chain.toml` that still has
+`funded_address`. L2 gas comes from deposits once they ship. Until then your chain has no gas and cannot send a
+transaction, so there is nothing for it to carry yet. You can still register it and start the services.
+
+If you need gas before deposits are available, you can declare one backed balance, with two keys under `[genesis]`:
+`backed_address` (an address you control) and `backed_balance_lamports` (the amount in lamports, for example
+`1_500_000_000` for 1.5 SOL). Your chain gets that amount at genesis, 1 lamport as 1 gwei. You then lock the same
+amount in your chain's vault with the bridge program's `Fund`, and Rome checks the vault before it registers your
+verification key. `init` prints the exact amount to lock. The bridge program is not deployed on devnet yet, so a backed
+balance cannot be locked on devnet today.
+
+Set `genesis.fee_recipient` to an address you control as well. It receives the priority fees (tips) of the chain's
+transactions; the base fee is burned, as on Ethereum. Like the rest of the genesis, it cannot be changed after you
+register. `init` refuses it if it is missing, malformed, zero, a precompile address or the exit portal's address.
 Do not add a chain id. The settlement program derives it from your payer key and that key's
-registration count; `init` reads it from Solana.
+registration count; `init` reads it from Solana. The id is a number between 2^32 and 2^53 - 1, and MetaMask cannot add
+a chain whose id is above 4503599627370476, which is about half of them. If yours is above it, `init` stops with
+`ChainIdNotWalletSafe` before anything is sent. Create a new payer key with `solana-keygen new -o keys/payer.json`,
+give it the same `chgrp 999` and `chmod 640` as before, and run `./rollup init` again. `init` only reads from Solana,
+so you can check the id before you fund the key.
 
 ### 2. Read the chain id and render the configs
 
@@ -187,6 +206,7 @@ Your node, RPC service and prover have their own running costs.
 ## Known limits
 
 - Building a guest for your chain's genesis is not automated yet.
+- A new chain has no gas: its genesis has no balances, and deposits are not available yet. Until they are, it cannot send a transaction.
 - The prover needs one NVIDIA GPU with more than 30 GB of memory and about 55 GB of proving keys on the host.
   The final proof step needs about 30 GB of GPU memory; a 24 GB card is not enough.
 - Exits are off on a new chain: it has no exit portal configured and its exit cap is zero. The chain

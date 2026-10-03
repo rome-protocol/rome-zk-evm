@@ -191,15 +191,15 @@ async fn main() {
     // Batch ids are sequential and never reused — read the real inbox program's own
     // `batch_cursor.next_batch` for this chain rather than a hardcoded `1`, which would collide with (or
     // wrongly skip past) whatever the cursor already expects.
-    let (cursor_pda, _) = zk_inbox_client::cursor_pda(&args.inbox_program, chain_id);
+    let (cursor_pda, _) = zk_inbox_client::cursor_pda(&args.inbox_program, &program_id, chain_id);
     let cursor_data = rpc
         .get_account(&cursor_pda)
         .await
         .unwrap_or_else(|e| {
             panic!(
                 "chain {chain_id} has no batch_cursor account on inbox program {} ({cursor_pda}): {e} \
-                 — run InitBatchCursor for this chain first (see zk-inbox-client's \
-                 examples/find_max_batch_id.rs)",
+                 — run InitBatchCursor for this chain first, at root.head_pending_batch + 1 \
+                 (see zk-inbox-client's examples/find_max_batch_id.rs)",
                 args.inbox_program
             )
         })
@@ -316,6 +316,7 @@ async fn main() {
             zk_inbox_client::open_chunk_ix(
                 &args.inbox_program,
                 &payer.pubkey(),
+                &program_id,
                 chain_id,
                 batch,
                 idx,
@@ -324,6 +325,7 @@ async fn main() {
             zk_inbox_client::write_chunk_ix(
                 &args.inbox_program,
                 &payer.pubkey(),
+                &program_id,
                 chain_id,
                 batch,
                 idx,
@@ -333,13 +335,14 @@ async fn main() {
             zk_inbox_client::seal_chunk_ix(
                 &args.inbox_program,
                 &payer.pubkey(),
+                &program_id,
                 chain_id,
                 batch,
                 idx,
                 body.len() as u32,
                 zk_inbox_client::chunk_body_hash(body),
             ),
-            zk_inbox_client::seal_leaf_ix(&args.inbox_program, chain_id, batch, idx),
+            zk_inbox_client::seal_leaf_ix(&args.inbox_program, &program_id, chain_id, batch, idx),
         ];
         let sig = send(&rpc, &payer, &ixs).await;
         print_cu(
@@ -356,6 +359,7 @@ async fn main() {
         &[zk_inbox_client::finalize_batch_ix(
             &args.inbox_program,
             &payer.pubkey(),
+            &program_id,
             chain_id,
             batch,
             0,
@@ -365,7 +369,8 @@ async fn main() {
     print_cu(&rpc, "inbox FinalizeBatch", &finalize_inbox_sig).await;
 
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let (inbox_batch_pda, _) = zk_inbox_client::batch_pda(&args.inbox_program, chain_id, batch);
+    let (inbox_batch_pda, _) =
+        zk_inbox_client::batch_pda(&args.inbox_program, &program_id, chain_id, batch);
     let inbox_acct = rpc
         .get_account(&inbox_batch_pda)
         .await

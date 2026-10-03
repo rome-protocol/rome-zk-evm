@@ -156,7 +156,15 @@ fn design_frame_instruction_data_bytes() -> u16 {
     let placeholder = Pubkey::new_from_array([1u8; 32]);
     let payload =
         vec![0u8; crate::channel::FRAME_HEADER_LEN + crate::channel::DEFAULT_MAX_FRAME_BODY_LEN];
-    let ixs = crate::pipeline::plan_chunk(&placeholder, &placeholder, 200_101, 0, 0, &payload);
+    let ixs = crate::pipeline::plan_chunk(
+        &placeholder,
+        &placeholder,
+        &placeholder,
+        200_101,
+        0,
+        0,
+        &payload,
+    );
     ixs.iter()
         .fold(0u16, |acc, ix| acc.saturating_add(ix.data.len() as u16))
 }

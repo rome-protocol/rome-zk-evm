@@ -148,6 +148,7 @@ pub fn required_loaded_accounts_data_size(
     let chunk_ixs = crate::pipeline::plan_chunk(
         inbox_program_id,
         &placeholder,
+        &placeholder,
         200_101,
         0,
         0,
@@ -171,6 +172,7 @@ pub fn required_loaded_accounts_data_size(
 
     let finalize_ixs = [zk_inbox_client::finalize_batch_ix(
         inbox_program_id,
+        &placeholder,
         &placeholder,
         200_101,
         0,

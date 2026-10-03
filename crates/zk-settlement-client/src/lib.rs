@@ -127,11 +127,16 @@ pub fn exit_nullifier_pda(program_id: &Pubkey, chain_id: u64, page: u64) -> (Pub
 pub fn exit_consumer_pda(chain_id: u64, bridge_program: &Pubkey) -> (Pubkey, u8) {
     rome_zk_layouts::exit::exit_consumer_pda(chain_id, bridge_program)
 }
-/// `["batch", chain_id, batch]` under `inbox_program` — the inbox batch account `PostRoot`/
-/// `PostRootProved` read; matches `zk_inbox_client::batch_pda`. The single definition is
+/// `["batch", settlement_program, chain_id, batch]` under `inbox_program` — the inbox batch account
+/// `PostRoot`/`PostRootProved` read; matches `zk_inbox_client::batch_pda`. The single definition is
 /// `rome_zk_layouts::batch::pda`.
-pub fn inbox_batch_pda(inbox_program: &Pubkey, chain_id: u64, batch: u64) -> Pubkey {
-    rome_zk_layouts::batch::pda(inbox_program, chain_id, batch).0
+pub fn inbox_batch_pda(
+    inbox_program: &Pubkey,
+    settlement_program: &Pubkey,
+    chain_id: u64,
+    batch: u64,
+) -> Pubkey {
+    rome_zk_layouts::batch::pda(inbox_program, settlement_program, chain_id, batch).0
 }
 
 fn ix(
@@ -866,7 +871,7 @@ fn post_root_accounts(
     let (pending, _) = pending_pda(program_id, args.chain_id, args.batch);
     let (predecessor, _) = pending_pda(program_id, args.chain_id, args.prev_batch);
     let (registry, _) = registry_pda(program_id, args.chain_id);
-    let inbox_batch = inbox_batch_pda(inbox_program, args.chain_id, args.batch);
+    let inbox_batch = inbox_batch_pda(inbox_program, program_id, args.chain_id, args.batch);
     let (chain_config, _) = chain_config_pda(program_id, args.chain_id);
     let (global_config, _) = global_config_pda(program_id);
     vec![
@@ -1534,13 +1539,14 @@ mod tests {
     #[test]
     fn inbox_batch_pda_matches_program_and_layouts() {
         let inbox_program = Pubkey::new_unique();
+        let settlement_program = Pubkey::new_unique();
         assert_eq!(
-            inbox_batch_pda(&inbox_program, 7, 3),
-            zk_settlement::settle::inbox_batch_pda(&inbox_program, 7, 3)
+            inbox_batch_pda(&inbox_program, &settlement_program, 7, 3),
+            zk_settlement::settle::inbox_batch_pda(&inbox_program, &settlement_program, 7, 3)
         );
         assert_eq!(
-            inbox_batch_pda(&inbox_program, 7, 3),
-            rome_zk_layouts::batch::pda(&inbox_program, 7, 3).0
+            inbox_batch_pda(&inbox_program, &settlement_program, 7, 3),
+            rome_zk_layouts::batch::pda(&inbox_program, &settlement_program, 7, 3).0
         );
     }
 

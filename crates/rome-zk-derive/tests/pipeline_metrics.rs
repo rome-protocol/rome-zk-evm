@@ -12,6 +12,9 @@ use rome_zk_derive::testutil::FakeAccountReader;
 use rome_zk_derive::traversal::SolanaTraversal;
 use solana_program::pubkey::Pubkey;
 
+/// Stand-in settlement program the test chain is registered under (inbox accounts are keyed by it).
+const SETTLEMENT_PROGRAM: Pubkey = Pubkey::new_from_array([9u8; 32]);
+
 const CHAIN_ID: u64 = 200_101;
 const OPEN_UNIX_TS: i64 = 1_757_000_000;
 
@@ -96,7 +99,8 @@ fn seed_batch(
     let bodies: Vec<Vec<u8>> = frames.iter().map(|f| f.to_bytes()).collect();
     let body_refs: Vec<&[u8]> = bodies.iter().map(|b| b.as_slice()).collect();
 
-    let (batch_pda, _) = zk_inbox_client::batch_pda(program_id, chain_id, batch);
+    let (batch_pda, _) =
+        zk_inbox_client::batch_pda(program_id, &SETTLEMENT_PROGRAM, chain_id, batch);
     reader.accounts.insert(
         batch_pda,
         batch_account_bytes(
@@ -109,7 +113,13 @@ fn seed_batch(
         ),
     );
     for (idx, body) in bodies.iter().enumerate() {
-        let (chunk_pda, _) = zk_inbox_client::chunk_pda(program_id, chain_id, batch, idx as u32);
+        let (chunk_pda, _) = zk_inbox_client::chunk_pda(
+            program_id,
+            &SETTLEMENT_PROGRAM,
+            chain_id,
+            batch,
+            idx as u32,
+        );
         let mut chunk = vec![0u8; zk_inbox::HEADER_LEN + body.len()];
         chunk[zk_inbox::OFF_MAGIC..zk_inbox::OFF_MAGIC + 4]
             .copy_from_slice(&zk_inbox::MAGIC.to_le_bytes());
@@ -130,8 +140,9 @@ fn pipeline(
     reader: FakeAccountReader,
     program_id: Pubkey,
 ) -> DerivePipeline<FakeAccountReader, MockEngineApi> {
-    let traversal = SolanaTraversal::new(reader.clone(), program_id, CHAIN_ID, 0);
-    let inbox = InboxRetrieval::new(reader, program_id);
+    let traversal =
+        SolanaTraversal::new(reader.clone(), program_id, SETTLEMENT_PROGRAM, CHAIN_ID, 0);
+    let inbox = InboxRetrieval::new(reader, program_id, SETTLEMENT_PROGRAM);
     let engine = EngineController::new(MockEngineApi::default(), alloy_primitives::B256::ZERO, 0);
     DerivePipeline::new(
         traversal,
@@ -149,7 +160,7 @@ fn pipeline(
 async fn derive_critical_total_increments_on_a_critical_batch() {
     let program_id = Pubkey::new_unique();
     let mut reader = FakeAccountReader::default();
-    let (batch_pda, _) = zk_inbox_client::batch_pda(&program_id, CHAIN_ID, 0);
+    let (batch_pda, _) = zk_inbox_client::batch_pda(&program_id, &SETTLEMENT_PROGRAM, CHAIN_ID, 0);
     reader
         .accounts
         .insert(batch_pda, v1_batch_account_bytes(CHAIN_ID, 0, 1));

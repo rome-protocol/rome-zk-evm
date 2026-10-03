@@ -80,8 +80,12 @@ async fn devnet_root_account_is_too_short_for_openbatch_and_no_batch_account_exi
 
     // --- chunk Open also independently requires a batch account that only OpenBatch can create ---
     let probe_batch_id = 999_999_999u64; // an id nobody has plausibly opened
-    let (batch_pda, _) =
-        zk_inbox_client::batch_pda(&inbox_program, DEVNET_CHAIN_ID, probe_batch_id);
+    let (batch_pda, _) = zk_inbox_client::batch_pda(
+        &inbox_program,
+        &settlement_program,
+        DEVNET_CHAIN_ID,
+        probe_batch_id,
+    );
     match rpc.get_account(&batch_pda).await {
         Ok(acc) => println!(
             "batch PDA {batch_pda} unexpectedly exists ({} bytes, owner {}) -- pick a different probe_batch_id",
@@ -114,6 +118,7 @@ async fn design_frame_v1_tx_simulates_clean_on_target_cluster() {
         rome_zk_batcher::config::default_loaded_accounts_data_size_limit();
 
     let inbox_program = Pubkey::from_str(DEVNET_INBOX_PROGRAM_ID).unwrap();
+    let settlement_program = Pubkey::from_str(DEVNET_SETTLEMENT_PROGRAM_ID).unwrap();
     let payer_legacy = Pubkey::from_str(PROBE_PAYER).unwrap();
     let payer_v1 = compat::to_v1_pubkey(&payer_legacy);
 
@@ -125,6 +130,7 @@ async fn design_frame_v1_tx_simulates_clean_on_target_cluster() {
     let ixs = rome_zk_batcher::pipeline::plan_chunk(
         &inbox_program,
         &payer_legacy,
+        &settlement_program,
         DEVNET_CHAIN_ID,
         PROBE_BATCH,
         PROBE_CHUNK_IDX,

@@ -26,7 +26,7 @@ fn main() {
     let chain_id: u64 = argv[2].parse().expect("bad chain_id");
 
     let (root_pda, _) = root::pda(&settlement_program, chain_id);
-    let (cursor_pda, _) = cursor::pda(&inbox_program, chain_id);
+    let (cursor_pda, _) = cursor::pda(&inbox_program, &settlement_program, chain_id);
     let (global_config_pda, _) = global_config::pda(&settlement_program);
     let (reserved_allow_pda, _) = reserved_allow::pda(&settlement_program, chain_id);
     let (chain_config_pda, _) = chain_config::pda(&settlement_program, chain_id);

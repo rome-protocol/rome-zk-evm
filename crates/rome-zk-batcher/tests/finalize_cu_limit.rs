@@ -230,18 +230,16 @@ async fn open_grown_and_presealed_batch(
     settlement_program: &Pubkey,
     frames: &[Frame],
 ) {
-    pipeline::open_and_grow_batch(
-        sender,
-        target,
-        frames.len() as u32,
-        settlement_program,
-        tuning(200_000),
-    )
-    .await
-    .expect("OpenBatch(+Grow) must succeed");
+    pipeline::open_and_grow_batch(sender, target, frames.len() as u32, tuning(200_000))
+        .await
+        .expect("OpenBatch(+Grow) must succeed");
 
-    let (batch_pda, _) =
-        zk_inbox_client::batch_pda(&target.program_id, target.chain_id, target.batch);
+    let (batch_pda, _) = zk_inbox_client::batch_pda(
+        &target.program_id,
+        settlement_program,
+        target.chain_id,
+        target.batch,
+    );
     let account = ctx
         .banks_client
         .get_account(batch_pda)
@@ -288,7 +286,7 @@ async fn finalize_and_verify_fails_a_900_leaf_batch_at_the_general_200k_cu_limit
         root_account_with_authority(chain_id, &authority.pubkey(), settlement_program),
     );
     pt.add_account(
-        zk_inbox_client::cursor_pda(&program_id, chain_id).0,
+        zk_inbox_client::cursor_pda(&program_id, &settlement_program, chain_id).0,
         cursor_account(program_id, chain_id, batch),
     );
     pt.add_account(
@@ -309,6 +307,7 @@ async fn finalize_and_verify_fails_a_900_leaf_batch_at_the_general_200k_cu_limit
     };
     let target = BatchTarget {
         program_id,
+        settlement_program,
         payer: authority.pubkey(),
         chain_id,
         batch,
@@ -373,7 +372,7 @@ async fn finalize_and_verify_succeeds_a_900_leaf_batch_at_the_configured_finaliz
         root_account_with_authority(chain_id, &authority.pubkey(), settlement_program),
     );
     pt.add_account(
-        zk_inbox_client::cursor_pda(&program_id, chain_id).0,
+        zk_inbox_client::cursor_pda(&program_id, &settlement_program, chain_id).0,
         cursor_account(program_id, chain_id, batch),
     );
     pt.add_account(
@@ -394,6 +393,7 @@ async fn finalize_and_verify_succeeds_a_900_leaf_batch_at_the_configured_finaliz
     };
     let target = BatchTarget {
         program_id,
+        settlement_program,
         payer: authority.pubkey(),
         chain_id,
         batch,

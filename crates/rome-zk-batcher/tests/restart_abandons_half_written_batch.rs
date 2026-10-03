@@ -133,7 +133,7 @@ async fn a_half_written_batch_is_abandoned_and_its_chunks_closed_before_the_next
         root_account_with_authority(CHAIN_ID, &authority.pubkey(), settlement_program),
     );
     pt.add_account(
-        zk_inbox_client::cursor_pda(&program_id, CHAIN_ID).0,
+        zk_inbox_client::cursor_pda(&program_id, &settlement_program, CHAIN_ID).0,
         cursor_account(program_id, CHAIN_ID, 0),
     );
     let ctx = pt.start_with_context().await;
@@ -159,16 +159,25 @@ async fn a_half_written_batch_is_abandoned_and_its_chunks_closed_before_the_next
 
     // --- Seal only chunk 0 of 2 (a partial seal — the crash-mid-post shape) ---
     let payload = b"one sealed chunk, one never opened".to_vec();
-    let chunk_plan =
-        pipeline::plan_chunk(&program_id, &authority.pubkey(), CHAIN_ID, 0, 0, &payload);
+    let chunk_plan = pipeline::plan_chunk(
+        &program_id,
+        &authority.pubkey(),
+        &settlement_program,
+        CHAIN_ID,
+        0,
+        0,
+        &payload,
+    );
     sender
         .send_and_confirm(&chunk_plan, tuning())
         .await
         .unwrap();
 
-    let (batch_pda, _) = zk_inbox_client::batch_pda(&program_id, CHAIN_ID, 0);
-    let (chunk0_pda, _) = zk_inbox_client::chunk_pda(&program_id, CHAIN_ID, 0, 0);
-    let (chunk1_pda, _) = zk_inbox_client::chunk_pda(&program_id, CHAIN_ID, 0, 1);
+    let (batch_pda, _) = zk_inbox_client::batch_pda(&program_id, &settlement_program, CHAIN_ID, 0);
+    let (chunk0_pda, _) =
+        zk_inbox_client::chunk_pda(&program_id, &settlement_program, CHAIN_ID, 0, 0);
+    let (chunk1_pda, _) =
+        zk_inbox_client::chunk_pda(&program_id, &settlement_program, CHAIN_ID, 0, 1);
     let before = banks_client
         .clone()
         .get_account(batch_pda)
@@ -254,7 +263,7 @@ async fn a_half_written_batch_is_abandoned_and_its_chunks_closed_before_the_next
     // ===== batch 1 (a fresh id, never batch 0 again) posts and finalizes normally =====
     let cursor_data = banks_client
         .clone()
-        .get_account(zk_inbox_client::cursor_pda(&program_id, CHAIN_ID).0)
+        .get_account(zk_inbox_client::cursor_pda(&program_id, &settlement_program, CHAIN_ID).0)
         .await
         .unwrap()
         .unwrap();
@@ -266,6 +275,7 @@ async fn a_half_written_batch_is_abandoned_and_its_chunks_closed_before_the_next
 
     let target = BatchTarget {
         program_id,
+        settlement_program,
         payer: authority.pubkey(),
         chain_id: CHAIN_ID,
         batch: 1,
@@ -297,14 +307,20 @@ async fn a_half_written_batch_is_abandoned_and_its_chunks_closed_before_the_next
             }
         }
     }
-    let finalize_ix =
-        zk_inbox_client::finalize_batch_ix(&program_id, &authority.pubkey(), CHAIN_ID, 1, 0);
+    let finalize_ix = zk_inbox_client::finalize_batch_ix(
+        &program_id,
+        &authority.pubkey(),
+        &settlement_program,
+        CHAIN_ID,
+        1,
+        0,
+    );
     sender
         .send_and_confirm(std::slice::from_ref(&finalize_ix), tuning())
         .await
         .unwrap();
 
-    let (batch1_pda, _) = zk_inbox_client::batch_pda(&program_id, CHAIN_ID, 1);
+    let (batch1_pda, _) = zk_inbox_client::batch_pda(&program_id, &settlement_program, CHAIN_ID, 1);
     let account1 = banks_client
         .clone()
         .get_account(batch1_pda)

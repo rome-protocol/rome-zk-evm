@@ -24,11 +24,18 @@ use crate::PipelineError;
 pub struct InboxRetrieval<R> {
     reader: R,
     program_id: Pubkey,
+    /// The settlement program the chain is registered under — chunk addresses are keyed by it
+    /// (`["inbox", settlement_program, chain_id, batch, idx]`).
+    settlement_program: Pubkey,
 }
 
 impl<R: AccountReader> InboxRetrieval<R> {
-    pub fn new(reader: R, program_id: Pubkey) -> Self {
-        Self { reader, program_id }
+    pub fn new(reader: R, program_id: Pubkey, settlement_program: Pubkey) -> Self {
+        Self {
+            reader,
+            program_id,
+            settlement_program,
+        }
     }
 
     /// The underlying [`AccountReader`] — mainly for tests to inspect a fake reader's own call log
@@ -52,7 +59,14 @@ impl<R: AccountReader> InboxRetrieval<R> {
     pub async fn chunks(&mut self, batch: BatchRef) -> Result<Vec<Vec<u8>>, PipelineError> {
         let chunk_pdas: Vec<Pubkey> = (0..batch.expected_count)
             .map(|idx| {
-                zk_inbox_client::chunk_pda(&self.program_id, batch.chain_id, batch.batch, idx).0
+                zk_inbox_client::chunk_pda(
+                    &self.program_id,
+                    &self.settlement_program,
+                    batch.chain_id,
+                    batch.batch,
+                    idx,
+                )
+                .0
             })
             .collect();
         let chunk_datas = self.reader.get_multiple_account_data(&chunk_pdas).await?;
@@ -245,15 +259,17 @@ mod tests {
     #[tokio::test]
     async fn reads_every_chunk_body_in_idx_order() {
         let program_id = Pubkey::new_unique();
+        let settlement_program = Pubkey::new_unique();
         let mut reader = FakeReader::default();
         let bodies: [&[u8]; 3] = [b"chunk-0-body", b"chunk-1-body", b"chunk-2-body"];
         for (idx, body) in bodies.iter().enumerate() {
-            let (pda, _) = zk_inbox_client::chunk_pda(&program_id, 7, 3, idx as u32);
+            let (pda, _) =
+                zk_inbox_client::chunk_pda(&program_id, &settlement_program, 7, 3, idx as u32);
             reader
                 .accounts
                 .insert(pda, chunk_account(7, 3, idx as u32, true, body));
         }
-        let mut r = InboxRetrieval::new(reader, program_id);
+        let mut r = InboxRetrieval::new(reader, program_id, settlement_program);
         let got = r.chunks(batch_ref_for(7, 3, 1, &bodies)).await.unwrap();
         assert_eq!(
             got,
@@ -270,6 +286,7 @@ mod tests {
     #[tokio::test]
     async fn chunks_reads_in_pages_not_one_round_trip_per_chunk() {
         let program_id = Pubkey::new_unique();
+        let settlement_program = Pubkey::new_unique();
         let n = 250u32;
         let bodies: Vec<Vec<u8>> = (0..n)
             .map(|i| format!("chunk-{i}-body").into_bytes())
@@ -279,13 +296,14 @@ mod tests {
 
         let mut reader = FakeReader::default();
         for (idx, body) in bodies.iter().enumerate() {
-            let (pda, _) = zk_inbox_client::chunk_pda(&program_id, 7, 3, idx as u32);
+            let (pda, _) =
+                zk_inbox_client::chunk_pda(&program_id, &settlement_program, 7, 3, idx as u32);
             reader
                 .accounts
                 .insert(pda, chunk_account(7, 3, idx as u32, true, body));
         }
 
-        let mut r = InboxRetrieval::new(reader, program_id);
+        let mut r = InboxRetrieval::new(reader, program_id, settlement_program);
         let got = r.chunks(batch_ref).await.unwrap();
         assert_eq!(got.len(), n as usize);
         assert_eq!(
@@ -316,23 +334,25 @@ mod tests {
     #[tokio::test]
     async fn a_chunk_body_not_matching_the_committed_acc_is_critical() {
         let program_id = Pubkey::new_unique();
+        let settlement_program = Pubkey::new_unique();
         let mut reader = FakeReader::default();
         let bodies: [&[u8]; 2] = [b"chunk-0-body", b"chunk-1-body"];
         // BatchRef's commitment is computed over the ORIGINAL bodies...
         let batch_ref = batch_ref_for(7, 3, 1, &bodies);
         for (idx, body) in bodies.iter().enumerate() {
-            let (pda, _) = zk_inbox_client::chunk_pda(&program_id, 7, 3, idx as u32);
+            let (pda, _) =
+                zk_inbox_client::chunk_pda(&program_id, &settlement_program, 7, 3, idx as u32);
             reader
                 .accounts
                 .insert(pda, chunk_account(7, 3, idx as u32, true, body));
         }
         // ...but the account actually read back has chunk 1 tampered — one flipped byte.
-        let (pda1, _) = zk_inbox_client::chunk_pda(&program_id, 7, 3, 1);
+        let (pda1, _) = zk_inbox_client::chunk_pda(&program_id, &settlement_program, 7, 3, 1);
         reader
             .accounts
             .insert(pda1, chunk_account(7, 3, 1, true, b"chunk-1-BODY"));
 
-        let mut r = InboxRetrieval::new(reader, program_id);
+        let mut r = InboxRetrieval::new(reader, program_id, settlement_program);
         let err = r.chunks(batch_ref).await.unwrap_err();
         assert!(matches!(err, PipelineError::Critical(_)));
     }
@@ -340,8 +360,9 @@ mod tests {
     #[tokio::test]
     async fn a_missing_chunk_is_critical() {
         let program_id = Pubkey::new_unique();
+        let settlement_program = Pubkey::new_unique();
         let reader = FakeReader::default(); // nothing seeded
-        let mut r = InboxRetrieval::new(reader, program_id);
+        let mut r = InboxRetrieval::new(reader, program_id, settlement_program);
         let err = r.chunks(batch_ref(7, 3, 1)).await.unwrap_err();
         assert!(matches!(err, PipelineError::Critical(_)));
     }
@@ -349,12 +370,13 @@ mod tests {
     #[tokio::test]
     async fn an_unsealed_chunk_is_critical() {
         let program_id = Pubkey::new_unique();
+        let settlement_program = Pubkey::new_unique();
         let mut reader = FakeReader::default();
-        let (pda, _) = zk_inbox_client::chunk_pda(&program_id, 7, 3, 0);
+        let (pda, _) = zk_inbox_client::chunk_pda(&program_id, &settlement_program, 7, 3, 0);
         reader
             .accounts
             .insert(pda, chunk_account(7, 3, 0, false, b"x"));
-        let mut r = InboxRetrieval::new(reader, program_id);
+        let mut r = InboxRetrieval::new(reader, program_id, settlement_program);
         let err = r.chunks(batch_ref(7, 3, 1)).await.unwrap_err();
         assert!(matches!(err, PipelineError::Critical(_)));
     }
@@ -362,13 +384,14 @@ mod tests {
     #[tokio::test]
     async fn a_header_reporting_the_wrong_batch_is_critical() {
         let program_id = Pubkey::new_unique();
+        let settlement_program = Pubkey::new_unique();
         let mut reader = FakeReader::default();
-        let (pda, _) = zk_inbox_client::chunk_pda(&program_id, 7, 3, 0);
+        let (pda, _) = zk_inbox_client::chunk_pda(&program_id, &settlement_program, 7, 3, 0);
         // Header says batch 4, but this is stored under batch 3's PDA.
         reader
             .accounts
             .insert(pda, chunk_account(7, 4, 0, true, b"x"));
-        let mut r = InboxRetrieval::new(reader, program_id);
+        let mut r = InboxRetrieval::new(reader, program_id, settlement_program);
         let err = r.chunks(batch_ref(7, 3, 1)).await.unwrap_err();
         assert!(matches!(err, PipelineError::Critical(_)));
     }

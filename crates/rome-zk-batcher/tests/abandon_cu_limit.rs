@@ -51,7 +51,7 @@ async fn abandon_batch_cu_on_a_900_leaf_account_fits_the_chunk_compute_unit_limi
         root_account_with_authority(chain_id, &authority.pubkey(), settlement_program),
     );
     pt.add_account(
-        zk_inbox_client::cursor_pda(&program_id, chain_id).0,
+        zk_inbox_client::cursor_pda(&program_id, &settlement_program, chain_id).0,
         cursor_account(program_id, chain_id, 0),
     );
     pt.add_account(
@@ -68,6 +68,7 @@ async fn abandon_batch_cu_on_a_900_leaf_account_fits_the_chunk_compute_unit_limi
 
     let target = BatchTarget {
         program_id,
+        settlement_program,
         payer: authority.pubkey(),
         chain_id,
         batch: 0,
@@ -85,7 +86,8 @@ async fn abandon_batch_cu_on_a_900_leaf_account_fits_the_chunk_compute_unit_limi
             .await
             .expect("OpenBatch/GrowBatch must succeed");
     }
-    let (batch_pda, _) = zk_inbox_client::batch_pda(&program_id, chain_id, target.batch);
+    let (batch_pda, _) =
+        zk_inbox_client::batch_pda(&program_id, &settlement_program, chain_id, target.batch);
     let account = ctx
         .banks_client
         .get_account(batch_pda)
@@ -94,8 +96,13 @@ async fn abandon_batch_cu_on_a_900_leaf_account_fits_the_chunk_compute_unit_limi
         .unwrap();
     assert_eq!(account.data.len(), rome_zk_layouts::batch::account_len(900));
 
-    let abandon_ix =
-        zk_inbox_client::abandon_batch_ix(&program_id, &authority.pubkey(), chain_id, target.batch);
+    let abandon_ix = zk_inbox_client::abandon_batch_ix(
+        &program_id,
+        &authority.pubkey(),
+        &settlement_program,
+        chain_id,
+        target.batch,
+    );
     let cu = send_measuring_cu(&mut ctx, std::slice::from_ref(&abandon_ix), &authority)
         .await
         .expect("AbandonBatch on a 900-leaf account must succeed");
@@ -118,8 +125,9 @@ async fn abandon_batch_cu_on_a_900_leaf_account_fits_the_chunk_compute_unit_limi
 
 /// A single chunk `Close` (the cheap, authority-only path once the batch account is already gone — exactly
 /// what `pipeline::abandon_open_batches_in_pending_window` does for each of a half-written batch's chunk PDAs)
-/// and a transaction packing `CLOSE_IXS_PER_TX` of them together (the packed form this file measures) both fit
-/// comfortably under `chunk_compute_unit_limit`.
+/// and a transaction packing `CLOSE_IXS_PER_TX` of them together (the packed form this file measures): a single
+/// one fits under `chunk_compute_unit_limit`, and the packed group fits under one `chunk_compute_unit_limit` per
+/// Close (the budget the group asks for).
 #[tokio::test]
 async fn packed_chunk_close_fits_the_chunk_compute_unit_limit() {
     let program_id = rome_zk_testkit::fixed_inbox_program_id();
@@ -136,7 +144,7 @@ async fn packed_chunk_close_fits_the_chunk_compute_unit_limit() {
         root_account_with_authority(chain_id, &authority.pubkey(), settlement_program),
     );
     pt.add_account(
-        zk_inbox_client::cursor_pda(&program_id, chain_id).0,
+        zk_inbox_client::cursor_pda(&program_id, &settlement_program, chain_id).0,
         cursor_account(program_id, chain_id, 0),
     );
     pt.add_account(
@@ -173,6 +181,7 @@ async fn packed_chunk_close_fits_the_chunk_compute_unit_limit() {
         let open_ix = zk_inbox_client::open_chunk_ix(
             &program_id,
             &authority.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -182,8 +191,13 @@ async fn packed_chunk_close_fits_the_chunk_compute_unit_limit() {
             .await
             .unwrap_or_else(|e| panic!("Open chunk {idx} must succeed: {e:?}"));
     }
-    let abandon_ix =
-        zk_inbox_client::abandon_batch_ix(&program_id, &authority.pubkey(), chain_id, batch);
+    let abandon_ix = zk_inbox_client::abandon_batch_ix(
+        &program_id,
+        &authority.pubkey(),
+        &settlement_program,
+        chain_id,
+        batch,
+    );
     send_measuring_cu(&mut ctx, std::slice::from_ref(&abandon_ix), &authority)
         .await
         .expect("AbandonBatch must succeed");
@@ -224,10 +238,12 @@ async fn packed_chunk_close_fits_the_chunk_compute_unit_limit() {
         .await
         .expect("a packed transaction of CLOSE_IXS_PER_TX Close instructions must succeed");
     eprintln!("packed {CLOSE_IXS_PER_TX}-Close CU: {packed_cu}");
+    // `abandon_open_batches_in_pending_window` gives a packed group one `chunk_compute_unit_limit` per Close.
+    let group_limit = CHUNK_COMPUTE_UNIT_LIMIT * CLOSE_IXS_PER_TX as u64;
     assert!(
-        packed_cu <= CHUNK_COMPUTE_UNIT_LIMIT,
-        "packing {CLOSE_IXS_PER_TX} Close instructions measured {packed_cu} CU, over \
-         chunk_compute_unit_limit ({CHUNK_COMPUTE_UNIT_LIMIT}) — abandon_open_batches_in_pending_window sends \
-         packed groups under this same tuning"
+        packed_cu <= group_limit,
+        "packing {CLOSE_IXS_PER_TX} Close instructions measured {packed_cu} CU, over the group's budget of \
+         {CLOSE_IXS_PER_TX} x chunk_compute_unit_limit ({group_limit}) — abandon_open_batches_in_pending_window \
+         sends packed groups under this tuning"
     );
 }

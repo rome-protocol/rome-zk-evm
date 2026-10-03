@@ -33,9 +33,18 @@ pub fn pending_pda(program_id: &Pubkey, chain_id: u64, batch: u64) -> (Pubkey, u
 /// Matches `zk_inbox::batch::seeds`/`rome_zk_layouts::batch::pda` — this program has no build-time
 /// dependency on `zk-inbox` (only its shared `rome_zk_layouts::batch` decode does the work here); the
 /// inbox program id itself comes from the registry account, checked at the call site.
+///
+/// The inbox batch account is keyed by the settlement program the chain was registered under; this program
+/// passes its own `program_id` there, so the only batch account it can ever read for a chain is one that was
+/// opened through this very deployment.
 #[inline]
-pub fn inbox_batch_pda(inbox_program: &Pubkey, chain_id: u64, batch: u64) -> Pubkey {
-    rome_zk_layouts::batch::pda(inbox_program, chain_id, batch).0
+pub fn inbox_batch_pda(
+    inbox_program: &Pubkey,
+    settlement_program: &Pubkey,
+    chain_id: u64,
+    batch: u64,
+) -> Pubkey {
+    rome_zk_layouts::batch::pda(inbox_program, settlement_program, chain_id, batch).0
 }
 
 /// The batch-identifying fields common to `PostRoot` and `PostRootProved`.
@@ -278,7 +287,7 @@ fn validate_post_root(
 
     // Inbox batch account: owned by the registered inbox program, at the expected PDA, finalized, and
     // its `acc` equals the caller's claimed `inbox_commitment`.
-    let expect_inbox = inbox_batch_pda(&inbox_program, args.chain_id, args.batch);
+    let expect_inbox = inbox_batch_pda(&inbox_program, program_id, args.chain_id, args.batch);
     if expect_inbox != *a.inbox_batch.key {
         return Err(SettleError::WrongInboxAccount.into());
     }
@@ -289,6 +298,11 @@ fn validate_post_root(
         let d = a.inbox_batch.try_borrow_data()?;
         let f = rome_zk_layouts::batch::read(&d).map_err(|_| SettleError::WrongInboxAccount)?;
         if f.chain_id != args.chain_id || f.batch != args.batch {
+            return Err(SettleError::WrongInboxAccount.into());
+        }
+        // The address above already ties the batch to this program; the batch's own recorded settlement
+        // program must agree (a second, independent statement of the same fact).
+        if f.settlement_program != program_id.to_bytes() {
             return Err(SettleError::WrongInboxAccount.into());
         }
         if !f.finalized {
@@ -1256,9 +1270,10 @@ mod tests {
     #[test]
     fn inbox_batch_pda_matches_rome_zk_layouts_batch_pda() {
         let inbox_program = Pubkey::new_unique();
+        let settlement_program = Pubkey::new_unique();
         assert_eq!(
-            inbox_batch_pda(&inbox_program, 7, 3),
-            rome_zk_layouts::batch::pda(&inbox_program, 7, 3).0
+            inbox_batch_pda(&inbox_program, &settlement_program, 7, 3),
+            rome_zk_layouts::batch::pda(&inbox_program, &settlement_program, 7, 3).0
         );
     }
 }

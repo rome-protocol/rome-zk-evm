@@ -329,6 +329,7 @@ async fn main() -> ExitCode {
     let mut expected_next_batch = match resolve::read_cursor_next_batch(
         deps.rpc.as_ref(),
         &deps.config.inbox_program_id,
+        &deps.config.settlement_program_id,
         chain_id,
     )
     .await

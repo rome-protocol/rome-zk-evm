@@ -1228,7 +1228,7 @@ async fn permissionless_post_root_unproved_refuses_by_name() {
     // Everything else is valid: the inbox batch is finalized and matches, the sequence is right. Only the
     // missing proof makes this refuse.
     let acc = keccak::hashv(&[b"proved-only acc"]).to_bytes();
-    let inbox_pda = sclient::inbox_batch_pda(&r.inbox_program, chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&r.inbox_program, &r.settlement_program, chain_id, 1);
     ctx.set_account(
         &inbox_pda,
         &inbox_batch_account(
@@ -1343,7 +1343,7 @@ async fn reserved_post_root_unproved_still_accepted() {
     let chain_id = 9u64;
     reserved_chain_ready_for_post_root(&mut ctx, &r, chain_id, 16).await;
     let acc = keccak::hashv(&[b"reserved unproved acc"]).to_bytes();
-    let inbox_pda = sclient::inbox_batch_pda(&r.inbox_program, chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&r.inbox_program, &r.settlement_program, chain_id, 1);
     ctx.set_account(
         &inbox_pda,
         &inbox_batch_account(
@@ -2638,7 +2638,7 @@ async fn post_root_rejects_a_treasury_that_is_not_global_config_treasury() {
     reserved_chain_ready_for_post_root(&mut ctx, &r, chain_id, 16).await;
 
     let acc = keccak::hashv(&[b"wrong treasury acc"]).to_bytes();
-    let inbox_pda = sclient::inbox_batch_pda(&r.inbox_program, chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&r.inbox_program, &r.settlement_program, chain_id, 1);
     ctx.set_account(
         &inbox_pda,
         &inbox_batch_account(
@@ -2841,7 +2841,7 @@ async fn post_root_charges_the_base_fee_and_ignores_bps() {
         .expect("SetFee should succeed");
 
     let acc = keccak::hashv(&[b"fee test acc"]).to_bytes();
-    let inbox_pda = sclient::inbox_batch_pda(&r.inbox_program, chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&r.inbox_program, &r.settlement_program, chain_id, 1);
     ctx.set_account(
         &inbox_pda,
         &inbox_batch_account(
@@ -2934,7 +2934,7 @@ async fn post_root_fails_when_the_poster_cannot_cover_the_fee() {
     .expect("reserved InitChain should succeed");
 
     let acc = keccak::hashv(&[b"poor poster acc"]).to_bytes();
-    let inbox_pda = sclient::inbox_batch_pda(&r.inbox_program, chain_id2, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&r.inbox_program, &r.settlement_program, chain_id2, 1);
     ctx.set_account(
         &inbox_pda,
         &inbox_batch_account(
@@ -3438,7 +3438,7 @@ async fn a_fee_change_applies_to_the_next_post_not_a_retroactive_one() {
 
     // Batch 1 at the default fee (base 1_000_000, bps 0).
     let acc1 = keccak::hashv(&[b"fee change acc 1"]).to_bytes();
-    let inbox1 = sclient::inbox_batch_pda(&r.inbox_program, chain_id, 1);
+    let inbox1 = sclient::inbox_batch_pda(&r.inbox_program, &r.settlement_program, chain_id, 1);
     ctx.set_account(
         &inbox1,
         &inbox_batch_account(
@@ -3480,7 +3480,7 @@ async fn a_fee_change_applies_to_the_next_post_not_a_retroactive_one() {
         .expect("SetFee should succeed");
 
     let acc2 = keccak::hashv(&[b"fee change acc 2"]).to_bytes();
-    let inbox2 = sclient::inbox_batch_pda(&r.inbox_program, chain_id, 2);
+    let inbox2 = sclient::inbox_batch_pda(&r.inbox_program, &r.settlement_program, chain_id, 2);
     ctx.set_account(
         &inbox2,
         &inbox_batch_account(
@@ -3565,7 +3565,7 @@ async fn post_root_proved_rejects_a_gas_in_batch_that_disagrees_with_the_proved_
     .expect("reserved InitChain should succeed");
 
     let acc = keccak::hashv(&[b"gas mismatch test acc"]).to_bytes();
-    let inbox_pda = sclient::inbox_batch_pda(&r.inbox_program, chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&r.inbox_program, &r.settlement_program, chain_id, 1);
     ctx.set_account(
         &inbox_pda,
         &inbox_batch_account(
@@ -3738,7 +3738,7 @@ async fn cu_post_root_with_fee() {
     let chain_id = 101u64;
     reserved_chain_ready_for_post_root(&mut ctx, &r, chain_id, 16).await;
     let acc = keccak::hashv(&[b"cu measurement acc"]).to_bytes();
-    let inbox_pda = sclient::inbox_batch_pda(&r.inbox_program, chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&r.inbox_program, &r.settlement_program, chain_id, 1);
     ctx.set_account(
         &inbox_pda,
         &inbox_batch_account(

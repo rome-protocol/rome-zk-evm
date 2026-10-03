@@ -19,6 +19,9 @@ struct Cli {
     rpc: String,
     #[arg(long, default_value = "BcUGv24CR7SMyBo3rYkWYX8HSZj1ex4hxX5QtZutRtNm")]
     inbox_program: String,
+    /// The chain's settlement program: the inbox accounts of a chain are keyed by it.
+    #[arg(long)]
+    settlement_program: String,
     #[arg(long, default_value_t = 200_101)]
     chain_id: u64,
     #[arg(long, default_value = "fixtures/inbox")]
@@ -86,8 +89,11 @@ fn get_multiple_account_data(rpc: &str, pubkeys: &[Pubkey]) -> Vec<Option<Vec<u8
 fn main() {
     let cli = Cli::parse();
     let program_id = Pubkey::from_str(&cli.inbox_program).expect("valid inbox program id");
+    let settlement_program =
+        Pubkey::from_str(&cli.settlement_program).expect("valid settlement program id");
 
-    let (cursor_pda, _) = rome_zk_layouts::cursor::pda(&program_id, cli.chain_id);
+    let (cursor_pda, _) =
+        rome_zk_layouts::cursor::pda(&program_id, &settlement_program, cli.chain_id);
     let cursor_data = get_account_data(&cli.rpc, &cursor_pda)
         .unwrap_or_else(|| panic!("batch_cursor account {cursor_pda} not found on {}", cli.rpc));
     let cursor = rome_zk_layouts::cursor::read(&cursor_data).expect("decode batch_cursor");
@@ -106,7 +112,8 @@ fn main() {
     let mut found: Option<(u64, rome_zk_layouts::batch::BatchFields)> = None;
     let mut id = cursor.next_batch - 1;
     loop {
-        let (batch_pda, _) = rome_zk_layouts::batch::pda(&program_id, cli.chain_id, id);
+        let (batch_pda, _) =
+            rome_zk_layouts::batch::pda(&program_id, &settlement_program, cli.chain_id, id);
         if let Some(data) = get_account_data(&cli.rpc, &batch_pda) {
             match rome_zk_layouts::batch::read(&data) {
                 Ok(f) if f.finalized => {
@@ -131,7 +138,16 @@ fn main() {
     let (batch_id, batch) = found.expect("no finalized batch found on this chain");
 
     let chunk_pdas: Vec<Pubkey> = (0..batch.expected_count)
-        .map(|idx| rome_zk_layouts::chunk::pda(&program_id, cli.chain_id, batch_id, idx).0)
+        .map(|idx| {
+            rome_zk_layouts::chunk::pda(
+                &program_id,
+                &settlement_program,
+                cli.chain_id,
+                batch_id,
+                idx,
+            )
+            .0
+        })
         .collect();
     let chunk_datas = get_multiple_account_data(&cli.rpc, &chunk_pdas);
 

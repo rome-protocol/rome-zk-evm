@@ -12,6 +12,9 @@ use rome_zk_derive::traversal::SolanaTraversal;
 use rome_zk_derive::PipelineError;
 use solana_program::pubkey::Pubkey;
 
+/// Stand-in settlement program the test chain is registered under (inbox accounts are keyed by it).
+const SETTLEMENT_PROGRAM: Pubkey = Pubkey::new_from_array([9u8; 32]);
+
 const CHAIN_ID: u64 = 200_101;
 
 /// `chunk_bodies` (in idx order) are hashed and reduced through the same `reference_commitment`
@@ -81,17 +84,19 @@ async fn a_tampered_chunk_is_critical_and_the_engine_is_never_touched() {
     let program_id = Pubkey::new_unique();
     let mut reader = FakeAccountReader::default();
 
-    let (batch_pda, _) = zk_inbox_client::batch_pda(&program_id, CHAIN_ID, 0);
+    let (batch_pda, _) = zk_inbox_client::batch_pda(&program_id, &SETTLEMENT_PROGRAM, CHAIN_ID, 0);
     reader
         .accounts
         .insert(batch_pda, batch_account_bytes(CHAIN_ID, 0, 1, 1, &[]));
-    let (chunk_pda, _) = zk_inbox_client::chunk_pda(&program_id, CHAIN_ID, 0, 0);
+    let (chunk_pda, _) =
+        zk_inbox_client::chunk_pda(&program_id, &SETTLEMENT_PROGRAM, CHAIN_ID, 0, 0);
     reader
         .accounts
         .insert(chunk_pda, tampered_chunk_account(CHAIN_ID, 0, 0));
 
-    let traversal = SolanaTraversal::new(reader.clone(), program_id, CHAIN_ID, 0);
-    let inbox = InboxRetrieval::new(reader, program_id);
+    let traversal =
+        SolanaTraversal::new(reader.clone(), program_id, SETTLEMENT_PROGRAM, CHAIN_ID, 0);
+    let inbox = InboxRetrieval::new(reader, program_id, SETTLEMENT_PROGRAM);
     let engine = EngineController::new(MockEngineApi::default(), alloy_primitives::B256::ZERO, 0);
     let mut pipeline = DerivePipeline::new(
         traversal,
@@ -162,13 +167,14 @@ async fn an_untampered_batch_derives_and_does_reach_the_engine() {
     assert_eq!(frames.len(), 1, "fixture fits in one chunk");
 
     let mut reader = FakeAccountReader::default();
-    let (batch_pda, _) = zk_inbox_client::batch_pda(&program_id, CHAIN_ID, 0);
+    let (batch_pda, _) = zk_inbox_client::batch_pda(&program_id, &SETTLEMENT_PROGRAM, CHAIN_ID, 0);
     let frame_bytes = frames[0].to_bytes();
     reader.accounts.insert(
         batch_pda,
         batch_account_bytes(CHAIN_ID, 0, 1, 1, &[&frame_bytes]),
     );
-    let (chunk_pda, _) = zk_inbox_client::chunk_pda(&program_id, CHAIN_ID, 0, 0);
+    let (chunk_pda, _) =
+        zk_inbox_client::chunk_pda(&program_id, &SETTLEMENT_PROGRAM, CHAIN_ID, 0, 0);
     let mut chunk = vec![0u8; zk_inbox::HEADER_LEN + frame_bytes.len()];
     chunk[zk_inbox::OFF_MAGIC..zk_inbox::OFF_MAGIC + 4]
         .copy_from_slice(&zk_inbox::MAGIC.to_le_bytes());
@@ -182,8 +188,9 @@ async fn an_untampered_batch_derives_and_does_reach_the_engine() {
     chunk[zk_inbox::HEADER_LEN..].copy_from_slice(&frame_bytes);
     reader.accounts.insert(chunk_pda, chunk);
 
-    let traversal = SolanaTraversal::new(reader.clone(), program_id, CHAIN_ID, 0);
-    let inbox = InboxRetrieval::new(reader, program_id);
+    let traversal =
+        SolanaTraversal::new(reader.clone(), program_id, SETTLEMENT_PROGRAM, CHAIN_ID, 0);
+    let inbox = InboxRetrieval::new(reader, program_id, SETTLEMENT_PROGRAM);
     let engine = EngineController::new(MockEngineApi::default(), alloy_primitives::B256::ZERO, 0);
     let mut pipeline = DerivePipeline::new(
         traversal,

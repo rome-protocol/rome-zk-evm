@@ -107,7 +107,7 @@ async fn full_pipeline_three_block_batch_finalizes_and_acc_matches_reference() {
         root_account_with_authority(chain_id, &payer.pubkey(), settlement_program),
     );
     pt.add_account(
-        zk_inbox_client::cursor_pda(&program_id, chain_id).0,
+        zk_inbox_client::cursor_pda(&program_id, &settlement_program, chain_id).0,
         cursor_account(program_id, chain_id, batch_id),
     );
     pt.add_account(
@@ -145,6 +145,7 @@ async fn full_pipeline_three_block_batch_finalizes_and_acc_matches_reference() {
         let ixs = pipeline::plan_chunk(
             &program_id,
             &payer.pubkey(),
+            &settlement_program,
             chain_id,
             batch_id,
             frame.frame_no as u32,
@@ -160,7 +161,8 @@ async fn full_pipeline_three_block_batch_finalizes_and_acc_matches_reference() {
     }
 
     // --- leaves_present == expected_count before FinalizeBatch ---
-    let (batch_pda, _) = zk_inbox_client::batch_pda(&program_id, chain_id, batch_id);
+    let (batch_pda, _) =
+        zk_inbox_client::batch_pda(&program_id, &settlement_program, chain_id, batch_id);
     let account = ctx
         .banks_client
         .get_account(batch_pda)
@@ -176,8 +178,14 @@ async fn full_pipeline_three_block_batch_finalizes_and_acc_matches_reference() {
     );
 
     // --- FinalizeBatch ---
-    let finalize_ix =
-        zk_inbox_client::finalize_batch_ix(&program_id, &payer.pubkey(), chain_id, batch_id, 0);
+    let finalize_ix = zk_inbox_client::finalize_batch_ix(
+        &program_id,
+        &payer.pubkey(),
+        &settlement_program,
+        chain_id,
+        batch_id,
+        0,
+    );
     let cu = send(&mut ctx, &[finalize_ix], &payer)
         .await
         .expect("FinalizeBatch");
@@ -229,8 +237,13 @@ async fn full_pipeline_three_block_batch_finalizes_and_acc_matches_reference() {
     ordered.sort_by_key(|f| f.frame_no);
     let mut reassembled_from_chain = Vec::new();
     for frame in &ordered {
-        let (chunk_pda, _) =
-            zk_inbox_client::chunk_pda(&program_id, chain_id, batch_id, frame.frame_no as u32);
+        let (chunk_pda, _) = zk_inbox_client::chunk_pda(
+            &program_id,
+            &settlement_program,
+            chain_id,
+            batch_id,
+            frame.frame_no as u32,
+        );
         let account = ctx
             .banks_client
             .get_account(chunk_pda)

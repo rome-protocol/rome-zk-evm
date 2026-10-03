@@ -157,7 +157,7 @@ async fn open_batch_creates_pda_with_clock_slot_and_correct_size() {
         root_account_with_authority(chain_id, &authority.pubkey(), settlement_program),
     );
     pt.add_account(
-        client::cursor_pda(&program_id, chain_id).0,
+        client::cursor_pda(&program_id, &settlement_program, chain_id).0,
         cursor_account(program_id, chain_id, 1),
     );
     pt.add_account(
@@ -186,7 +186,7 @@ async fn open_batch_creates_pda_with_clock_slot_and_correct_size() {
         .expect("OpenBatch should succeed");
     eprintln!("OpenBatch (with root-authority check) consumed {cu} CU");
 
-    let (pda, _) = client::batch_pda(&program_id, chain_id, batch);
+    let (pda, _) = client::batch_pda(&program_id, &settlement_program, chain_id, batch);
     let acct = ctx
         .banks_client
         .get_account(pda)
@@ -237,7 +237,7 @@ async fn open_batch_writes_the_exact_clock_slot_and_unix_timestamp() {
         root_account_with_authority(chain_id, &authority.pubkey(), settlement_program),
     );
     pt.add_account(
-        client::cursor_pda(&program_id, chain_id).0,
+        client::cursor_pda(&program_id, &settlement_program, chain_id).0,
         cursor_account(program_id, chain_id, 1),
     );
     pt.add_account(
@@ -277,7 +277,7 @@ async fn open_batch_writes_the_exact_clock_slot_and_unix_timestamp() {
         .await
         .expect("OpenBatch should succeed");
 
-    let (pda, _) = client::batch_pda(&program_id, chain_id, batch);
+    let (pda, _) = client::batch_pda(&program_id, &settlement_program, chain_id, batch);
     let acct = ctx
         .banks_client
         .get_account(pda)
@@ -333,7 +333,7 @@ async fn open_batch_rejects_a_negative_clock_unix_timestamp() {
         root_account_with_authority(chain_id, &authority.pubkey(), settlement_program),
     );
     pt.add_account(
-        client::cursor_pda(&program_id, chain_id).0,
+        client::cursor_pda(&program_id, &settlement_program, chain_id).0,
         cursor_account(program_id, chain_id, 1),
     );
     pt.add_account(
@@ -373,7 +373,7 @@ async fn open_batch_rejects_a_negative_clock_unix_timestamp() {
     );
     assert!(
         ctx.banks_client
-            .get_account(client::batch_pda(&program_id, chain_id, batch).0)
+            .get_account(client::batch_pda(&program_id, &settlement_program, chain_id, batch).0)
             .await
             .unwrap()
             .is_none(),
@@ -381,7 +381,7 @@ async fn open_batch_rejects_a_negative_clock_unix_timestamp() {
     );
     let cursor_after = ctx
         .banks_client
-        .get_account(client::cursor_pda(&program_id, chain_id).0)
+        .get_account(client::cursor_pda(&program_id, &settlement_program, chain_id).0)
         .await
         .unwrap()
         .unwrap();
@@ -403,7 +403,8 @@ async fn a_v1_shaped_batch_account_is_refused_by_every_instruction() {
     let program_id = rome_zk_testkit::fixed_inbox_program_id();
     let chain_id = 11;
     let batch = 4;
-    let (batch_pda, _) = client::batch_pda(&program_id, chain_id, batch);
+    let settlement_program = rome_zk_testkit::fixed_settlement_program_id();
+    let (batch_pda, _) = client::batch_pda(&program_id, &settlement_program, chain_id, batch);
     let authority = funded_keypair();
 
     // A *realistic* mid-flight v1 account — not the bare 202-byte magic+version+chain_id+batch stub
@@ -473,7 +474,13 @@ async fn a_v1_shaped_batch_account_is_refused_by_every_instruction() {
     // GrowBatch: permissionless, `payer` need not be the batch authority.
     {
         let mut ctx = fresh_ctx(program_id, batch_pda, &v1_account, &authority.pubkey()).await;
-        let ix = client::grow_batch_ix(&program_id, &authority.pubkey(), chain_id, batch);
+        let ix = client::grow_batch_ix(
+            &program_id,
+            &authority.pubkey(),
+            &settlement_program,
+            chain_id,
+            batch,
+        );
         let err = send(&mut ctx, &[ix], &authority, &[]).await.unwrap_err();
         assert_eq!(
             err,
@@ -485,7 +492,15 @@ async fn a_v1_shaped_batch_account_is_refused_by_every_instruction() {
     // Chunk Open: `open_chunk_check` reads the batch header before creating the chunk PDA.
     {
         let mut ctx = fresh_ctx(program_id, batch_pda, &v1_account, &authority.pubkey()).await;
-        let ix = client::open_chunk_ix(&program_id, &authority.pubkey(), chain_id, batch, 0, 8);
+        let ix = client::open_chunk_ix(
+            &program_id,
+            &authority.pubkey(),
+            &settlement_program,
+            chain_id,
+            batch,
+            0,
+            8,
+        );
         let err = send(&mut ctx, &[ix], &authority, &[]).await.unwrap_err();
         assert_eq!(
             err,
@@ -504,7 +519,8 @@ async fn a_v1_shaped_batch_account_is_refused_by_every_instruction() {
             true,
         );
         pt.add_account(batch_pda, v1_account.clone());
-        let (chunk_pda, _) = client::chunk_pda(&program_id, chain_id, batch, 0);
+        let (chunk_pda, _) =
+            client::chunk_pda(&program_id, &settlement_program, chain_id, batch, 0);
         pt.add_account(
             chunk_pda,
             chunk_account(
@@ -527,7 +543,7 @@ async fn a_v1_shaped_batch_account_is_refused_by_every_instruction() {
             },
         );
         let mut ctx = pt.start_with_context().await;
-        let ix = client::seal_leaf_ix(&program_id, chain_id, batch, 0);
+        let ix = client::seal_leaf_ix(&program_id, &settlement_program, chain_id, batch, 0);
         let err = send(&mut ctx, &[ix], &authority, &[]).await.unwrap_err();
         assert_eq!(
             err,
@@ -540,7 +556,14 @@ async fn a_v1_shaped_batch_account_is_refused_by_every_instruction() {
     // account is refused the same way regardless of who signs.
     {
         let mut ctx = fresh_ctx(program_id, batch_pda, &v1_account, &authority.pubkey()).await;
-        let ix = client::finalize_batch_ix(&program_id, &authority.pubkey(), chain_id, batch, 0);
+        let ix = client::finalize_batch_ix(
+            &program_id,
+            &authority.pubkey(),
+            &settlement_program,
+            chain_id,
+            batch,
+            0,
+        );
         let err = send(&mut ctx, &[ix], &authority, &[]).await.unwrap_err();
         assert_eq!(
             err,
@@ -552,7 +575,13 @@ async fn a_v1_shaped_batch_account_is_refused_by_every_instruction() {
     // AbandonBatch: authority-signed, but the version check trips before the authority is even read.
     {
         let mut ctx = fresh_ctx(program_id, batch_pda, &v1_account, &authority.pubkey()).await;
-        let ix = client::abandon_batch_ix(&program_id, &authority.pubkey(), chain_id, batch);
+        let ix = client::abandon_batch_ix(
+            &program_id,
+            &authority.pubkey(),
+            &settlement_program,
+            chain_id,
+            batch,
+        );
         let err = send(&mut ctx, &[ix], &authority, &[&authority])
             .await
             .unwrap_err();
@@ -579,7 +608,7 @@ async fn open_batch_rejects_wrong_pda() {
         root,
         root_account_with_authority(chain_id, &payer.pubkey(), settlement_program),
     );
-    let (cursor_pda, _) = client::cursor_pda(&program_id, chain_id);
+    let (cursor_pda, _) = client::cursor_pda(&program_id, &settlement_program, chain_id);
     pt.add_account(cursor_pda, cursor_account(program_id, chain_id, 1));
     pt.add_account(
         payer.pubkey(),
@@ -631,7 +660,7 @@ async fn open_batch_rejects_non_authority_signer() {
         root_account_with_authority(chain_id, &real_authority.pubkey(), settlement_program),
     );
     pt.add_account(
-        client::cursor_pda(&program_id, chain_id).0,
+        client::cursor_pda(&program_id, &settlement_program, chain_id).0,
         cursor_account(program_id, chain_id, 1),
     );
     for kp in [&real_authority, &impostor] {
@@ -680,7 +709,7 @@ async fn open_batch_rejects_root_owned_by_wrong_program() {
         root_account_with_authority(chain_id, &authority.pubkey(), wrong_program),
     );
     pt.add_account(
-        client::cursor_pda(&program_id, chain_id).0,
+        client::cursor_pda(&program_id, &settlement_program, chain_id).0,
         cursor_account(program_id, chain_id, 1),
     );
     pt.add_account(
@@ -742,10 +771,21 @@ async fn seal_leaf_accepts_out_of_order_and_rejects_bad_cases() {
         true,
     );
     let (fixture, leaves) = seal_leaf_test_setup(program_id, 6);
-    let (batch_pda, _) = client::batch_pda(&program_id, fixture.chain_id, fixture.batch);
+    let (batch_pda, _) = client::batch_pda(
+        &program_id,
+        &fixture.settlement_program,
+        fixture.chain_id,
+        fixture.batch,
+    );
     pt.add_account(batch_pda, fixture.account(program_id, 0, &[], &[], false));
     for (idx, _hash, body) in &leaves {
-        let (cpda, _) = client::chunk_pda(&program_id, fixture.chain_id, fixture.batch, *idx);
+        let (cpda, _) = client::chunk_pda(
+            &program_id,
+            &fixture.settlement_program,
+            fixture.chain_id,
+            fixture.batch,
+            *idx,
+        );
         pt.add_account(
             cpda,
             chunk_account(
@@ -766,6 +806,7 @@ async fn seal_leaf_accepts_out_of_order_and_rejects_bad_cases() {
         &mut ctx,
         &[client::seal_leaf_ix(
             &program_id,
+            &fixture.settlement_program,
             fixture.chain_id,
             fixture.batch,
             5,
@@ -780,6 +821,7 @@ async fn seal_leaf_accepts_out_of_order_and_rejects_bad_cases() {
         &mut ctx,
         &[client::seal_leaf_ix(
             &program_id,
+            &fixture.settlement_program,
             fixture.chain_id,
             fixture.batch,
             0,
@@ -804,6 +846,7 @@ async fn seal_leaf_accepts_out_of_order_and_rejects_bad_cases() {
         &mut ctx,
         &[client::seal_leaf_ix(
             &program_id,
+            &fixture.settlement_program,
             fixture.chain_id,
             fixture.batch,
             0,
@@ -831,6 +874,7 @@ async fn seal_leaf_accepts_out_of_order_and_rejects_bad_cases() {
         &mut ctx,
         &[client::seal_leaf_ix(
             &program_id,
+            &fixture.settlement_program,
             fixture.chain_id,
             fixture.batch,
             6,
@@ -851,10 +895,21 @@ async fn seal_leaf_rejects_duplicate_with_different_hash() {
         true,
     );
     let (fixture, leaves) = seal_leaf_test_setup(program_id, 2);
-    let (batch_pda, _) = client::batch_pda(&program_id, fixture.chain_id, fixture.batch);
+    let (batch_pda, _) = client::batch_pda(
+        &program_id,
+        &fixture.settlement_program,
+        fixture.chain_id,
+        fixture.batch,
+    );
     pt.add_account(batch_pda, fixture.account(program_id, 0, &[], &[], false));
     for (idx, _hash, body) in &leaves {
-        let (cpda, _) = client::chunk_pda(&program_id, fixture.chain_id, fixture.batch, *idx);
+        let (cpda, _) = client::chunk_pda(
+            &program_id,
+            &fixture.settlement_program,
+            fixture.chain_id,
+            fixture.batch,
+            *idx,
+        );
         pt.add_account(
             cpda,
             chunk_account(
@@ -873,6 +928,7 @@ async fn seal_leaf_rejects_duplicate_with_different_hash() {
         &mut ctx,
         &[client::seal_leaf_ix(
             &program_id,
+            &fixture.settlement_program,
             fixture.chain_id,
             fixture.batch,
             0,
@@ -887,7 +943,13 @@ async fn seal_leaf_rejects_duplicate_with_different_hash() {
     // hash now differs from the one already recorded for idx 0. `set_account` lets the test mutate an
     // already-started ledger's account directly, which is the point here (no real Write is involved —
     // this stands in for "somehow the recorded hash and the chunk's current bytes disagree").
-    let (cpda0, _) = client::chunk_pda(&program_id, fixture.chain_id, fixture.batch, 0);
+    let (cpda0, _) = client::chunk_pda(
+        &program_id,
+        &fixture.settlement_program,
+        fixture.chain_id,
+        fixture.batch,
+        0,
+    );
     let different_body = b"a completely different body".to_vec();
     let new_account = chunk_account(
         program_id,
@@ -906,6 +968,7 @@ async fn seal_leaf_rejects_duplicate_with_different_hash() {
         &mut ctx,
         &[client::seal_leaf_ix(
             &program_id,
+            &fixture.settlement_program,
             fixture.chain_id,
             fixture.batch,
             0,
@@ -936,9 +999,20 @@ async fn seal_leaf_rejects_an_unsealed_chunk() {
         settlement_program: Pubkey::new_unique(),
         authority: Pubkey::new_unique(),
     };
-    let (batch_pda, _) = client::batch_pda(&program_id, fixture.chain_id, fixture.batch);
+    let (batch_pda, _) = client::batch_pda(
+        &program_id,
+        &fixture.settlement_program,
+        fixture.chain_id,
+        fixture.batch,
+    );
     pt.add_account(batch_pda, fixture.account(program_id, 0, &[], &[], false));
-    let (cpda, _) = client::chunk_pda(&program_id, fixture.chain_id, fixture.batch, 0);
+    let (cpda, _) = client::chunk_pda(
+        &program_id,
+        &fixture.settlement_program,
+        fixture.chain_id,
+        fixture.batch,
+        0,
+    );
     let mut unsealed = chunk_account(
         program_id,
         &fixture.authority,
@@ -956,6 +1030,7 @@ async fn seal_leaf_rejects_an_unsealed_chunk() {
         &mut ctx,
         &[client::seal_leaf_ix(
             &program_id,
+            &fixture.settlement_program,
             fixture.chain_id,
             fixture.batch,
             0,
@@ -997,7 +1072,12 @@ async fn finalize_small(n: u32) {
         authority: authority.pubkey(),
     };
     let leaves = small_leaf_set(n as usize);
-    let (batch_pda, _) = client::batch_pda(&program_id, fixture.chain_id, fixture.batch);
+    let (batch_pda, _) = client::batch_pda(
+        &program_id,
+        &fixture.settlement_program,
+        fixture.chain_id,
+        fixture.batch,
+    );
     let sealed: Vec<u32> = (0..n).collect();
     pt.add_account(
         batch_pda,
@@ -1011,6 +1091,7 @@ async fn finalize_small(n: u32) {
         &[client::finalize_batch_ix(
             &program_id,
             &authority.pubkey(),
+            &fixture.settlement_program,
             fixture.chain_id,
             fixture.batch,
             0,
@@ -1068,7 +1149,12 @@ async fn finalize_batch_before_all_leaves_present_errors() {
         authority: authority.pubkey(),
     };
     let leaves = small_leaf_set(2); // only 2 of 3
-    let (batch_pda, _) = client::batch_pda(&program_id, fixture.chain_id, fixture.batch);
+    let (batch_pda, _) = client::batch_pda(
+        &program_id,
+        &fixture.settlement_program,
+        fixture.chain_id,
+        fixture.batch,
+    );
     pt.add_account(
         batch_pda,
         fixture.account(program_id, 2, &leaves, &[0, 1], false),
@@ -1083,6 +1169,7 @@ async fn finalize_batch_before_all_leaves_present_errors() {
         &[client::finalize_batch_ix(
             &program_id,
             &authority.pubkey(),
+            &fixture.settlement_program,
             fixture.chain_id,
             fixture.batch,
             0,
@@ -1112,7 +1199,12 @@ async fn finalize_batch_twice_errors() {
         authority: authority.pubkey(),
     };
     let leaves = small_leaf_set(2);
-    let (batch_pda, _) = client::batch_pda(&program_id, fixture.chain_id, fixture.batch);
+    let (batch_pda, _) = client::batch_pda(
+        &program_id,
+        &fixture.settlement_program,
+        fixture.chain_id,
+        fixture.batch,
+    );
     pt.add_account(
         batch_pda,
         fixture.account(program_id, 2, &leaves, &[0, 1], false),
@@ -1125,6 +1217,7 @@ async fn finalize_batch_twice_errors() {
         &[client::finalize_batch_ix(
             &program_id,
             &authority.pubkey(),
+            &fixture.settlement_program,
             fixture.chain_id,
             fixture.batch,
             0,
@@ -1139,6 +1232,7 @@ async fn finalize_batch_twice_errors() {
         &[client::finalize_batch_ix(
             &program_id,
             &authority.pubkey(),
+            &fixture.settlement_program,
             fixture.chain_id,
             fixture.batch,
             0,
@@ -1175,7 +1269,12 @@ async fn finalize_batch_900_leaves_within_cu_budget() {
     let leaves: Vec<[u8; 32]> = (0..n as usize)
         .map(|i| chunk_body_hash(&(i as u32).to_le_bytes()))
         .collect();
-    let (batch_pda, _) = client::batch_pda(&program_id, fixture.chain_id, fixture.batch);
+    let (batch_pda, _) = client::batch_pda(
+        &program_id,
+        &fixture.settlement_program,
+        fixture.chain_id,
+        fixture.batch,
+    );
     let sealed: Vec<u32> = (0..n).collect();
     pt.add_account(
         batch_pda,
@@ -1189,6 +1288,7 @@ async fn finalize_batch_900_leaves_within_cu_budget() {
         &[client::finalize_batch_ix(
             &program_id,
             &authority.pubkey(),
+            &fixture.settlement_program,
             fixture.chain_id,
             fixture.batch,
             0,
@@ -1243,7 +1343,12 @@ async fn finalize_batch_step_continuation_without_the_authority_signer_is_refuse
     let leaves: Vec<[u8; 32]> = (0..n as usize)
         .map(|i| chunk_body_hash(&(i as u32).to_le_bytes()))
         .collect();
-    let (batch_pda, _) = client::batch_pda(&program_id, fixture.chain_id, fixture.batch);
+    let (batch_pda, _) = client::batch_pda(
+        &program_id,
+        &fixture.settlement_program,
+        fixture.chain_id,
+        fixture.batch,
+    );
     let sealed: Vec<u32> = (0..n).collect();
     pt.add_account(
         batch_pda,
@@ -1258,6 +1363,7 @@ async fn finalize_batch_step_continuation_without_the_authority_signer_is_refuse
         &[client::finalize_batch_ix(
             &program_id,
             &authority.pubkey(),
+            &fixture.settlement_program,
             fixture.chain_id,
             fixture.batch,
             step,
@@ -1271,6 +1377,7 @@ async fn finalize_batch_step_continuation_without_the_authority_signer_is_refuse
     let mut ix = client::finalize_batch_ix(
         &program_id,
         &authority.pubkey(),
+        &fixture.settlement_program,
         fixture.chain_id,
         fixture.batch,
         step,
@@ -1320,7 +1427,12 @@ async fn finalize_batch_2500_leaves_resumes_across_transactions() {
     let leaves: Vec<[u8; 32]> = (0..n as usize)
         .map(|i| chunk_body_hash(&(i as u32).to_le_bytes()))
         .collect();
-    let (batch_pda, _) = client::batch_pda(&program_id, fixture.chain_id, fixture.batch);
+    let (batch_pda, _) = client::batch_pda(
+        &program_id,
+        &fixture.settlement_program,
+        fixture.chain_id,
+        fixture.batch,
+    );
     let sealed: Vec<u32> = (0..n).collect();
     pt.add_account(
         batch_pda,
@@ -1336,6 +1448,7 @@ async fn finalize_batch_2500_leaves_resumes_across_transactions() {
         &[client::finalize_batch_ix(
             &program_id,
             &authority.pubkey(),
+            &fixture.settlement_program,
             fixture.chain_id,
             fixture.batch,
             step,
@@ -1364,6 +1477,7 @@ async fn finalize_batch_2500_leaves_resumes_across_transactions() {
         &[client::finalize_batch_ix(
             &program_id,
             &authority.pubkey(),
+            &fixture.settlement_program,
             fixture.chain_id,
             fixture.batch,
             step,
@@ -1429,7 +1543,12 @@ async fn finalize_batch_signed_by_the_batch_authority_succeeds() {
     );
     let authority = Keypair::new();
     let (fixture, leaves) = ready_to_finalize_fixture(300, 9, authority.pubkey());
-    let (batch_pda, _) = client::batch_pda(&program_id, fixture.chain_id, fixture.batch);
+    let (batch_pda, _) = client::batch_pda(
+        &program_id,
+        &fixture.settlement_program,
+        fixture.chain_id,
+        fixture.batch,
+    );
     let sealed: Vec<u32> = (0..fixture.expected_count).collect();
     pt.add_account(
         batch_pda,
@@ -1443,6 +1562,7 @@ async fn finalize_batch_signed_by_the_batch_authority_succeeds() {
         &[client::finalize_batch_ix(
             &program_id,
             &authority.pubkey(),
+            &fixture.settlement_program,
             fixture.chain_id,
             fixture.batch,
             0,
@@ -1469,7 +1589,12 @@ async fn finalize_batch_missing_the_authority_account_errors() {
     );
     let authority = Keypair::new();
     let (fixture, leaves) = ready_to_finalize_fixture(301, 9, authority.pubkey());
-    let (batch_pda, _) = client::batch_pda(&program_id, fixture.chain_id, fixture.batch);
+    let (batch_pda, _) = client::batch_pda(
+        &program_id,
+        &fixture.settlement_program,
+        fixture.chain_id,
+        fixture.batch,
+    );
     let sealed: Vec<u32> = (0..fixture.expected_count).collect();
     pt.add_account(
         batch_pda,
@@ -1482,6 +1607,7 @@ async fn finalize_batch_missing_the_authority_account_errors() {
     let mut ix = client::finalize_batch_ix(
         &program_id,
         &authority.pubkey(),
+        &fixture.settlement_program,
         fixture.chain_id,
         fixture.batch,
         0,
@@ -1504,7 +1630,12 @@ async fn finalize_batch_with_an_unsigned_authority_account_errors() {
     );
     let authority = Keypair::new();
     let (fixture, leaves) = ready_to_finalize_fixture(302, 9, authority.pubkey());
-    let (batch_pda, _) = client::batch_pda(&program_id, fixture.chain_id, fixture.batch);
+    let (batch_pda, _) = client::batch_pda(
+        &program_id,
+        &fixture.settlement_program,
+        fixture.chain_id,
+        fixture.batch,
+    );
     let sealed: Vec<u32> = (0..fixture.expected_count).collect();
     pt.add_account(
         batch_pda,
@@ -1518,6 +1649,7 @@ async fn finalize_batch_with_an_unsigned_authority_account_errors() {
     let mut ix = client::finalize_batch_ix(
         &program_id,
         &authority.pubkey(),
+        &fixture.settlement_program,
         fixture.chain_id,
         fixture.batch,
         0,
@@ -1541,7 +1673,12 @@ async fn finalize_batch_signed_by_the_wrong_key_errors() {
     let authority = Keypair::new();
     let wrong = Keypair::new();
     let (fixture, leaves) = ready_to_finalize_fixture(303, 9, authority.pubkey());
-    let (batch_pda, _) = client::batch_pda(&program_id, fixture.chain_id, fixture.batch);
+    let (batch_pda, _) = client::batch_pda(
+        &program_id,
+        &fixture.settlement_program,
+        fixture.chain_id,
+        fixture.batch,
+    );
     let sealed: Vec<u32> = (0..fixture.expected_count).collect();
     pt.add_account(
         batch_pda,
@@ -1555,6 +1692,7 @@ async fn finalize_batch_signed_by_the_wrong_key_errors() {
     let ix = client::finalize_batch_ix(
         &program_id,
         &wrong.pubkey(),
+        &fixture.settlement_program,
         fixture.chain_id,
         fixture.batch,
         0,
@@ -1593,7 +1731,7 @@ async fn finalize_batch_by_a_third_party_after_it_permissionlessly_sealed_every_
         root_account_with_authority(chain_id, &authority.pubkey(), settlement_program),
     );
     pt.add_account(
-        client::cursor_pda(&program_id, chain_id).0,
+        client::cursor_pda(&program_id, &settlement_program, chain_id).0,
         cursor_account(program_id, chain_id, batch),
     );
     for kp in [&authority, &third_party] {
@@ -1636,6 +1774,7 @@ async fn finalize_batch_by_a_third_party_after_it_permissionlessly_sealed_every_
                 client::open_chunk_ix(
                     &program_id,
                     &authority.pubkey(),
+                    &settlement_program,
                     chain_id,
                     batch,
                     idx,
@@ -1644,6 +1783,7 @@ async fn finalize_batch_by_a_third_party_after_it_permissionlessly_sealed_every_
                 client::write_chunk_ix(
                     &program_id,
                     &authority.pubkey(),
+                    &settlement_program,
                     chain_id,
                     batch,
                     idx,
@@ -1653,6 +1793,7 @@ async fn finalize_batch_by_a_third_party_after_it_permissionlessly_sealed_every_
                 client::seal_chunk_ix(
                     &program_id,
                     &authority.pubkey(),
+                    &settlement_program,
                     chain_id,
                     batch,
                     idx,
@@ -1672,7 +1813,13 @@ async fn finalize_batch_by_a_third_party_after_it_permissionlessly_sealed_every_
     for idx in 0..n {
         send(
             &mut ctx,
-            &[client::seal_leaf_ix(&program_id, chain_id, batch, idx)],
+            &[client::seal_leaf_ix(
+                &program_id,
+                &settlement_program,
+                chain_id,
+                batch,
+                idx,
+            )],
             &third_party,
             &[],
         )
@@ -1687,6 +1834,7 @@ async fn finalize_batch_by_a_third_party_after_it_permissionlessly_sealed_every_
         &[client::finalize_batch_ix(
             &program_id,
             &third_party.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             0,
@@ -1708,6 +1856,7 @@ async fn finalize_batch_by_a_third_party_after_it_permissionlessly_sealed_every_
         &[client::finalize_batch_ix(
             &program_id,
             &authority.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             0,
@@ -1754,7 +1903,12 @@ async fn close_batch_before_final_root_errors() {
     let settlement_program = rome_zk_testkit::fixed_settlement_program_id();
     let (fixture, leaves) =
         finalized_batch_fixture(program_id, 2, 11, 6, settlement_program, authority.pubkey());
-    let (batch_pda, _) = client::batch_pda(&program_id, fixture.chain_id, fixture.batch);
+    let (batch_pda, _) = client::batch_pda(
+        &program_id,
+        &settlement_program,
+        fixture.chain_id,
+        fixture.batch,
+    );
     pt.add_account(
         batch_pda,
         fixture.account(program_id, 2, &leaves, &[0, 1], true),
@@ -1802,7 +1956,12 @@ async fn close_batch_with_root_owned_by_wrong_program_errors() {
     let wrong_program = Pubkey::new_unique();
     let (fixture, leaves) =
         finalized_batch_fixture(program_id, 2, 11, 6, settlement_program, authority.pubkey());
-    let (batch_pda, _) = client::batch_pda(&program_id, fixture.chain_id, fixture.batch);
+    let (batch_pda, _) = client::batch_pda(
+        &program_id,
+        &settlement_program,
+        fixture.chain_id,
+        fixture.batch,
+    );
     pt.add_account(
         batch_pda,
         fixture.account(program_id, 2, &leaves, &[0, 1], true),
@@ -1850,7 +2009,12 @@ async fn close_batch_succeeds_once_root_is_final_and_returns_rent() {
     let settlement_program = rome_zk_testkit::fixed_settlement_program_id();
     let (fixture, leaves) =
         finalized_batch_fixture(program_id, 2, 11, 6, settlement_program, authority.pubkey());
-    let (batch_pda, _) = client::batch_pda(&program_id, fixture.chain_id, fixture.batch);
+    let (batch_pda, _) = client::batch_pda(
+        &program_id,
+        &settlement_program,
+        fixture.chain_id,
+        fixture.batch,
+    );
     let batch_account = fixture.account(program_id, 2, &leaves, &[0, 1], true);
     let expected_rent = batch_account.lamports;
     pt.add_account(batch_pda, batch_account);
@@ -1937,7 +2101,7 @@ async fn chunk_lane_end_to_end_open_write_seal_close_requires_final_root() {
         root_account_with_authority(chain_id, &authority.pubkey(), settlement_program),
     );
     pt.add_account(
-        client::cursor_pda(&program_id, chain_id).0,
+        client::cursor_pda(&program_id, &settlement_program, chain_id).0,
         cursor_account(program_id, chain_id, batch),
     );
     pt.add_account(
@@ -1973,6 +2137,7 @@ async fn chunk_lane_end_to_end_open_write_seal_close_requires_final_root() {
         &[client::open_chunk_ix(
             &program_id,
             &authority.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -1988,6 +2153,7 @@ async fn chunk_lane_end_to_end_open_write_seal_close_requires_final_root() {
         &[client::write_chunk_ix(
             &program_id,
             &authority.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -2004,6 +2170,7 @@ async fn chunk_lane_end_to_end_open_write_seal_close_requires_final_root() {
         &[client::seal_chunk_ix(
             &program_id,
             &authority.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -2016,7 +2183,7 @@ async fn chunk_lane_end_to_end_open_write_seal_close_requires_final_root() {
     .await
     .expect("Seal must still work");
 
-    let (cpda, _) = client::chunk_pda(&program_id, chain_id, batch, idx);
+    let (cpda, _) = client::chunk_pda(&program_id, &settlement_program, chain_id, batch, idx);
     let acct = ctx
         .banks_client
         .get_account(cpda)
@@ -2051,7 +2218,13 @@ async fn chunk_lane_end_to_end_open_write_seal_close_requires_final_root() {
     // SealLeaf + FinalizeBatch, then advance the root to final: now Close must succeed.
     send(
         &mut ctx,
-        &[client::seal_leaf_ix(&program_id, chain_id, batch, idx)],
+        &[client::seal_leaf_ix(
+            &program_id,
+            &settlement_program,
+            chain_id,
+            batch,
+            idx,
+        )],
         &authority,
         &[],
     )
@@ -2062,6 +2235,7 @@ async fn chunk_lane_end_to_end_open_write_seal_close_requires_final_root() {
         &[client::finalize_batch_ix(
             &program_id,
             &authority.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             0,
@@ -2133,7 +2307,7 @@ async fn open_one_chunk_batch(
         root_account_with_authority(chain_id, &authority.pubkey(), settlement_program),
     );
     pt.add_account(
-        client::cursor_pda(&program_id, chain_id).0,
+        client::cursor_pda(&program_id, &settlement_program, chain_id).0,
         cursor_account(program_id, chain_id, batch),
     );
     pt.add_account(
@@ -2195,6 +2369,7 @@ async fn seal_rejects_a_short_seal_with_an_unwritten_hole() {
         &[client::open_chunk_ix(
             &program_id,
             &authority.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -2210,6 +2385,7 @@ async fn seal_rejects_a_short_seal_with_an_unwritten_hole() {
         &[client::write_chunk_ix(
             &program_id,
             &authority.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -2226,6 +2402,7 @@ async fn seal_rejects_a_short_seal_with_an_unwritten_hole() {
         &[client::write_chunk_ix(
             &program_id,
             &authority.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -2244,6 +2421,7 @@ async fn seal_rejects_a_short_seal_with_an_unwritten_hole() {
     let seal_ix = client::seal_chunk_ix(
         &program_id,
         &authority.pubkey(),
+        &settlement_program,
         chain_id,
         batch,
         idx,
@@ -2262,7 +2440,7 @@ async fn seal_rejects_a_short_seal_with_an_unwritten_hole() {
     );
 
     // Fail-closed: the chunk must not be left sealed after a rejected Seal.
-    let (cpda, _) = client::chunk_pda(&program_id, chain_id, batch, idx);
+    let (cpda, _) = client::chunk_pda(&program_id, &settlement_program, chain_id, batch, idx);
     let acct = ctx
         .banks_client
         .get_account(cpda)
@@ -2297,6 +2475,7 @@ async fn seal_accepts_the_correct_hash_and_acc_matches_the_reference() {
         &[client::open_chunk_ix(
             &program_id,
             &authority.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -2312,6 +2491,7 @@ async fn seal_accepts_the_correct_hash_and_acc_matches_the_reference() {
         &[client::write_chunk_ix(
             &program_id,
             &authority.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -2330,6 +2510,7 @@ async fn seal_accepts_the_correct_hash_and_acc_matches_the_reference() {
         &[client::seal_chunk_ix(
             &program_id,
             &authority.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -2344,7 +2525,13 @@ async fn seal_accepts_the_correct_hash_and_acc_matches_the_reference() {
 
     send(
         &mut ctx,
-        &[client::seal_leaf_ix(&program_id, chain_id, batch, idx)],
+        &[client::seal_leaf_ix(
+            &program_id,
+            &settlement_program,
+            chain_id,
+            batch,
+            idx,
+        )],
         &authority,
         &[],
     )
@@ -2355,6 +2542,7 @@ async fn seal_accepts_the_correct_hash_and_acc_matches_the_reference() {
         &[client::finalize_batch_ix(
             &program_id,
             &authority.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             0,
@@ -2365,7 +2553,7 @@ async fn seal_accepts_the_correct_hash_and_acc_matches_the_reference() {
     .await
     .expect("FinalizeBatch");
 
-    let (batch_pda, _) = client::batch_pda(&program_id, chain_id, batch);
+    let (batch_pda, _) = client::batch_pda(&program_id, &settlement_program, chain_id, batch);
     let acct = ctx
         .banks_client
         .get_account(batch_pda)
@@ -2411,6 +2599,7 @@ async fn seal_accepts_the_hash_of_whatever_was_actually_written_hole_included() 
         &[client::open_chunk_ix(
             &program_id,
             &authority.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -2426,6 +2615,7 @@ async fn seal_accepts_the_hash_of_whatever_was_actually_written_hole_included() 
         &[client::write_chunk_ix(
             &program_id,
             &authority.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -2442,6 +2632,7 @@ async fn seal_accepts_the_hash_of_whatever_was_actually_written_hole_included() 
         &[client::write_chunk_ix(
             &program_id,
             &authority.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -2464,6 +2655,7 @@ async fn seal_accepts_the_hash_of_whatever_was_actually_written_hole_included() 
         &[client::seal_chunk_ix(
             &program_id,
             &authority.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -2478,14 +2670,20 @@ async fn seal_accepts_the_hash_of_whatever_was_actually_written_hole_included() 
 
     send(
         &mut ctx,
-        &[client::seal_leaf_ix(&program_id, chain_id, batch, idx)],
+        &[client::seal_leaf_ix(
+            &program_id,
+            &settlement_program,
+            chain_id,
+            batch,
+            idx,
+        )],
         &authority,
         &[],
     )
     .await
     .expect("SealLeaf");
 
-    let (batch_pda, _) = client::batch_pda(&program_id, chain_id, batch);
+    let (batch_pda, _) = client::batch_pda(&program_id, &settlement_program, chain_id, batch);
     let acct = ctx
         .banks_client
         .get_account(batch_pda)
@@ -2526,6 +2724,7 @@ async fn seal_cu_on_the_max_frame_body_3681_bytes() {
         &[client::open_chunk_ix(
             &program_id,
             &authority.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -2541,6 +2740,7 @@ async fn seal_cu_on_the_max_frame_body_3681_bytes() {
         &[client::write_chunk_ix(
             &program_id,
             &authority.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -2558,6 +2758,7 @@ async fn seal_cu_on_the_max_frame_body_3681_bytes() {
         &[client::seal_chunk_ix(
             &program_id,
             &authority.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -2605,6 +2806,7 @@ async fn reseal_with_a_shorter_len_after_seal_leaf_is_rejected_and_header_unchan
         &[client::open_chunk_ix(
             &program_id,
             &authority.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -2620,6 +2822,7 @@ async fn reseal_with_a_shorter_len_after_seal_leaf_is_rejected_and_header_unchan
         &[client::write_chunk_ix(
             &program_id,
             &authority.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -2638,6 +2841,7 @@ async fn reseal_with_a_shorter_len_after_seal_leaf_is_rejected_and_header_unchan
         &[client::seal_chunk_ix(
             &program_id,
             &authority.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -2651,14 +2855,20 @@ async fn reseal_with_a_shorter_len_after_seal_leaf_is_rejected_and_header_unchan
     .expect("Seal(1,000, full_hash) must succeed");
     send(
         &mut ctx,
-        &[client::seal_leaf_ix(&program_id, chain_id, batch, idx)],
+        &[client::seal_leaf_ix(
+            &program_id,
+            &settlement_program,
+            chain_id,
+            batch,
+            idx,
+        )],
         &authority,
         &[],
     )
     .await
     .expect("SealLeaf must commit the 1,000-byte leaf");
 
-    let (cpda, _) = client::chunk_pda(&program_id, chain_id, batch, idx);
+    let (cpda, _) = client::chunk_pda(&program_id, &settlement_program, chain_id, batch, idx);
     let before = ctx
         .banks_client
         .get_account(cpda)
@@ -2676,6 +2886,7 @@ async fn reseal_with_a_shorter_len_after_seal_leaf_is_rejected_and_header_unchan
         &[client::seal_chunk_ix(
             &program_id,
             &authority.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -2728,6 +2939,7 @@ async fn identical_reseal_after_seal_leaf_stays_idempotent_ok() {
         &[client::open_chunk_ix(
             &program_id,
             &authority.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -2743,6 +2955,7 @@ async fn identical_reseal_after_seal_leaf_stays_idempotent_ok() {
         &[client::write_chunk_ix(
             &program_id,
             &authority.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -2759,6 +2972,7 @@ async fn identical_reseal_after_seal_leaf_stays_idempotent_ok() {
     let seal_ix = client::seal_chunk_ix(
         &program_id,
         &authority.pubkey(),
+        &settlement_program,
         chain_id,
         batch,
         idx,
@@ -2770,7 +2984,13 @@ async fn identical_reseal_after_seal_leaf_stays_idempotent_ok() {
         .expect("first Seal must succeed");
     send(
         &mut ctx,
-        &[client::seal_leaf_ix(&program_id, chain_id, batch, idx)],
+        &[client::seal_leaf_ix(
+            &program_id,
+            &settlement_program,
+            chain_id,
+            batch,
+            idx,
+        )],
         &authority,
         &[],
     )
@@ -2782,7 +3002,7 @@ async fn identical_reseal_after_seal_leaf_stays_idempotent_ok() {
         .await
         .expect("an identical re-Seal (same len, same body_hash) must stay an idempotent Ok");
 
-    let (cpda, _) = client::chunk_pda(&program_id, chain_id, batch, idx);
+    let (cpda, _) = client::chunk_pda(&program_id, &settlement_program, chain_id, batch, idx);
     let acct = ctx
         .banks_client
         .get_account(cpda)
@@ -2823,6 +3043,7 @@ async fn write_after_seal_is_rejected_and_bytes_unchanged() {
         &[client::open_chunk_ix(
             &program_id,
             &authority.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -2838,6 +3059,7 @@ async fn write_after_seal_is_rejected_and_bytes_unchanged() {
         &[client::write_chunk_ix(
             &program_id,
             &authority.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -2856,6 +3078,7 @@ async fn write_after_seal_is_rejected_and_bytes_unchanged() {
         &[client::seal_chunk_ix(
             &program_id,
             &authority.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -2868,7 +3091,7 @@ async fn write_after_seal_is_rejected_and_bytes_unchanged() {
     .await
     .expect("Seal must succeed");
 
-    let (cpda, _) = client::chunk_pda(&program_id, chain_id, batch, idx);
+    let (cpda, _) = client::chunk_pda(&program_id, &settlement_program, chain_id, batch, idx);
     let before = ctx
         .banks_client
         .get_account(cpda)
@@ -2883,6 +3106,7 @@ async fn write_after_seal_is_rejected_and_bytes_unchanged() {
         &[client::write_chunk_ix(
             &program_id,
             &authority.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -2910,13 +3134,19 @@ async fn write_after_seal_is_rejected_and_bytes_unchanged() {
     // overwritten, not merely that the second Write returned an error.
     send(
         &mut ctx,
-        &[client::seal_leaf_ix(&program_id, chain_id, batch, idx)],
+        &[client::seal_leaf_ix(
+            &program_id,
+            &settlement_program,
+            chain_id,
+            batch,
+            idx,
+        )],
         &authority,
         &[],
     )
     .await
     .expect("SealLeaf");
-    let (batch_pda, _) = client::batch_pda(&program_id, chain_id, batch);
+    let (batch_pda, _) = client::batch_pda(&program_id, &settlement_program, chain_id, batch);
     let batch_acct = ctx
         .banks_client
         .get_account(batch_pda)
@@ -2945,11 +3175,13 @@ async fn open_chunk_rejects_without_a_batch_account() {
     .start_with_context()
     .await;
     let payer = ctx.payer.insecure_clone();
+    let settlement_program = rome_zk_testkit::fixed_settlement_program_id();
     let err = send(
         &mut ctx,
         &[client::open_chunk_ix(
             &program_id,
             &payer.pubkey(),
+            &settlement_program,
             7,
             1,
             0,
@@ -2986,7 +3218,12 @@ async fn open_chunk_succeeds_even_when_an_attacker_prefunds_its_pda() {
         settlement_program: Pubkey::new_unique(),
         authority: authority.pubkey(),
     };
-    let (batch_pda, _) = client::batch_pda(&program_id, fixture.chain_id, fixture.batch);
+    let (batch_pda, _) = client::batch_pda(
+        &program_id,
+        &fixture.settlement_program,
+        fixture.chain_id,
+        fixture.batch,
+    );
     pt.add_account(batch_pda, fixture.account(program_id, 0, &[], &[], false));
     pt.add_account(
         authority.pubkey(),
@@ -3002,7 +3239,13 @@ async fn open_chunk_succeeds_even_when_an_attacker_prefunds_its_pda() {
 
     let idx = 0u32;
     let size = 8u32;
-    let (chunk_pda, _) = client::chunk_pda(&program_id, fixture.chain_id, fixture.batch, idx);
+    let (chunk_pda, _) = client::chunk_pda(
+        &program_id,
+        &fixture.settlement_program,
+        fixture.chain_id,
+        fixture.batch,
+        idx,
+    );
     prefund_pda(&mut ctx, chunk_pda).await;
     let donated_lamports = ctx
         .banks_client
@@ -3018,6 +3261,7 @@ async fn open_chunk_succeeds_even_when_an_attacker_prefunds_its_pda() {
         &[client::open_chunk_ix(
             &program_id,
             &authority.pubkey(),
+            &fixture.settlement_program,
             fixture.chain_id,
             fixture.batch,
             idx,
@@ -3058,7 +3302,12 @@ async fn open_chunk_rejects_non_batch_authority_signer() {
         settlement_program: Pubkey::new_unique(),
         authority: Pubkey::new_unique(), // not the payer below
     };
-    let (batch_pda, _) = client::batch_pda(&program_id, fixture.chain_id, fixture.batch);
+    let (batch_pda, _) = client::batch_pda(
+        &program_id,
+        &fixture.settlement_program,
+        fixture.chain_id,
+        fixture.batch,
+    );
     pt.add_account(batch_pda, fixture.account(program_id, 0, &[], &[], false));
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
@@ -3067,6 +3316,7 @@ async fn open_chunk_rejects_non_batch_authority_signer() {
         &[client::open_chunk_ix(
             &program_id,
             &payer.pubkey(),
+            &fixture.settlement_program,
             fixture.chain_id,
             fixture.batch,
             0,
@@ -3100,7 +3350,12 @@ async fn open_chunk_rejects_idx_beyond_expected_count() {
         settlement_program: Pubkey::new_unique(),
         authority: Pubkey::new_unique(),
     };
-    let (batch_pda, _) = client::batch_pda(&program_id, fixture.chain_id, fixture.batch);
+    let (batch_pda, _) = client::batch_pda(
+        &program_id,
+        &fixture.settlement_program,
+        fixture.chain_id,
+        fixture.batch,
+    );
     pt.add_account(batch_pda, fixture.account(program_id, 0, &[], &[], false));
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
@@ -3109,6 +3364,7 @@ async fn open_chunk_rejects_idx_beyond_expected_count() {
         &[client::open_chunk_ix(
             &program_id,
             &payer.pubkey(),
+            &fixture.settlement_program,
             fixture.chain_id,
             fixture.batch,
             2, // == expected_count, out of range
@@ -3142,7 +3398,12 @@ async fn open_chunk_rejects_finalized_batch() {
         authority: Pubkey::new_unique(),
     };
     let leaves = small_leaf_set(1);
-    let (batch_pda, _) = client::batch_pda(&program_id, fixture.chain_id, fixture.batch);
+    let (batch_pda, _) = client::batch_pda(
+        &program_id,
+        &fixture.settlement_program,
+        fixture.chain_id,
+        fixture.batch,
+    );
     pt.add_account(
         batch_pda,
         fixture.account(program_id, 1, &leaves, &[0], true),
@@ -3154,6 +3415,7 @@ async fn open_chunk_rejects_finalized_batch() {
         &[client::open_chunk_ix(
             &program_id,
             &payer.pubkey(),
+            &fixture.settlement_program,
             fixture.chain_id,
             fixture.batch,
             0,
@@ -3191,7 +3453,12 @@ async fn abandon_batch_returns_rent_when_not_finalized() {
         settlement_program: Pubkey::new_unique(),
         authority: authority.pubkey(),
     };
-    let (batch_pda, _) = client::batch_pda(&program_id, fixture.chain_id, fixture.batch);
+    let (batch_pda, _) = client::batch_pda(
+        &program_id,
+        &fixture.settlement_program,
+        fixture.chain_id,
+        fixture.batch,
+    );
     let batch_account = fixture.account(program_id, 0, &[], &[], false);
     let expected_rent = batch_account.lamports;
     pt.add_account(batch_pda, batch_account);
@@ -3220,6 +3487,7 @@ async fn abandon_batch_returns_rent_when_not_finalized() {
         &[client::abandon_batch_ix(
             &program_id,
             &authority.pubkey(),
+            &fixture.settlement_program,
             fixture.chain_id,
             fixture.batch,
         )],
@@ -3267,7 +3535,12 @@ async fn abandon_batch_rejects_non_authority_signer() {
         settlement_program: Pubkey::new_unique(),
         authority,
     };
-    let (batch_pda, _) = client::batch_pda(&program_id, fixture.chain_id, fixture.batch);
+    let (batch_pda, _) = client::batch_pda(
+        &program_id,
+        &fixture.settlement_program,
+        fixture.chain_id,
+        fixture.batch,
+    );
     pt.add_account(batch_pda, fixture.account(program_id, 0, &[], &[], false));
     pt.add_account(
         impostor.pubkey(),
@@ -3286,6 +3559,7 @@ async fn abandon_batch_rejects_non_authority_signer() {
         &[client::abandon_batch_ix(
             &program_id,
             &impostor.pubkey(),
+            &fixture.settlement_program,
             fixture.chain_id,
             fixture.batch,
         )],
@@ -3314,7 +3588,12 @@ async fn abandon_batch_rejects_a_finalized_batch() {
         authority: authority.pubkey(),
     };
     let leaves = small_leaf_set(1);
-    let (batch_pda, _) = client::batch_pda(&program_id, fixture.chain_id, fixture.batch);
+    let (batch_pda, _) = client::batch_pda(
+        &program_id,
+        &fixture.settlement_program,
+        fixture.chain_id,
+        fixture.batch,
+    );
     pt.add_account(
         batch_pda,
         fixture.account(program_id, 1, &leaves, &[0], true),
@@ -3336,6 +3615,7 @@ async fn abandon_batch_rejects_a_finalized_batch() {
         &[client::abandon_batch_ix(
             &program_id,
             &authority.pubkey(),
+            &fixture.settlement_program,
             fixture.chain_id,
             fixture.batch,
         )],
@@ -3370,7 +3650,7 @@ async fn chunk_close_succeeds_for_an_abandoned_batch_via_chunk_authority_alone()
         root_account_with_authority(chain_id, &authority.pubkey(), settlement_program),
     );
     pt.add_account(
-        client::cursor_pda(&program_id, chain_id).0,
+        client::cursor_pda(&program_id, &settlement_program, chain_id).0,
         cursor_account(program_id, chain_id, batch),
     );
     pt.add_account(
@@ -3407,6 +3687,7 @@ async fn chunk_close_succeeds_for_an_abandoned_batch_via_chunk_authority_alone()
         &[client::open_chunk_ix(
             &program_id,
             &payer.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -3422,6 +3703,7 @@ async fn chunk_close_succeeds_for_an_abandoned_batch_via_chunk_authority_alone()
         &[client::write_chunk_ix(
             &program_id,
             &payer.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -3438,6 +3720,7 @@ async fn chunk_close_succeeds_for_an_abandoned_batch_via_chunk_authority_alone()
         &[client::seal_chunk_ix(
             &program_id,
             &payer.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -3456,6 +3739,7 @@ async fn chunk_close_succeeds_for_an_abandoned_batch_via_chunk_authority_alone()
         &[client::abandon_batch_ix(
             &program_id,
             &payer.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
         )],
@@ -3474,7 +3758,7 @@ async fn chunk_close_succeeds_for_an_abandoned_batch_via_chunk_authority_alone()
         batch,
         idx,
     );
-    let (cpda, _) = client::chunk_pda(&program_id, chain_id, batch, idx);
+    let (cpda, _) = client::chunk_pda(&program_id, &settlement_program, chain_id, batch, idx);
     send(&mut ctx, &[close_ix], &payer, &[])
         .await
         .expect("Close must succeed for the chunk authority once the batch has been abandoned");
@@ -3504,7 +3788,7 @@ async fn chunk_close_rejects_a_foreign_system_account_posing_as_an_absent_batch(
         root_account_with_authority(chain_id, &authority.pubkey(), settlement_program),
     );
     pt.add_account(
-        client::cursor_pda(&program_id, chain_id).0,
+        client::cursor_pda(&program_id, &settlement_program, chain_id).0,
         cursor_account(program_id, chain_id, batch),
     );
     pt.add_account(
@@ -3541,6 +3825,7 @@ async fn chunk_close_rejects_a_foreign_system_account_posing_as_an_absent_batch(
         &[client::open_chunk_ix(
             &program_id,
             &payer.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -3556,6 +3841,7 @@ async fn chunk_close_rejects_a_foreign_system_account_posing_as_an_absent_batch(
         &[client::write_chunk_ix(
             &program_id,
             &payer.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,
@@ -3572,6 +3858,7 @@ async fn chunk_close_rejects_a_foreign_system_account_posing_as_an_absent_batch(
         &[client::seal_chunk_ix(
             &program_id,
             &payer.pubkey(),
+            &settlement_program,
             chain_id,
             batch,
             idx,

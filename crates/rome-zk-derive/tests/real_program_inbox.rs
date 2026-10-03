@@ -112,7 +112,7 @@ async fn chunks_written_via_the_real_program_read_back_through_inbox_retrieval_m
         root_account_with_authority(CHAIN_ID, &payer.pubkey(), settlement_program),
     );
     pt.add_account(
-        zk_inbox_client::cursor_pda(&program_id, CHAIN_ID).0,
+        zk_inbox_client::cursor_pda(&program_id, &settlement_program, CHAIN_ID).0,
         cursor_account(program_id, CHAIN_ID, BATCH_ID),
     );
     pt.add_account(
@@ -144,6 +144,7 @@ async fn chunks_written_via_the_real_program_read_back_through_inbox_retrieval_m
         let ixs: ChunkPlan = pipeline::plan_chunk(
             &program_id,
             &payer.pubkey(),
+            &settlement_program,
             CHAIN_ID,
             BATCH_ID,
             frame.frame_no as u32,
@@ -160,6 +161,7 @@ async fn chunks_written_via_the_real_program_read_back_through_inbox_retrieval_m
         &[zk_inbox_client::finalize_batch_ix(
             &program_id,
             &payer.pubkey(),
+            &settlement_program,
             CHAIN_ID,
             BATCH_ID,
             0,
@@ -170,7 +172,9 @@ async fn chunks_written_via_the_real_program_read_back_through_inbox_retrieval_m
 
     let batch_account = ctx
         .banks_client
-        .get_account(zk_inbox_client::batch_pda(&program_id, CHAIN_ID, BATCH_ID).0)
+        .get_account(
+            zk_inbox_client::batch_pda(&program_id, &settlement_program, CHAIN_ID, BATCH_ID).0,
+        )
         .await
         .unwrap()
         .expect("batch account exists");
@@ -182,7 +186,7 @@ async fn chunks_written_via_the_real_program_read_back_through_inbox_retrieval_m
 
     // --- the actual seam under test: InboxRetrieval, over a real BanksClient-backed AccountReader ---
     let reader = BanksAccountReader(ctx.banks_client.clone());
-    let mut retrieval = InboxRetrieval::new(reader, program_id);
+    let mut retrieval = InboxRetrieval::new(reader, program_id, settlement_program);
     let batch_ref = rome_zk_derive::traversal::BatchRef {
         chain_id: CHAIN_ID,
         batch: BATCH_ID,
@@ -238,7 +242,7 @@ async fn a_chunk_body_tampered_after_finalization_is_critical_acc_mismatch() {
         root_account_with_authority(CHAIN_ID, &payer.pubkey(), settlement_program),
     );
     pt.add_account(
-        zk_inbox_client::cursor_pda(&program_id, CHAIN_ID).0,
+        zk_inbox_client::cursor_pda(&program_id, &settlement_program, CHAIN_ID).0,
         cursor_account(program_id, CHAIN_ID, BATCH_ID),
     );
     pt.add_account(
@@ -270,6 +274,7 @@ async fn a_chunk_body_tampered_after_finalization_is_critical_acc_mismatch() {
         let ixs: ChunkPlan = pipeline::plan_chunk(
             &program_id,
             &payer.pubkey(),
+            &settlement_program,
             CHAIN_ID,
             BATCH_ID,
             frame.frame_no as u32,
@@ -283,6 +288,7 @@ async fn a_chunk_body_tampered_after_finalization_is_critical_acc_mismatch() {
         &[zk_inbox_client::finalize_batch_ix(
             &program_id,
             &payer.pubkey(),
+            &settlement_program,
             CHAIN_ID,
             BATCH_ID,
             0,
@@ -291,7 +297,8 @@ async fn a_chunk_body_tampered_after_finalization_is_critical_acc_mismatch() {
     )
     .await;
 
-    let batch_pda = zk_inbox_client::batch_pda(&program_id, CHAIN_ID, BATCH_ID).0;
+    let batch_pda =
+        zk_inbox_client::batch_pda(&program_id, &settlement_program, CHAIN_ID, BATCH_ID).0;
     let batch_account = ctx
         .banks_client
         .get_account(batch_pda)
@@ -304,7 +311,8 @@ async fn a_chunk_body_tampered_after_finalization_is_critical_acc_mismatch() {
     // Tamper chunk 0's stored body *after* finalization — bypassing every on-chain instruction, exactly
     // as a corrupted/lying account read would look. The batch account's committed root/acc still
     // reflects the ORIGINAL bytes.
-    let (chunk0_pda, _) = zk_inbox_client::chunk_pda(&program_id, CHAIN_ID, BATCH_ID, 0);
+    let (chunk0_pda, _) =
+        zk_inbox_client::chunk_pda(&program_id, &settlement_program, CHAIN_ID, BATCH_ID, 0);
     let mut chunk0 = ctx
         .banks_client
         .get_account(chunk0_pda)
@@ -319,7 +327,7 @@ async fn a_chunk_body_tampered_after_finalization_is_critical_acc_mismatch() {
     );
 
     let reader = BanksAccountReader(ctx.banks_client.clone());
-    let mut retrieval = InboxRetrieval::new(reader, program_id);
+    let mut retrieval = InboxRetrieval::new(reader, program_id, settlement_program);
     let batch_ref = rome_zk_derive::traversal::BatchRef {
         chain_id: CHAIN_ID,
         batch: BATCH_ID,

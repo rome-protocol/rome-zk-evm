@@ -64,8 +64,9 @@ pub enum ResolveError {
     #[error(
         "chain {chain_id} has no batch_cursor account — OpenBatch on this program requires one (it is \
          part of every OpenBatch's account list), so there is no safe id this process could resolve to. \
-         Run InitBatchCursor for this chain first (see zk-inbox-client's examples/find_max_batch_id for a \
-         scanner that computes the right next_batch on a chain with prior batch history)"
+         Run InitBatchCursor for this chain first, at next_batch = root.head_pending_batch + 1 (zk-inbox-client's \
+         examples/init_cursor takes --next-batch; examples/find_max_batch_id reads the root and prints that value). \
+         Never above head_pending_batch + 1: settlement posts only that id next, so a higher cursor halts the chain"
     )]
     CursorMissing { chain_id: u64 },
     /// Chain-anchor resolution: a paged `getMultipleAccounts` call came back
@@ -227,10 +228,12 @@ pub(crate) fn decode_batch_probe(
 pub(crate) async fn probe_batch_state<A: AccountOps>(
     accounts: &A,
     inbox_program_id: &Pubkey,
+    settlement_program_id: &Pubkey,
     chain_id: u64,
     batch: u64,
 ) -> Result<BatchAccountState, ResolveError> {
-    let (pda, _) = zk_inbox_client::batch_pda(inbox_program_id, chain_id, batch);
+    let (pda, _) =
+        zk_inbox_client::batch_pda(inbox_program_id, settlement_program_id, chain_id, batch);
     let data = accounts.get_account(&pda).await?;
     decode_batch_probe(data, batch)
 }
@@ -241,6 +244,7 @@ pub(crate) async fn probe_batch_state<A: AccountOps>(
 pub(crate) async fn probe_batch_states_paged<A: AccountOps>(
     accounts: &A,
     inbox_program_id: &Pubkey,
+    settlement_program_id: &Pubkey,
     chain_id: u64,
     ids: &[u64],
 ) -> Result<Vec<BatchAccountState>, ResolveError> {
@@ -248,7 +252,9 @@ pub(crate) async fn probe_batch_states_paged<A: AccountOps>(
     for page in ids.chunks(PROBE_PAGE_SIZE) {
         let pdas: Vec<Pubkey> = page
             .iter()
-            .map(|&b| zk_inbox_client::batch_pda(inbox_program_id, chain_id, b).0)
+            .map(|&b| {
+                zk_inbox_client::batch_pda(inbox_program_id, settlement_program_id, chain_id, b).0
+            })
             .collect();
         let datas = accounts.get_multiple_account_data(&pdas).await?;
         // The guard lives here, where the length is relied on — not only inside one backend's impl: a
@@ -272,6 +278,7 @@ pub(crate) async fn probe_batch_states_paged<A: AccountOps>(
 async fn chunk_range_touched<A: AccountOps>(
     accounts: &A,
     inbox_program_id: &Pubkey,
+    settlement_program_id: &Pubkey,
     chain_id: u64,
     batch: u64,
     frame_count: u32,
@@ -280,7 +287,16 @@ async fn chunk_range_touched<A: AccountOps>(
         return Ok(false);
     }
     let pdas: Vec<Pubkey> = (0..frame_count)
-        .map(|idx| zk_inbox_client::chunk_pda(inbox_program_id, chain_id, batch, idx).0)
+        .map(|idx| {
+            zk_inbox_client::chunk_pda(
+                inbox_program_id,
+                settlement_program_id,
+                chain_id,
+                batch,
+                idx,
+            )
+            .0
+        })
         .collect();
     Ok(accounts
         .accounts_exist(&pdas)
@@ -299,12 +315,14 @@ enum FinalizedDecision {
 async fn decide_finalized<A: AccountOps>(
     accounts: &A,
     inbox_program_id: &Pubkey,
+    settlement_program_id: &Pubkey,
     chain_id: u64,
     batch: u64,
     compressed: &[u8],
     max_frame_body_len: usize,
 ) -> Result<FinalizedDecision, ResolveError> {
-    let (pda, _) = zk_inbox_client::batch_pda(inbox_program_id, chain_id, batch);
+    let (pda, _) =
+        zk_inbox_client::batch_pda(inbox_program_id, settlement_program_id, chain_id, batch);
     let data = accounts
         .get_account(&pda)
         .await?
@@ -331,12 +349,14 @@ async fn decide_finalized<A: AccountOps>(
 pub async fn resolve_batch_id<A: AccountOps>(
     accounts: &A,
     inbox_program_id: &Pubkey,
+    settlement_program_id: &Pubkey,
     chain_id: u64,
     compressed: &[u8],
     max_frame_body_len: usize,
     expected_next_batch: u64,
 ) -> Result<ResolveOutcome, ResolveError> {
-    let (cursor_pda, _) = zk_inbox_client::cursor_pda(inbox_program_id, chain_id);
+    let (cursor_pda, _) =
+        zk_inbox_client::cursor_pda(inbox_program_id, settlement_program_id, chain_id);
     let data = accounts
         .get_account(&cursor_pda)
         .await?
@@ -352,6 +372,7 @@ pub async fn resolve_batch_id<A: AccountOps>(
     resolve_via_cursor(
         accounts,
         inbox_program_id,
+        settlement_program_id,
         chain_id,
         cursor.next_batch,
         compressed,
@@ -367,9 +388,11 @@ pub async fn resolve_batch_id<A: AccountOps>(
 pub async fn read_cursor_next_batch<A: AccountOps>(
     accounts: &A,
     inbox_program_id: &Pubkey,
+    settlement_program_id: &Pubkey,
     chain_id: u64,
 ) -> Result<u64, ResolveError> {
-    let (cursor_pda, _) = zk_inbox_client::cursor_pda(inbox_program_id, chain_id);
+    let (cursor_pda, _) =
+        zk_inbox_client::cursor_pda(inbox_program_id, settlement_program_id, chain_id);
     let data = accounts
         .get_account(&cursor_pda)
         .await?
@@ -386,6 +409,7 @@ pub async fn read_cursor_next_batch<A: AccountOps>(
 async fn resolve_via_cursor<A: AccountOps>(
     accounts: &A,
     inbox_program_id: &Pubkey,
+    settlement_program_id: &Pubkey,
     chain_id: u64,
     next_batch: u64,
     compressed: &[u8],
@@ -393,11 +417,20 @@ async fn resolve_via_cursor<A: AccountOps>(
 ) -> Result<ResolveOutcome, ResolveError> {
     if next_batch > 0 {
         let prev = next_batch - 1;
-        match probe_batch_state(accounts, inbox_program_id, chain_id, prev).await? {
+        match probe_batch_state(
+            accounts,
+            inbox_program_id,
+            settlement_program_id,
+            chain_id,
+            prev,
+        )
+        .await?
+        {
             BatchAccountState::Finalized => {
                 match decide_finalized(
                     accounts,
                     inbox_program_id,
+                    settlement_program_id,
                     chain_id,
                     prev,
                     compressed,
@@ -440,6 +473,7 @@ async fn resolve_via_cursor<A: AccountOps>(
     let touched = chunk_range_touched(
         accounts,
         inbox_program_id,
+        settlement_program_id,
         chain_id,
         next_batch,
         frames.len() as u32,
@@ -458,6 +492,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     const PROGRAM: Pubkey = Pubkey::new_from_array([9u8; 32]);
+    const SETTLEMENT_PROGRAM: Pubkey = Pubkey::new_from_array([7u8; 32]);
     const CHAIN_ID: u64 = 200_198;
 
     #[derive(Default)]
@@ -573,13 +608,26 @@ mod tests {
     #[tokio::test]
     async fn a_chain_without_a_cursor_is_a_hard_cursor_missing_error() {
         let chain = FakeChain::default();
-        let err = resolve_batch_id(&chain, &PROGRAM, CHAIN_ID, b"hello world", 32, 0)
-            .await
-            .unwrap_err();
+        let err = resolve_batch_id(
+            &chain,
+            &PROGRAM,
+            &SETTLEMENT_PROGRAM,
+            CHAIN_ID,
+            b"hello world",
+            32,
+            0,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(
             err,
             ResolveError::CursorMissing { chain_id } if chain_id == CHAIN_ID
         ));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("root.head_pending_batch + 1") && msg.contains("init_cursor"),
+            "the operator is told the cursor value to use: {msg}"
+        );
     }
 
     // ===== The cursor-based resume path =====
@@ -587,22 +635,30 @@ mod tests {
     #[tokio::test]
     async fn a_chain_with_a_cursor_at_zero_resolves_directly_to_post_under_zero() {
         let chain = FakeChain::default();
-        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, CHAIN_ID);
+        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(cursor_pda, cursor_bytes(CHAIN_ID, 0));
 
-        let outcome = resolve_batch_id(&chain, &PROGRAM, CHAIN_ID, b"hello world", 32, 0)
-            .await
-            .unwrap();
+        let outcome = resolve_batch_id(
+            &chain,
+            &PROGRAM,
+            &SETTLEMENT_PROGRAM,
+            CHAIN_ID,
+            b"hello world",
+            32,
+            0,
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome, ResolveOutcome::PostUnder(0));
     }
 
     #[tokio::test]
     async fn a_chain_with_a_cursor_resolves_directly_to_next_batch_without_scanning() {
         let chain = FakeChain::default();
-        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, CHAIN_ID);
+        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(cursor_pda, cursor_bytes(CHAIN_ID, 5));
         // batch 4 (next_batch - 1) is finalized with *different* content than this run's own — proceed.
-        let (batch4, _) = zk_inbox_client::batch_pda(&PROGRAM, CHAIN_ID, 4);
+        let (batch4, _) = zk_inbox_client::batch_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID, 4);
         chain.set_account(
             batch4,
             finalized_matching_batch_bytes(CHAIN_ID, 4, b"unrelated content"),
@@ -610,23 +666,39 @@ mod tests {
 
         // Ids 0..3 are never seeded at all — the old scan would have needed each of them to exist or
         // read Missing; the cursor path never even looks at them.
-        let outcome = resolve_batch_id(&chain, &PROGRAM, CHAIN_ID, b"hello world", 32, 5)
-            .await
-            .unwrap();
+        let outcome = resolve_batch_id(
+            &chain,
+            &PROGRAM,
+            &SETTLEMENT_PROGRAM,
+            CHAIN_ID,
+            b"hello world",
+            32,
+            5,
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome, ResolveOutcome::PostUnder(5));
     }
 
     #[tokio::test]
     async fn a_touched_chunk_range_under_the_cursors_next_batch_is_a_hard_error() {
         let chain = FakeChain::default();
-        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, CHAIN_ID);
+        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(cursor_pda, cursor_bytes(CHAIN_ID, 3));
-        let (chunk0, _) = zk_inbox_client::chunk_pda(&PROGRAM, CHAIN_ID, 3, 0);
+        let (chunk0, _) = zk_inbox_client::chunk_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID, 3, 0);
         chain.set_account(chunk0, vec![1, 2, 3]);
 
-        let err = resolve_batch_id(&chain, &PROGRAM, CHAIN_ID, b"x", 3200, 3)
-            .await
-            .unwrap_err();
+        let err = resolve_batch_id(
+            &chain,
+            &PROGRAM,
+            &SETTLEMENT_PROGRAM,
+            CHAIN_ID,
+            b"x",
+            3200,
+            3,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(
             err,
             ResolveError::CursorBatchAlreadyTouched { batch: 3 }
@@ -636,12 +708,20 @@ mod tests {
     #[tokio::test]
     async fn a_real_rpc_failure_reading_the_cursor_propagates() {
         let chain = FakeChain::default();
-        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, CHAIN_ID);
+        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.fail_reads_for(cursor_pda);
 
-        let err = resolve_batch_id(&chain, &PROGRAM, CHAIN_ID, b"x", 3200, 0)
-            .await
-            .unwrap_err();
+        let err = resolve_batch_id(
+            &chain,
+            &PROGRAM,
+            &SETTLEMENT_PROGRAM,
+            CHAIN_ID,
+            b"x",
+            3200,
+            0,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, ResolveError::AccountRead { pubkey, .. } if pubkey == cursor_pda));
     }
 
@@ -654,14 +734,22 @@ mod tests {
     #[tokio::test]
     async fn a_cursor_that_moved_since_this_runs_expected_next_batch_refuses_by_name() {
         let chain = FakeChain::default();
-        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, CHAIN_ID);
+        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
         // The on-chain cursor already sits at 6 (another writer posted batch 5 after this run last read
         // the cursor at startup and formed its own expectation of 5).
         chain.set_account(cursor_pda, cursor_bytes(CHAIN_ID, 6));
 
-        let err = resolve_batch_id(&chain, &PROGRAM, CHAIN_ID, b"x", 3200, 5)
-            .await
-            .unwrap_err();
+        let err = resolve_batch_id(
+            &chain,
+            &PROGRAM,
+            &SETTLEMENT_PROGRAM,
+            CHAIN_ID,
+            b"x",
+            3200,
+            5,
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -679,21 +767,29 @@ mod tests {
     #[tokio::test]
     async fn a_cursor_matching_expected_next_batch_proceeds_normally() {
         let chain = FakeChain::default();
-        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, CHAIN_ID);
+        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(cursor_pda, cursor_bytes(CHAIN_ID, 5));
 
-        let outcome = resolve_batch_id(&chain, &PROGRAM, CHAIN_ID, b"x", 3200, 5)
-            .await
-            .unwrap();
+        let outcome = resolve_batch_id(
+            &chain,
+            &PROGRAM,
+            &SETTLEMENT_PROGRAM,
+            CHAIN_ID,
+            b"x",
+            3200,
+            5,
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome, ResolveOutcome::PostUnder(5));
     }
 
     #[tokio::test]
     async fn read_cursor_next_batch_reads_the_current_on_chain_value() {
         let chain = FakeChain::default();
-        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, CHAIN_ID);
+        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(cursor_pda, cursor_bytes(CHAIN_ID, 7));
-        let n = read_cursor_next_batch(&chain, &PROGRAM, CHAIN_ID)
+        let n = read_cursor_next_batch(&chain, &PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID)
             .await
             .unwrap();
         assert_eq!(n, 7);
@@ -709,17 +805,25 @@ mod tests {
     async fn a_rerun_over_an_already_posted_prev_batch_resolves_to_already_posted_not_a_new_id() {
         let chain = FakeChain::default();
         let compressed = b"same content every time";
-        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, CHAIN_ID);
+        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(cursor_pda, cursor_bytes(CHAIN_ID, 1));
-        let (batch0, _) = zk_inbox_client::batch_pda(&PROGRAM, CHAIN_ID, 0);
+        let (batch0, _) = zk_inbox_client::batch_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID, 0);
         chain.set_account(
             batch0,
             finalized_matching_batch_bytes(CHAIN_ID, 0, compressed),
         );
 
-        let outcome = resolve_batch_id(&chain, &PROGRAM, CHAIN_ID, compressed, 3200, 1)
-            .await
-            .unwrap();
+        let outcome = resolve_batch_id(
+            &chain,
+            &PROGRAM,
+            &SETTLEMENT_PROGRAM,
+            CHAIN_ID,
+            compressed,
+            3200,
+            1,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             outcome,
             ResolveOutcome::AlreadyPosted(0),
@@ -732,17 +836,25 @@ mod tests {
     #[tokio::test]
     async fn a_finalized_prev_batch_with_different_content_proceeds_to_the_next_id() {
         let chain = FakeChain::default();
-        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, CHAIN_ID);
+        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(cursor_pda, cursor_bytes(CHAIN_ID, 1));
-        let (batch0, _) = zk_inbox_client::batch_pda(&PROGRAM, CHAIN_ID, 0);
+        let (batch0, _) = zk_inbox_client::batch_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID, 0);
         chain.set_account(
             batch0,
             finalized_matching_batch_bytes(CHAIN_ID, 0, b"yesterday's content"),
         );
 
-        let outcome = resolve_batch_id(&chain, &PROGRAM, CHAIN_ID, b"today's content", 3200, 1)
-            .await
-            .unwrap();
+        let outcome = resolve_batch_id(
+            &chain,
+            &PROGRAM,
+            &SETTLEMENT_PROGRAM,
+            CHAIN_ID,
+            b"today's content",
+            3200,
+            1,
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome, ResolveOutcome::PostUnder(1));
     }
 
@@ -752,14 +864,22 @@ mod tests {
     #[tokio::test]
     async fn a_not_yet_finalized_prev_batch_warns_and_still_proceeds() {
         let chain = FakeChain::default();
-        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, CHAIN_ID);
+        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(cursor_pda, cursor_bytes(CHAIN_ID, 1));
-        let (batch0, _) = zk_inbox_client::batch_pda(&PROGRAM, CHAIN_ID, 0);
+        let (batch0, _) = zk_inbox_client::batch_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID, 0);
         chain.set_account(batch0, open_not_finalized_bytes(5, 2));
 
-        let outcome = resolve_batch_id(&chain, &PROGRAM, CHAIN_ID, b"x", 3200, 1)
-            .await
-            .unwrap();
+        let outcome = resolve_batch_id(
+            &chain,
+            &PROGRAM,
+            &SETTLEMENT_PROGRAM,
+            CHAIN_ID,
+            b"x",
+            3200,
+            1,
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome, ResolveOutcome::PostUnder(1));
     }
 
@@ -767,13 +887,21 @@ mod tests {
     #[tokio::test]
     async fn a_missing_prev_batch_proceeds_normally() {
         let chain = FakeChain::default();
-        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, CHAIN_ID);
+        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(cursor_pda, cursor_bytes(CHAIN_ID, 1));
         // batch 0's account is deliberately absent (abandoned).
 
-        let outcome = resolve_batch_id(&chain, &PROGRAM, CHAIN_ID, b"x", 3200, 1)
-            .await
-            .unwrap();
+        let outcome = resolve_batch_id(
+            &chain,
+            &PROGRAM,
+            &SETTLEMENT_PROGRAM,
+            CHAIN_ID,
+            b"x",
+            3200,
+            1,
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome, ResolveOutcome::PostUnder(1));
     }
 
@@ -800,9 +928,15 @@ mod tests {
     #[tokio::test]
     async fn a_short_page_from_any_backend_is_a_named_refusal_not_a_truncated_sweep() {
         let ids: Vec<u64> = (0..7).collect();
-        let err = probe_batch_states_paged(&ShortPageAccounts, &Pubkey::new_unique(), 7, &ids)
-            .await
-            .expect_err("a page with fewer entries than ids asked must be refused");
+        let err = probe_batch_states_paged(
+            &ShortPageAccounts,
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            7,
+            &ids,
+        )
+        .await
+        .expect_err("a page with fewer entries than ids asked must be refused");
         assert!(
             matches!(
                 err,

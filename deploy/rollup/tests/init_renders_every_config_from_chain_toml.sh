@@ -29,12 +29,14 @@ has sequencer-config.toml '^empty_block_interval_secs = 5$' "empty_block_interva
 has sequencer-config.toml '^sequencer_key_path = "/data/sequencer.key"$' "container key path"
 has sequencer-config.toml '^log_dir = "/data/reth/log"$' "container log dir (the batcher reads it)"
 
-python3 - "$OUT/genesis.json" "$REPO_ROOT/contracts/exit-portal/RomeExitPortal.runtime.hex" <<'PY' && pass "genesis.json: chainId is the derived id, gas limit and funded account come from chain.toml; the exit portal is the one predeploy" || fail "genesis.json: chainId is the derived id, gas limit and funded account come from chain.toml; the exit portal is the one predeploy" "see above"
+python3 - "$OUT/genesis.json" "$REPO_ROOT/contracts/exit-portal/RomeExitPortal.runtime.hex" <<'PY' && pass "genesis.json: chainId is the derived id, gas limit and coinbase come from chain.toml; no balances; the exit portal is the one predeploy" || fail "genesis.json: chainId is the derived id, gas limit and coinbase come from chain.toml; no balances; the exit portal is the one predeploy" "see above"
 import json, sys
 g = json.load(open(sys.argv[1]))
 assert g["config"]["chainId"] == 4295391538, g["config"]["chainId"]
 assert int(g["gasLimit"], 16) == 30_000_000, g["gasLimit"]
-assert list(g["alloc"]) == ["0x1111111111111111111111111111111111111111", "0x4200000000000000000000000000000000000016"], list(g["alloc"])
+assert g["coinbase"] == "0x3333333333333333333333333333333333333333", g["coinbase"]
+assert list(g["alloc"]) == ["0x4200000000000000000000000000000000000016"], list(g["alloc"])
+assert g["alloc"]["0x4200000000000000000000000000000000000016"]["balance"] == "0x0"
 code = g["alloc"]["0x4200000000000000000000000000000000000016"]["code"]
 want = "0x" + "".join(open(sys.argv[2]).read().split()).removeprefix("0x")
 assert code == want and len(code) > 100, "exit portal predeploy differs from contracts/exit-portal/RomeExitPortal.runtime.hex"
@@ -73,11 +75,11 @@ after="$(cd "$OUT" && cat jwt.hex genesis.json sequencer-config.toml | shasum)"
 [[ "$before" == "$after" ]] && pass "a second init changes nothing (engine secret and genesis kept)" || fail "a second init changes nothing" "outputs differ"
 
 # A changed chain.toml must not silently rewrite a genesis that may already be live.
-sed -i.bak 's/0x1111111111111111111111111111111111111111/0x2222222222222222222222222222222222222222/' "$WORK/chain.toml"
+sed -i.bak 's/^fee_recipient = .*/fee_recipient = "0x2222222222222222222222222222222222222222"/' "$WORK/chain.toml"
 if out="$("$ROLLUP" init 2>&1)"; then fail "init refuses to overwrite a differing genesis" "exited 0: $out"
 elif grep -q 'GenesisDrift' <<<"$out"; then pass "init refuses by name (GenesisDrift) when chain.toml would change an existing genesis"
 else fail "init refuses by name (GenesisDrift)" "$out"; fi
-grep -q 0x1111111111111111111111111111111111111111 "$OUT/genesis.json" && pass "the existing genesis is untouched after the refusal" || fail "the existing genesis is untouched" "changed"
+grep -q '"coinbase": "0x3333333333333333333333333333333333333333"' "$OUT/genesis.json" && pass "the existing genesis is untouched after the refusal" || fail "the existing genesis is untouched" "changed"
 cp "$FIX/chain.toml" "$WORK/chain.toml"
 
 # A payer whose nonce moved since init: the recorded id is reused, so the rendered genesis does not change.
@@ -103,14 +105,6 @@ refuses "no payer keypair" PayerKeyMissing PAYER_KEYPAIR_PATH="$WORK/keys/none.j
 printf '#!/bin/sh\necho "error: rpc down" >&2\nexit 1\n' > "$WORK/failcargo"; chmod +x "$WORK/failcargo"; mkdir -p "$WORK/failbin"; cp "$WORK/failcargo" "$WORK/failbin/cargo"
 refuses "the chain-id lookup failing" ChainIdLookupFailed PATH="$WORK/failbin:$PATH" ROLLUP_OUT="$WORK/o10"
 refuses "a derived id below 2^32" ChainIdInvalid STUB_ID=1000 ROLLUP_OUT="$WORK/o11"
-sed 's/^funded_address = .*/funded_address = "nope"/' "$FIX/chain.toml" > "$WORK/bad2.toml"; refuses "bad funded address" FundedAddressInvalid CHAIN_TOML="$WORK/bad2.toml" ROLLUP_OUT="$WORK/o6"
-n=20
-for addr in 0x0000000000000000000000000000000000000000 0x0000000000000000000000000000000000000001 0x000000000000000000000000000000000000000A 0x000000000000000000000000000000000000000b 0x00000000000000000000000000000000000000ff 0x4200000000000000000000000000000000000016; do
-  n=$((n+1)); sed "s/^funded_address = .*/funded_address = \"$addr\"/" "$FIX/chain.toml" > "$WORK/res$n.toml"
-  refuses "funded address $addr" FundedAddressReserved CHAIN_TOML="$WORK/res$n.toml" ROLLUP_OUT="$WORK/o$n"
-done
-sed 's/^funded_address = .*/funded_address = "0x0000000000000000000000000000000000000100"/' "$FIX/chain.toml" > "$WORK/ok100.toml"
-CHAIN_TOML="$WORK/ok100.toml" ROLLUP_OUT="$WORK/o-ok100" "$ROLLUP" init >/dev/null 2>&1 && pass "a funded address just above the precompile range (0x..0100) is accepted" || fail "0x..0100 is accepted" "init refused it"
 printf '' > "$WORK/emptyportal.hex"
 refuses "an empty exit portal bytecode file" ExitPortalRuntimeMissing EXIT_PORTAL_RUNTIME_HEX="$WORK/emptyportal.hex" ROLLUP_OUT="$WORK/o30"
 

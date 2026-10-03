@@ -89,6 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &pool,
             &mut source,
             &cfg.inbox_program,
+            &cfg.settlement_program,
             ProgramKind::Inbox,
             watcher_cfg,
         )
@@ -108,6 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let settlement_ingest_ok = match run_once(
             &pool,
             &mut source,
+            &cfg.settlement_program,
             &cfg.settlement_program,
             ProgramKind::Root,
             watcher_cfg,

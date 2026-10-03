@@ -161,6 +161,7 @@ fn main() -> anyhow::Result<()> {
     let (batch_account, chunk_bodies) = rome_zk_prover_input::inbox::fetch_and_verify_batch(
         &mut fetch,
         &inbox_program,
+        &settlement_program,
         chain_id,
         batch,
     )?;

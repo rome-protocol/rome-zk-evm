@@ -64,13 +64,16 @@ pub fn account_len(expected_count: u32) -> usize {
     leaves_offset(expected_count) + 32 * expected_count as usize
 }
 
-/// `["batch", chain_id, batch]` — owned by the inbox program. `zk-settlement` derives the same address
-/// (passing the inbox program id, read from its own registry account) to validate the inbox batch
-/// account it reads at `PostRoot`/`PostRootProved` — same seeds, different `program_id`.
+/// `["batch", settlement_program, chain_id, batch]` — owned by the inbox program. The settlement program is
+/// part of the key so a chain's batch accounts can only be created through its own settlement program.
+/// `zk-settlement` derives the same address (passing the inbox program id, read from its own registry
+/// account, and its own program id as `settlement_program`) to validate the inbox batch account it reads at
+/// `PostRoot`/`PostRootProved` — same seeds, different `program_id`.
 #[inline]
-pub fn seeds(chain_id: u64, batch: u64) -> [Vec<u8>; 3] {
+pub fn seeds(settlement_program: &[u8; 32], chain_id: u64, batch: u64) -> [Vec<u8>; 4] {
     [
         b"batch".to_vec(),
+        settlement_program.to_vec(),
         chain_id.to_le_bytes().to_vec(),
         batch.to_le_bytes().to_vec(),
     ]
@@ -83,11 +86,12 @@ pub fn seeds(chain_id: u64, batch: u64) -> [Vec<u8>; 3] {
 #[inline]
 pub fn pda(
     program_id: &solana_program::pubkey::Pubkey,
+    settlement_program: &solana_program::pubkey::Pubkey,
     chain_id: u64,
     batch: u64,
 ) -> (solana_program::pubkey::Pubkey, u8) {
-    let s = seeds(chain_id, batch);
-    solana_program::pubkey::Pubkey::find_program_address(&[&s[0], &s[1], &s[2]], program_id)
+    let s = seeds(&settlement_program.to_bytes(), chain_id, batch);
+    solana_program::pubkey::Pubkey::find_program_address(&[&s[0], &s[1], &s[2], &s[3]], program_id)
 }
 
 /// Field-for-field decode of a batch account's fixed header (not the bitmap or leaf hashes, which the
@@ -341,10 +345,11 @@ mod tests {
 
     #[test]
     fn seeds_golden_bytes_for_fixed_inputs() {
-        let s = seeds(0x0102_0304_0506_0708, 9);
+        let s = seeds(&[0x5Au8; 32], 0x0102_0304_0506_0708, 9);
         assert_eq!(s[0], b"batch".to_vec());
-        assert_eq!(s[1], vec![0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
-        assert_eq!(s[2], vec![9, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(s[1], vec![0x5Au8; 32]);
+        assert_eq!(s[2], vec![0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
+        assert_eq!(s[3], vec![9, 0, 0, 0, 0, 0, 0, 0]);
     }
 
     #[cfg(feature = "solana")]
@@ -352,12 +357,17 @@ mod tests {
     fn pda_is_deterministic_and_varies_with_batch_and_program() {
         let program = solana_program::pubkey::Pubkey::new_unique();
         let other = solana_program::pubkey::Pubkey::new_unique();
-        let (a1, _) = pda(&program, 7, 1);
-        let (a2, _) = pda(&program, 7, 1);
+        let settlement = solana_program::pubkey::Pubkey::new_unique();
+        let other_settlement = solana_program::pubkey::Pubkey::new_unique();
+        let (a1, _) = pda(&program, &settlement, 7, 1);
+        let (a2, _) = pda(&program, &settlement, 7, 1);
         assert_eq!(a1, a2);
-        let (b, _) = pda(&program, 7, 2);
+        let (b, _) = pda(&program, &settlement, 7, 2);
         assert_ne!(a1, b);
-        let (c, _) = pda(&other, 7, 1);
+        let (c, _) = pda(&other, &settlement, 7, 1);
         assert_ne!(a1, c);
+        // The settlement program is part of the key: another program's chain id maps elsewhere.
+        let (d, _) = pda(&program, &other_settlement, 7, 1);
+        assert_ne!(a1, d);
     }
 }

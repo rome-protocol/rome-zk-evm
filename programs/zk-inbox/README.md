@@ -8,6 +8,16 @@ side; this program's batch accumulator is what makes root posting a fixed-size, 
 
 ## What it guarantees
 
+- **A chain's inbox accounts are keyed by its settlement program, so they can only be created through
+  it.** The batch cursor is `["batch_cursor", settlement_program, chain_id]`, a batch is
+  `["batch", settlement_program, chain_id, batch]` and a chunk is
+  `["inbox", settlement_program, chain_id, batch, idx]`, all under this program. `OpenBatch` and
+  `InitBatchCursor` take the settlement program as an argument and derive from it; the account they read
+  the chain's authority from is that program's own root account, so the addresses a chain uses can only
+  be created by a caller who satisfies the chain's own settlement program. Chunk `Open` and `SealLeaf`
+  read the settlement program from the batch account. Settlement derives the batch with its own program
+  id and refuses a batch whose recorded settlement program is anyone else's.
+
 - **A batch id is never reused.** `OpenBatch` requires the caller's batch id to equal a per-chain,
   program-owned sequential cursor's current value (bootstrapped once via `InitBatchCursor`) and advances
   that cursor atomically as part of opening — an abandoned batch's id can never be reopened, so a later
@@ -51,7 +61,11 @@ side; this program's batch accumulator is what makes root posting a fixed-size, 
   finalized and its settlement-side root to already be final — reading the settlement program's root
   account directly, not trusting a caller's claim. The one exception: a chunk whose batch was never
   posted at all (never created, or `AbandonBatch`ed) may be closed by its own chunk authority alone, since
-  there is no data availability left to protect in that case.
+  there is no data availability left to protect in that case. A chunk `Close` takes the settlement
+  program from the owner of the root account it is given, and requires the root, the chunk and the batch
+  addresses to be the ones derived under that program; when the batch account still exists it must also
+  record that same settlement program. A root owned by any other program therefore cannot be used to
+  close a chunk.
 
 ## Config
 
@@ -89,6 +103,13 @@ authority cannot finalize it, even after permissionlessly sealing every one of i
 `finalize_batch_with_an_unsigned_authority_account_errors`,
 `finalize_batch_missing_the_authority_account_errors`) — without this, a third party could finalize a
 later batch id ahead of the real poster's own still-open one, stranding it.
+
+Accounts under a settlement program other than the chain's own are at addresses the chain never reads:
+`tests/third_party_settlement.rs` checks that opening a batch, initialising a cursor, opening and sealing
+chunks, and closing chunks through a different settlement program leave the chain's own cursor, batch and
+chunk accounts untouched, and that a chunk `Close` against another program's root is refused.
+`tests/cu_measurement.rs` prints the compute units of `InitBatchCursor`, `OpenBatch` and chunk
+`Open`/`Write`/`Seal`/`SealLeaf` on the compiled program.
 
 A short-seal (a caller claiming a length the account's bytes do not actually hold) is rejected at the core:
 `Seal`'s `body_hash` is checked against `keccak256(body[..len])` recomputed from the account itself, and a

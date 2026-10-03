@@ -56,6 +56,46 @@ it with `./rollup up sequencer` so it can read the genesis block.
 stops with `NonceAdvanced`, before sending anything, if the id it would now get is not the one in your genesis. It
 sends the recorded nonce and chain id with the registration, so the program refuses a pair that went stale. Before any of that, `register` stops with `AuthorityChanged` if the payer key is not the one `init` recorded. If the nonce has moved because your own earlier run registered this chain, `register` sees the chain's root account and carries on instead of stopping.
 
+A new chain's genesis has no balances. Nobody is minted any coins, and the exit portal is the only predeployed
+contract, at balance 0. This is on purpose. A genesis cannot change after you register, and a genesis that mints
+coins could never take deposits safely: its holder could exit coins that other people's deposits paid for. L2 gas
+comes from deposits once they ship, and until then a chain with no balances cannot send a transaction. If you need
+gas sooner, you can declare one backed balance in `[genesis]`:
+
+```toml
+backed_address = "0x..."               # an address you control
+backed_balance_lamports = 1_500_000_000  # 1.5 SOL, written in lamports
+```
+
+The amount is in lamports because it has to match what you lock in your chain's vault, which holds wrapped SOL.
+One lamport is one gwei on your chain, and `init` renders wei as lamports times 1e9, so the conversion is always
+exact. Write a plain whole number from 1 to 18446744073709551615, with no decimals, quotes, units, hex or exponents.
+Set both keys or neither. You lock the same amount in the vault with the bridge program's `Fund` instruction, and Rome
+checks that the vault holds it before it registers your verification key. `init` prints the exact lamport amount to
+lock. First create the vault with the bridge program's `InitVault`, signed by your chain authority, which works only
+after `register`; you also need that amount of wrapped SOL, on top of the SOL budget for registration and fees.
+The bridge program is not deployed on devnet yet, so on devnet there is no vault to lock a backed balance in today.
+
+`init` stops with `FundedAddressRemoved` if `chain.toml` still sets `genesis.funded_address`, which older versions
+required and which minted 1e27 wei to that address. It also stops with `GenesisKeyUnknown` for any other key under
+`[genesis]` that it does not know (including `backed_balance`, which has to carry its unit), `BackedAddressMissing`
+or `BackedBalanceMissing` when only one of the two keys is set, `BackedAddressInvalid` for an address that is not `0x`
+and 40 hex characters, `BackedAddressReserved` for zero, the precompile addresses (`0x00..00` to `0x00..ff`) and the exit
+portal's address, and `BackedBalanceInvalid` for anything but a whole number of lamports in range. An existing
+`rendered/genesis.json` is never changed, so adding a backed balance after your first `init` stops with `GenesisDrift`.
+
+Set `genesis.fee_recipient` in `chain.toml` to an address you control. It receives the priority fees (tips) of the
+chain's transactions; the base fee is burned, as on Ethereum. It becomes the genesis coinbase. The sequencer, derive
+and the guest all read the fee recipient from there, and it cannot change once you register. `init` stops with `FeeRecipientMissing` if it is not set,
+`FeeRecipientInvalid` if it is not `0x` and 40 hex characters, and `FeeRecipientReserved` for zero, the precompile
+addresses (`0x00..00` to `0x00..ff`) and the exit portal's address.
+
+A permissionless chain id falls anywhere from 2^32 to 2^53 - 1, and MetaMask cannot add a chain whose id is above
+4503599627370476, which is about half of them. `init` checks the id it derived before you register: above that limit
+it stops with `ChainIdNotWalletSafe` and sends nothing. Create a new payer key with `solana-keygen new`, point
+`PAYER_KEYPAIR_PATH` at it, fund it and run `init` again; a different key gets a different id. If the chain is already
+registered, its id is fixed, so `init` prints the same name as a warning and carries on.
+
 `init` refuses by name a `[profile]` key in `chain.toml` that it sets itself (`ProfileKeyReserved`: `chain_id`,
 `rpc_addr`, `metrics_addr`, `log_dir`, `sequencer_key_path`, `datadir`, `genesis_path`), and stops with
 `ChainIdLookupFailed` if it cannot read your nonce from Solana.

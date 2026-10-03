@@ -65,7 +65,16 @@ async fn main() {
     for batch_str in &argv[4..] {
         let batch: u64 = batch_str.parse().expect("bad batch_id");
         let pdas: Vec<Pubkey> = (0..scan_range)
-            .map(|idx| zk_inbox_client::chunk_pda(&program_id, chain_id, batch, idx).0)
+            .map(|idx| {
+                zk_inbox_client::chunk_pda(
+                    &program_id,
+                    &settlement_program_id,
+                    chain_id,
+                    batch,
+                    idx,
+                )
+                .0
+            })
             .collect();
 
         let mut existing: Vec<(u32, Pubkey, u64)> = Vec::new();

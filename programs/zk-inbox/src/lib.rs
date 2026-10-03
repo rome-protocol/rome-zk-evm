@@ -96,9 +96,10 @@ pub enum InboxIx {
     /// `authority` per the settlement root account). Bootstraps the per-chain `batch_cursor` PDA at
     /// `next_batch`; fails (`CursorAlreadyInitialized`) if the cursor already holds real data for this
     /// chain (checked by owner + `data_len`, not by `create_account`'s own error: a merely pre-funded,
-    /// still-empty PDA must still bootstrap normally) — run once per chain, and on a chain with prior
-    /// batch history it must be initialised above every batch id ever opened there, or `OpenBatch`
-    /// could re-open a stale id.
+    /// still-empty PDA must still bootstrap normally) — run once per chain. Initialise it at exactly
+    /// `root.head_pending_batch + 1` of the chain's settlement root: settlement posts only that id next,
+    /// so a lower value could re-open a stale id and a higher one leaves the chain waiting for a batch
+    /// id the cursor has already passed.
     InitBatchCursor {
         chain_id: u64,
         next_batch: u64,
@@ -129,12 +130,12 @@ impl From<ChunkError> for ProgramError {
     }
 }
 
-/// The chunk PDA's seeds — the single definition is `rome_zk_layouts::chunk::seeds`;
+/// The chunk PDA's seeds, `["inbox", settlement_program, chain_id, batch, idx]` — the single definition is `rome_zk_layouts::chunk::seeds`;
 /// kept under this name so every existing call site (this program's own `Open`, plus `zk-inbox-client`,
 /// plus tests) is unchanged.
 #[inline]
-pub fn pda_seeds(chain_id: u64, batch: u64, idx: u32) -> [Vec<u8>; 4] {
-    rome_zk_layouts::chunk::seeds(chain_id, batch, idx)
+pub fn pda_seeds(settlement_program: &Pubkey, chain_id: u64, batch: u64, idx: u32) -> [Vec<u8>; 5] {
+    rome_zk_layouts::chunk::seeds(&settlement_program.to_bytes(), chain_id, batch, idx)
 }
 
 /// Decodes a chunk account's fixed header via `rome_zk_layouts::chunk::read` (the single definition of
@@ -176,10 +177,13 @@ pub fn process_instruction(
             if !payer.is_signer || *sys.key != system_program::id() {
                 return Err(ProgramError::MissingRequiredSignature);
             }
-            batch::open_chunk_check(program_id, chain_id, batch, idx, batch_pda, payer.key)?;
-            let seeds = pda_seeds(chain_id, batch, idx);
+            // The chunk is keyed by the settlement program the batch was opened through, which the batch
+            // account records (`open_chunk_check` returns it after tying the batch address to it).
+            let settlement_program =
+                batch::open_chunk_check(program_id, chain_id, batch, idx, batch_pda, payer.key)?;
+            let seeds = pda_seeds(&settlement_program, chain_id, batch, idx);
             let (expect, bump) = Pubkey::find_program_address(
-                &[&seeds[0], &seeds[1], &seeds[2], &seeds[3]],
+                &[&seeds[0], &seeds[1], &seeds[2], &seeds[3], &seeds[4]],
                 program_id,
             );
             if expect != *pda.key {
@@ -197,7 +201,14 @@ pub fn process_instruction(
                 sys,
                 program_id,
                 space,
-                &[&seeds[0], &seeds[1], &seeds[2], &seeds[3], &[bump]],
+                &[
+                    &seeds[0],
+                    &seeds[1],
+                    &seeds[2],
+                    &seeds[3],
+                    &seeds[4],
+                    &[bump],
+                ],
             )?;
             let mut d = pda.try_borrow_mut_data()?;
             d[OFF_MAGIC..OFF_MAGIC + 4].copy_from_slice(&MAGIC.to_le_bytes());
@@ -275,32 +286,58 @@ pub fn process_instruction(
             if pda.owner != program_id {
                 return Err(ProgramError::IncorrectProgramId);
             }
-            let (chain_id, batch) = {
+            let (chain_id, batch, idx) = {
                 let d = pda.try_borrow_data()?;
                 let (authority, chain_id, batch, _, _) = read_header(&d)?;
                 if !auth.is_signer || *auth.key != authority {
                     return Err(ProgramError::MissingRequiredSignature);
                 }
-                (chain_id, batch)
+                let idx = u32::from_le_bytes(d[OFF_IDX..OFF_IDX + 4].try_into().unwrap());
+                (chain_id, batch, idx)
             };
+            // Every inbox account of a chain is keyed by the settlement program that owns the chain. The
+            // settlement program here is the owner of the root account the caller passed; the chunk's own
+            // address, the batch slot's address and the root's address must all derive from it, so a root
+            // under any other program can only ever reach that program's own (disjoint) accounts, never
+            // this chain's. (The root's own data is read only on the live-batch path below.)
+            let settlement_program = *root_pda.owner;
+            let chunk_key =
+                rome_zk_layouts::chunk::pda(program_id, &settlement_program, chain_id, batch, idx)
+                    .0;
+            if chunk_key != *pda.key {
+                return Err(ProgramError::InvalidSeeds);
+            }
             // If the batch pda is absent (never created, or `AbandonBatch`ed — both leave it owned by
             // the system program), nothing was ever posted for this batch id, so the chunk authority
             // (already verified above) may close unconditionally. Otherwise, the usual
             // finalized + final-root check applies.
-            // The batch slot must be THE batch PDA for this (chain, batch) regardless of who owns it now:
-            // a system-owned account here means "abandoned" only if it is that PDA's address. Without
-            // the address check the chunk authority could pass any system account and delete DA of a
-            // live batch.
-            {
-                let sd = batch::seeds(chain_id, batch);
-                let expected =
-                    Pubkey::find_program_address(&[&sd[0], &sd[1], &sd[2]], program_id).0;
-                if expected != *batch_pda.key {
-                    return Err(batch::BatchError::WrongBatchAccount.into());
-                }
+            // The batch slot must be THE batch PDA for this (settlement program, chain, batch) regardless of
+            // who owns it now: a system-owned account here means "abandoned" only if it is that PDA's
+            // address. Without the address check the chunk authority could pass any system account and
+            // delete DA of a live batch.
+            let batch_key =
+                rome_zk_layouts::batch::pda(program_id, &settlement_program, chain_id, batch).0;
+            if batch_key != *batch_pda.key {
+                return Err(batch::BatchError::WrongBatchAccount.into());
             }
-            if *batch_pda.owner != system_program::id() {
-                batch::close_chunk_check(program_id, chain_id, batch, batch_pda, root_pda)?;
+            if *batch_pda.owner == system_program::id() {
+                // Abandoned: nothing to read from the batch account, so the settlement program above is
+                // taken from the root account's owner and the root must be that program's own root for
+                // this chain (its address alone is checked; a root under another program cannot reach
+                // this chain's chunk, because the chunk address above is derived from that program).
+                let root_key = rome_zk_layouts::root::pda(&settlement_program, chain_id).0;
+                if root_key != *root_pda.key {
+                    return Err(ProgramError::InvalidSeeds);
+                }
+            } else {
+                batch::close_chunk_check(
+                    program_id,
+                    &settlement_program,
+                    chain_id,
+                    batch,
+                    batch_pda,
+                    root_pda,
+                )?;
             }
             let lamports = pda.lamports();
             **pda.try_borrow_mut_lamports()? = 0;
@@ -437,8 +474,11 @@ mod tests {
 
     #[test]
     fn pda_seeds_are_deterministic_and_distinct_per_idx() {
-        assert_eq!(pda_seeds(1, 2, 3), pda_seeds(1, 2, 3));
-        assert_ne!(pda_seeds(1, 2, 3), pda_seeds(1, 2, 4));
+        let sp = Pubkey::new_from_array([0x5Au8; 32]);
+        assert_eq!(pda_seeds(&sp, 1, 2, 3), pda_seeds(&sp, 1, 2, 3));
+        assert_ne!(pda_seeds(&sp, 1, 2, 3), pda_seeds(&sp, 1, 2, 4));
+        let other = Pubkey::new_from_array([0x5Bu8; 32]);
+        assert_ne!(pda_seeds(&sp, 1, 2, 3), pda_seeds(&other, 1, 2, 3));
     }
 
     /// `zk-inbox-client::find_max_batch_id`'s `getProgramAccounts` memcmp filters read `chain_id`/`batch`
@@ -488,6 +528,10 @@ mod tests {
     /// addresses for the same `(chain_id, batch, idx)`.
     #[test]
     fn pda_seeds_matches_rome_zk_layouts_chunk_seeds() {
-        assert_eq!(pda_seeds(7, 3, 2), rome_zk_layouts::chunk::seeds(7, 3, 2));
+        let sp = Pubkey::new_from_array([0x5Au8; 32]);
+        assert_eq!(
+            pda_seeds(&sp, 7, 3, 2),
+            rome_zk_layouts::chunk::seeds(&[0x5Au8; 32], 7, 3, 2)
+        );
     }
 }

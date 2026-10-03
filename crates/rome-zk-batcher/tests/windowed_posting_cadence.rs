@@ -77,10 +77,12 @@ impl FakeChain {
     /// "a crashed prior process already left this behind" shape.
     fn seed_open_not_finalized(&self, batch: u64, expected_count: u32) {
         let mut inner = self.0.lock().unwrap();
-        let (batch_pda, _) = zk_inbox_client::batch_pda(&PROGRAM, CHAIN_ID, batch);
+        let (batch_pda, _) =
+            zk_inbox_client::batch_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID, batch);
         inner.batch_pda_index.insert(batch_pda, batch);
         for idx in 0..expected_count {
-            let (chunk_pda, _) = zk_inbox_client::chunk_pda(&PROGRAM, CHAIN_ID, batch, idx);
+            let (chunk_pda, _) =
+                zk_inbox_client::chunk_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID, batch, idx);
             inner.chunk_pda_index.insert(chunk_pda, (batch, idx));
         }
         inner.batches.insert(
@@ -95,7 +97,8 @@ impl FakeChain {
     /// Seeds a pre-existing, already-finalized batch directly (nothing to sweep).
     fn seed_finalized(&self, batch: u64) {
         let mut inner = self.0.lock().unwrap();
-        let (batch_pda, _) = zk_inbox_client::batch_pda(&PROGRAM, CHAIN_ID, batch);
+        let (batch_pda, _) =
+            zk_inbox_client::batch_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID, batch);
         inner.batch_pda_index.insert(batch_pda, batch);
         inner.batches.insert(
             batch,
@@ -248,7 +251,7 @@ impl FakeChain {
 
 impl AccountOps for FakeChain {
     async fn get_account(&self, pubkey: &Pubkey) -> Result<Option<Vec<u8>>, ResolveError> {
-        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, CHAIN_ID);
+        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
         let (root_pda, _) = zk_settlement_client::root_pda(&SETTLEMENT_PROGRAM, CHAIN_ID);
         if *pubkey == cursor_pda {
             let gate = self.0.lock().unwrap().delay_cursor_read.take();
@@ -353,11 +356,17 @@ impl Sender for FakeChain {
                     expected_count,
                     ..
                 } => {
-                    let (batch_pda, _) = zk_inbox_client::batch_pda(&PROGRAM, CHAIN_ID, batch);
+                    let (batch_pda, _) =
+                        zk_inbox_client::batch_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID, batch);
                     inner.batch_pda_index.insert(batch_pda, batch);
                     for idx in 0..expected_count {
-                        let (chunk_pda, _) =
-                            zk_inbox_client::chunk_pda(&PROGRAM, CHAIN_ID, batch, idx);
+                        let (chunk_pda, _) = zk_inbox_client::chunk_pda(
+                            &PROGRAM,
+                            &SETTLEMENT_PROGRAM,
+                            CHAIN_ID,
+                            batch,
+                            idx,
+                        );
                         inner.chunk_pda_index.insert(chunk_pda, (batch, idx));
                     }
                     inner.batches.insert(

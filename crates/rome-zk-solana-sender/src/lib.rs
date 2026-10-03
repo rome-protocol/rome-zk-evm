@@ -1665,6 +1665,7 @@ mod tests {
         let payer = Keypair::new();
         let payer_legacy = compat::from_v1_pubkey(&payer.pubkey());
         let program_id = solana_program::pubkey::Pubkey::new_unique();
+        let settlement_program = solana_program::pubkey::Pubkey::new_unique();
         let chain_id = 200_101u64;
         let batch = 7u64;
         let idx = 3u32;
@@ -1676,10 +1677,19 @@ mod tests {
         let len = body.len() as u32;
         let body_hash = zk_inbox_client::chunk_body_hash(&body);
         let ixs = vec![
-            zk_inbox_client::open_chunk_ix(&program_id, &payer_legacy, chain_id, batch, idx, len),
+            zk_inbox_client::open_chunk_ix(
+                &program_id,
+                &payer_legacy,
+                &settlement_program,
+                chain_id,
+                batch,
+                idx,
+                len,
+            ),
             zk_inbox_client::write_chunk_ix(
                 &program_id,
                 &payer_legacy,
+                &settlement_program,
                 chain_id,
                 batch,
                 idx,
@@ -1689,13 +1699,14 @@ mod tests {
             zk_inbox_client::seal_chunk_ix(
                 &program_id,
                 &payer_legacy,
+                &settlement_program,
                 chain_id,
                 batch,
                 idx,
                 len,
                 body_hash,
             ),
-            zk_inbox_client::seal_leaf_ix(&program_id, chain_id, batch, idx),
+            zk_inbox_client::seal_leaf_ix(&program_id, &settlement_program, chain_id, batch, idx),
         ];
         let tx = build_tx(
             &payer,
@@ -1754,14 +1765,41 @@ mod tests {
         let payer = Keypair::new();
         let payer_legacy = compat::from_v1_pubkey(&payer.pubkey());
         let program_id = solana_program::pubkey::Pubkey::new_unique();
+        let settlement_program = solana_program::pubkey::Pubkey::new_unique();
         let body = vec![7u8; rome_zk_channel::FRAME_HEADER_LEN + 50];
         let len = body.len() as u32;
         let body_hash = zk_inbox_client::chunk_body_hash(&body);
         let ixs = vec![
-            zk_inbox_client::open_chunk_ix(&program_id, &payer_legacy, 1, 1, 0, len),
-            zk_inbox_client::write_chunk_ix(&program_id, &payer_legacy, 1, 1, 0, 0, body),
-            zk_inbox_client::seal_chunk_ix(&program_id, &payer_legacy, 1, 1, 0, len, body_hash),
-            zk_inbox_client::seal_leaf_ix(&program_id, 1, 1, 0),
+            zk_inbox_client::open_chunk_ix(
+                &program_id,
+                &payer_legacy,
+                &settlement_program,
+                1,
+                1,
+                0,
+                len,
+            ),
+            zk_inbox_client::write_chunk_ix(
+                &program_id,
+                &payer_legacy,
+                &settlement_program,
+                1,
+                1,
+                0,
+                0,
+                body,
+            ),
+            zk_inbox_client::seal_chunk_ix(
+                &program_id,
+                &payer_legacy,
+                &settlement_program,
+                1,
+                1,
+                0,
+                len,
+                body_hash,
+            ),
+            zk_inbox_client::seal_leaf_ix(&program_id, &settlement_program, 1, 1, 0),
         ];
         let tx = build_tx(
             &payer,
@@ -1909,6 +1947,7 @@ mod tests {
         let payer = Keypair::new();
         let payer_legacy = compat::from_v1_pubkey(&payer.pubkey());
         let program_id = solana_program::pubkey::Pubkey::new_unique();
+        let settlement_program = solana_program::pubkey::Pubkey::new_unique();
         let payload = vec![
             7u8;
             rome_zk_channel::FRAME_HEADER_LEN
@@ -1917,6 +1956,7 @@ mod tests {
         let ixs = rome_zk_batcher::pipeline::plan_chunk(
             &program_id,
             &payer_legacy,
+            &settlement_program,
             200_101,
             7,
             3,

@@ -122,6 +122,7 @@ fn status_str(s: &Option<TransactionConfirmationStatus>) -> &'static str {
 async fn fetch_and_decode<S: Source>(
     source: &mut S,
     program_id: &Pubkey,
+    settlement_program: &Pubkey,
     kind: ProgramKind,
     sig_info: &SignatureInfo,
 ) -> Result<(DecodedTx, bool), IngestError> {
@@ -131,7 +132,9 @@ async fn fetch_and_decode<S: Source>(
         match source.get_transaction(&sig_info.signature).await? {
             Some(tx) => {
                 let decoded = match kind {
-                    ProgramKind::Inbox => decode_inbox_tx(&tx.message, &program_id_str),
+                    ProgramKind::Inbox => {
+                        decode_inbox_tx(&tx.message, &program_id_str, settlement_program)
+                    }
                     ProgramKind::Root => decode_settlement_tx(&tx.message, &program_id_str),
                 };
                 return Ok((decoded, tx.err));
@@ -161,10 +164,15 @@ async fn fetch_and_decode<S: Source>(
 /// `last_slot` advance to the walk's own head. Call it again on a timer for the steady-state "keep up with
 /// the tip" loop; a very large backlog may take many calls' worth of RPC round trips to finish its first
 /// walk, but every batch committed along the way is durable (never re-walked from scratch after a crash).
+///
+/// `settlement_program` is the settlement program this watcher follows. For `ProgramKind::Inbox` it decides which
+/// inbox instructions belong to the chain (see `decode::decode_inbox_tx`); for `ProgramKind::Root` it is the same
+/// program as `program_id`.
 pub async fn run_once<S: Source>(
     pool: &PgPool,
     source: &mut S,
     program_id: &Pubkey,
+    settlement_program: &Pubkey,
     kind: ProgramKind,
     cfg: WatcherConfig,
 ) -> Result<PageOutcome, IngestError> {
@@ -249,7 +257,8 @@ pub async fn run_once<S: Source>(
                     Vec::with_capacity(chunk.len());
                 for sig_info in chunk {
                     let (decoded, tx_err) =
-                        fetch_and_decode(source, program_id, kind, sig_info).await?;
+                        fetch_and_decode(source, program_id, settlement_program, kind, sig_info)
+                            .await?;
                     rows.push((sig_info.clone(), decoded, tx_err));
                 }
                 let last = chunk.last().expect("chunk is non-empty");

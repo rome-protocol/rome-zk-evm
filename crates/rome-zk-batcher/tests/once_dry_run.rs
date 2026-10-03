@@ -197,6 +197,7 @@ async fn post_group_real(
     let batch = match resolve::resolve_batch_id(
         accounts,
         &program_id,
+        &settlement_program,
         chain_id,
         &compressed,
         rome_zk_batcher::channel::DEFAULT_MAX_FRAME_BODY_LEN,
@@ -229,6 +230,7 @@ async fn post_group_real(
 
     let target = BatchTarget {
         program_id,
+        settlement_program,
         payer: payer_kp.pubkey(),
         chain_id,
         batch,
@@ -242,11 +244,18 @@ async fn post_group_real(
         }
     }
 
-    let finalize_ix =
-        zk_inbox_client::finalize_batch_ix(&program_id, &payer_kp.pubkey(), chain_id, batch, 0);
+    let finalize_ix = zk_inbox_client::finalize_batch_ix(
+        &program_id,
+        &payer_kp.pubkey(),
+        &settlement_program,
+        chain_id,
+        batch,
+        0,
+    );
     send(ctx, &[finalize_ix], payer_kp).await.unwrap();
 
-    let (batch_pda, _) = zk_inbox_client::batch_pda(&program_id, chain_id, batch);
+    let (batch_pda, _) =
+        zk_inbox_client::batch_pda(&program_id, &settlement_program, chain_id, batch);
     let account = ctx
         .banks_client
         .get_account(batch_pda)
@@ -292,7 +301,7 @@ async fn once_cap_posts_three_blocks_as_two_batches_of_two_and_one() {
         root_account_with_authority(CHAIN_ID, &payer_kp.pubkey(), settlement_program),
     );
     pt.add_account(
-        zk_inbox_client::cursor_pda(&program_id, CHAIN_ID).0,
+        zk_inbox_client::cursor_pda(&program_id, &settlement_program, CHAIN_ID).0,
         cursor_account(program_id, CHAIN_ID, 0),
     );
     let mut ctx = pt.start_with_context().await;
@@ -342,9 +351,10 @@ async fn once_cap_posts_three_blocks_as_two_batches_of_two_and_one() {
 
     // This run's own expected_next_batch, read once, right where the binary reads it
     // (after the startup abandon — nothing to abandon on a fresh chain).
-    let mut expected_next_batch = resolve::read_cursor_next_batch(&accounts, &program_id, CHAIN_ID)
-        .await
-        .unwrap();
+    let mut expected_next_batch =
+        resolve::read_cursor_next_batch(&accounts, &program_id, &settlement_program, CHAIN_ID)
+            .await
+            .unwrap();
     assert_eq!(expected_next_batch, 0);
 
     for (expected_batch, group) in groups.iter().enumerate() {
@@ -371,7 +381,7 @@ async fn once_cap_posts_three_blocks_as_two_batches_of_two_and_one() {
 
     // Both groups' worth of blocks (3 total) are accounted for across exactly 2 batch ids — nothing was
     // silently merged into one oversized batch, and nothing was dropped.
-    let (cursor_pda, _) = zk_inbox_client::cursor_pda(&program_id, CHAIN_ID);
+    let (cursor_pda, _) = zk_inbox_client::cursor_pda(&program_id, &settlement_program, CHAIN_ID);
     let cursor_data = ctx
         .banks_client
         .get_account(cursor_pda)
@@ -511,7 +521,7 @@ async fn once_dry_run_reads_a_real_log_preflights_opens_sends_finalizes_and_veri
         root_account_with_authority(CHAIN_ID, &payer_kp.pubkey(), settlement_program),
     );
     pt.add_account(
-        zk_inbox_client::cursor_pda(&program_id, CHAIN_ID).0,
+        zk_inbox_client::cursor_pda(&program_id, &settlement_program, CHAIN_ID).0,
         cursor_account(program_id, CHAIN_ID, 0),
     );
     let mut ctx = pt.start_with_context().await;
@@ -565,7 +575,8 @@ async fn once_dry_run_reads_a_real_log_preflights_opens_sends_finalizes_and_veri
 
     // --- step 3: resume — batch 0 has never been opened, so the decision is PostFresh ---
     let batch = 0u64;
-    let (batch_pda, _) = zk_inbox_client::batch_pda(&program_id, CHAIN_ID, batch);
+    let (batch_pda, _) =
+        zk_inbox_client::batch_pda(&program_id, &settlement_program, CHAIN_ID, batch);
     assert!(
         ctx.banks_client
             .get_account(batch_pda)
@@ -604,6 +615,7 @@ async fn once_dry_run_reads_a_real_log_preflights_opens_sends_finalizes_and_veri
     // batched sender submits — driven here via BanksClient) ---
     let target = BatchTarget {
         program_id,
+        settlement_program,
         payer: payer_kp.pubkey(),
         chain_id: CHAIN_ID,
         batch,
@@ -622,8 +634,14 @@ async fn once_dry_run_reads_a_real_log_preflights_opens_sends_finalizes_and_veri
     }
 
     // --- step 6: FinalizeBatch, then verify acc against the client-side reference ---
-    let finalize_ix =
-        zk_inbox_client::finalize_batch_ix(&program_id, &payer_kp.pubkey(), CHAIN_ID, batch, 0);
+    let finalize_ix = zk_inbox_client::finalize_batch_ix(
+        &program_id,
+        &payer_kp.pubkey(),
+        &settlement_program,
+        CHAIN_ID,
+        batch,
+        0,
+    );
     send(&mut ctx, &[finalize_ix], &payer_kp).await.unwrap();
 
     let account = ctx
@@ -642,7 +660,8 @@ async fn once_dry_run_reads_a_real_log_preflights_opens_sends_finalizes_and_veri
 
     // Batch id 1 (not yet opened) must independently read back as Missing/PostFresh — the next `--once`
     // run's resume scan would land here.
-    let (next_batch_pda, _) = zk_inbox_client::batch_pda(&program_id, CHAIN_ID, batch + 1);
+    let (next_batch_pda, _) =
+        zk_inbox_client::batch_pda(&program_id, &settlement_program, CHAIN_ID, batch + 1);
     assert!(ctx
         .banks_client
         .get_account(next_batch_pda)

@@ -561,7 +561,7 @@ mod tests {
         (input_len.div_ceil(MAX_FRAME_BODY_LEN)).max(1) as u32
     }
 
-    fn encode_inbox_batch_account(finalized: bool) -> Vec<u8> {
+    fn encode_inbox_batch_account(finalized: bool, settlement_program: Pubkey) -> Vec<u8> {
         let acc: [u8; 32] = hex::decode(GATE_ACC_HEX).unwrap().try_into().unwrap();
         rome_zk_layouts::batch::write_header(&rome_zk_layouts::batch::BatchFields {
             chain_id: GATE_CHAIN_ID,
@@ -570,7 +570,7 @@ mod tests {
             expected_count: gate_expected_chunk_count(),
             leaves_present: gate_expected_chunk_count(),
             finalized,
-            settlement_program: [0u8; 32],
+            settlement_program: settlement_program.to_bytes(),
             authority: [0u8; 32],
             root: [0u8; 32],
             forced_root: [0u8; 32],
@@ -724,11 +724,16 @@ mod tests {
                     rent_epoch: 0,
                 },
             );
-            let (cursor_pda, _) = zk_inbox_client::cursor_pda(&inbox_program, GATE_CHAIN_ID);
+            let (cursor_pda, _) =
+                zk_inbox_client::cursor_pda(&inbox_program, &settlement_program, GATE_CHAIN_ID);
             pt.add_account(cursor_pda, cursor_account(inbox_program, GATE_CHAIN_ID, 2));
-            let inbox_batch_pda =
-                zk_settlement_client::inbox_batch_pda(&inbox_program, GATE_CHAIN_ID, 1);
-            let acc_data = encode_inbox_batch_account(true);
+            let inbox_batch_pda = zk_settlement_client::inbox_batch_pda(
+                &inbox_program,
+                &settlement_program,
+                GATE_CHAIN_ID,
+                1,
+            );
+            let acc_data = encode_inbox_batch_account(true, settlement_program);
             pt.add_account(
                 inbox_batch_pda,
                 solana_sdk::account::Account {
@@ -777,11 +782,19 @@ mod tests {
                 zk_settlement_client::registry_pda(&self.settlement_program, GATE_CHAIN_ID);
             let (cc_pda, _) =
                 zk_settlement_client::chain_config_pda(&self.settlement_program, GATE_CHAIN_ID);
-            let (cursor_pda, _) = zk_inbox_client::cursor_pda(&self.inbox_program, GATE_CHAIN_ID);
+            let (cursor_pda, _) = zk_inbox_client::cursor_pda(
+                &self.inbox_program,
+                &self.settlement_program,
+                GATE_CHAIN_ID,
+            );
             let (pred_pda, _) =
                 zk_settlement_client::pending_pda(&self.settlement_program, GATE_CHAIN_ID, 0);
-            let inbox_batch_pda =
-                zk_settlement_client::inbox_batch_pda(&self.inbox_program, GATE_CHAIN_ID, 1);
+            let inbox_batch_pda = zk_settlement_client::inbox_batch_pda(
+                &self.inbox_program,
+                &self.settlement_program,
+                GATE_CHAIN_ID,
+                1,
+            );
             let (global_pda, _) = zk_settlement_client::global_config_pda(&self.settlement_program);
             let programdata_pda = zk_settlement_client::program_data_pda(&self.settlement_program);
             let keys = [
@@ -1100,8 +1113,12 @@ mod tests {
         let cd = from_zisk_proof_file(&gate_proof_bytes()).expect("decode gate proof");
         let checked = check_against_record(&cd, &vkey).expect("checks clean");
 
-        let inbox_batch_pda =
-            zk_settlement_client::inbox_batch_pda(&rig.inbox_program, GATE_CHAIN_ID, 1);
+        let inbox_batch_pda = zk_settlement_client::inbox_batch_pda(
+            &rig.inbox_program,
+            &rig.settlement_program,
+            GATE_CHAIN_ID,
+            1,
+        );
         let mut acc = rig
             .ctx
             .banks_client
@@ -1153,8 +1170,12 @@ mod tests {
         let cd = from_zisk_proof_file(&gate_proof_bytes()).expect("decode gate proof");
         let checked = check_against_record(&cd, &vkey).expect("checks clean");
 
-        let inbox_batch_pda =
-            zk_settlement_client::inbox_batch_pda(&rig.inbox_program, GATE_CHAIN_ID, 1);
+        let inbox_batch_pda = zk_settlement_client::inbox_batch_pda(
+            &rig.inbox_program,
+            &rig.settlement_program,
+            GATE_CHAIN_ID,
+            1,
+        );
         let mut acc = rig
             .ctx
             .banks_client

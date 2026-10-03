@@ -194,6 +194,7 @@ async fn watcher_decodes_prove_and_consume_exit_by_name() {
         &pg.pool,
         &mut source,
         &settlement_program,
+        &settlement_program,
         ProgramKind::Root,
         WatcherConfig::default(),
     )
@@ -231,6 +232,7 @@ async fn exit_row_lifecycle_proved_then_released() {
     run_once(
         &pg.pool,
         &mut source,
+        &settlement_program,
         &settlement_program,
         ProgramKind::Root,
         WatcherConfig::default(),

@@ -1,4 +1,4 @@
-//! The zk-inbox chunk account layout ("ZKIB", PDA `["inbox", chain_id, batch, idx]` under
+//! The zk-inbox chunk account layout ("ZKIB", PDA `["inbox", settlement_program, chain_id, batch, idx]` under
 //! the inbox program). One PDA per chunk of the compressed channel stream a batch carries as DA.
 //!
 //! ```text
@@ -70,11 +70,13 @@ pub fn write_header(f: &ChunkHeaderFields) -> [u8; HEADER_LEN] {
     d
 }
 
-/// `["inbox", chain_id, batch, idx]`.
+/// `["inbox", settlement_program, chain_id, batch, idx]`. The settlement program is part of the key so a
+/// chain's chunk accounts can only be created through its own settlement program.
 #[inline]
-pub fn seeds(chain_id: u64, batch: u64, idx: u32) -> [Vec<u8>; 4] {
+pub fn seeds(settlement_program: &[u8; 32], chain_id: u64, batch: u64, idx: u32) -> [Vec<u8>; 5] {
     [
         b"inbox".to_vec(),
+        settlement_program.to_vec(),
         chain_id.to_le_bytes().to_vec(),
         batch.to_le_bytes().to_vec(),
         idx.to_le_bytes().to_vec(),
@@ -87,12 +89,16 @@ pub fn seeds(chain_id: u64, batch: u64, idx: u32) -> [Vec<u8>; 4] {
 #[inline]
 pub fn pda(
     program_id: &solana_program::pubkey::Pubkey,
+    settlement_program: &solana_program::pubkey::Pubkey,
     chain_id: u64,
     batch: u64,
     idx: u32,
 ) -> (solana_program::pubkey::Pubkey, u8) {
-    let s = seeds(chain_id, batch, idx);
-    solana_program::pubkey::Pubkey::find_program_address(&[&s[0], &s[1], &s[2], &s[3]], program_id)
+    let s = seeds(&settlement_program.to_bytes(), chain_id, batch, idx);
+    solana_program::pubkey::Pubkey::find_program_address(
+        &[&s[0], &s[1], &s[2], &s[3], &s[4]],
+        program_id,
+    )
 }
 
 #[cfg(test)]
@@ -101,22 +107,27 @@ mod tests {
 
     #[test]
     fn seeds_golden_bytes_for_fixed_inputs() {
-        let s = seeds(0x0102_0304_0506_0708, 9, 3);
+        let s = seeds(&[0x5Au8; 32], 0x0102_0304_0506_0708, 9, 3);
         assert_eq!(s[0], b"inbox".to_vec());
-        assert_eq!(s[1], vec![0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
-        assert_eq!(s[2], vec![9, 0, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(s[3], vec![3, 0, 0, 0]);
+        assert_eq!(s[1], vec![0x5Au8; 32]);
+        assert_eq!(s[2], vec![0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
+        assert_eq!(s[3], vec![9, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(s[4], vec![3, 0, 0, 0]);
     }
 
     #[cfg(feature = "solana")]
     #[test]
     fn pda_is_deterministic_and_varies_with_idx() {
         let program = solana_program::pubkey::Pubkey::new_unique();
-        let (a1, _) = pda(&program, 7, 1, 0);
-        let (a2, _) = pda(&program, 7, 1, 0);
+        let settlement = solana_program::pubkey::Pubkey::new_unique();
+        let other_settlement = solana_program::pubkey::Pubkey::new_unique();
+        let (a1, _) = pda(&program, &settlement, 7, 1, 0);
+        let (a2, _) = pda(&program, &settlement, 7, 1, 0);
         assert_eq!(a1, a2);
-        let (b, _) = pda(&program, 7, 1, 1);
+        let (b, _) = pda(&program, &settlement, 7, 1, 1);
         assert_ne!(a1, b);
+        let (c, _) = pda(&program, &other_settlement, 7, 1, 0);
+        assert_ne!(a1, c);
     }
 
     /// Byte-golden test (contract): a **literal** 64-byte vector (every byte position written as a

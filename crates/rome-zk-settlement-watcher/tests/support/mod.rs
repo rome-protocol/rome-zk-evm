@@ -157,6 +157,61 @@ struct FixtureFile {
     settlement_records: Vec<FixtureRecord>,
 }
 
+impl FixtureFile {
+    /// The fixture is a real capture from before inbox accounts were keyed by the settlement program, so its chunk
+    /// accounts sit at the old chain-id-only addresses. The watcher accepts a chunk `Open` only at the
+    /// settlement-keyed address, so every old chunk address that an `Open` created is rewritten, in every
+    /// transaction that mentions it, to the address the same `(chain, batch, idx)` has under the fixture's
+    /// settlement program. Nothing else about the capture changes.
+    fn rekey_chunk_accounts(&mut self) {
+        use std::collections::HashMap;
+        let inbox: Pubkey = self.inbox_program.parse().expect("valid pubkey");
+        let settlement: Pubkey = self.settlement_program.parse().expect("valid pubkey");
+        let mut rekey: HashMap<String, String> = HashMap::new();
+        for record in &self.inbox_records {
+            let Some(message) = &record.message else {
+                continue;
+            };
+            for ins in &message.instructions {
+                if message.account_keys.get(ins.program_id_index as usize)
+                    != Some(&inbox.to_string())
+                {
+                    continue;
+                }
+                let Ok(raw) = bs58::decode(&ins.data).into_vec() else {
+                    continue;
+                };
+                if let Ok(zk_inbox_client::InboxIx::Open {
+                    chain_id,
+                    batch,
+                    idx,
+                    ..
+                }) = zk_inbox_client::decode_instruction(&raw)
+                {
+                    let old = ins
+                        .accounts
+                        .get(1)
+                        .and_then(|&i| message.account_keys.get(i as usize));
+                    if let Some(old) = old {
+                        let new =
+                            zk_inbox_client::chunk_pda(&inbox, &settlement, chain_id, batch, idx).0;
+                        rekey.insert(old.clone(), new.to_string());
+                    }
+                }
+            }
+        }
+        for record in &mut self.inbox_records {
+            if let Some(message) = &mut record.message {
+                for key in &mut message.account_keys {
+                    if let Some(new) = rekey.get(key) {
+                        *key = new.clone();
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Replays `fixtures/settlement-watcher/tiber-devnet-batches-4003-4005.json` behind the exact same
 /// [`Source`] contract `RpcSource` implements. Records are stored oldest-first (ascending slot, matching
 /// how they were captured); `get_signatures_for_address` reverses that to the real RPC's newest-first
@@ -177,8 +232,9 @@ impl FixtureSource {
     pub fn load() -> Self {
         let raw = std::fs::read_to_string(FIXTURE_PATH)
             .unwrap_or_else(|e| panic!("read {FIXTURE_PATH}: {e}"));
-        let file: FixtureFile =
+        let mut file: FixtureFile =
             serde_json::from_str(&raw).expect("fixture JSON must parse into FixtureFile");
+        file.rekey_chunk_accounts();
         Self {
             inbox_program: file.inbox_program,
             settlement_program: file.settlement_program,

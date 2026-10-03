@@ -50,14 +50,27 @@ pub fn batch_account_index(ix: &InboxIx) -> Option<usize> {
     }
 }
 
-/// `["inbox", chain_id, batch, idx]` — the single definition is `rome_zk_layouts::chunk::pda`.
-pub fn chunk_pda(program_id: &Pubkey, chain_id: u64, batch: u64, idx: u32) -> (Pubkey, u8) {
-    rome_zk_layouts::chunk::pda(program_id, chain_id, batch, idx)
+/// `["inbox", settlement_program, chain_id, batch, idx]` — the single definition is
+/// `rome_zk_layouts::chunk::pda`.
+pub fn chunk_pda(
+    program_id: &Pubkey,
+    settlement_program: &Pubkey,
+    chain_id: u64,
+    batch: u64,
+    idx: u32,
+) -> (Pubkey, u8) {
+    rome_zk_layouts::chunk::pda(program_id, settlement_program, chain_id, batch, idx)
 }
 
-/// `["batch", chain_id, batch]` — the single definition is `rome_zk_layouts::batch::pda`.
-pub fn batch_pda(program_id: &Pubkey, chain_id: u64, batch: u64) -> (Pubkey, u8) {
-    rome_zk_layouts::batch::pda(program_id, chain_id, batch)
+/// `["batch", settlement_program, chain_id, batch]` — the single definition is
+/// `rome_zk_layouts::batch::pda`.
+pub fn batch_pda(
+    program_id: &Pubkey,
+    settlement_program: &Pubkey,
+    chain_id: u64,
+    batch: u64,
+) -> (Pubkey, u8) {
+    rome_zk_layouts::batch::pda(program_id, settlement_program, chain_id, batch)
 }
 
 /// `["root", chain_id]` under `settlement_program` (zk-settlement's derivation) — the single definition is
@@ -66,9 +79,10 @@ pub fn root_pda(settlement_program: &Pubkey, chain_id: u64) -> (Pubkey, u8) {
     rome_zk_layouts::root::pda(settlement_program, chain_id)
 }
 
-/// `["batch_cursor", chain_id]` — the single definition is `rome_zk_layouts::cursor::pda`.
-pub fn cursor_pda(program_id: &Pubkey, chain_id: u64) -> (Pubkey, u8) {
-    rome_zk_layouts::cursor::pda(program_id, chain_id)
+/// `["batch_cursor", settlement_program, chain_id]` — the single definition is
+/// `rome_zk_layouts::cursor::pda`.
+pub fn cursor_pda(program_id: &Pubkey, settlement_program: &Pubkey, chain_id: u64) -> (Pubkey, u8) {
+    rome_zk_layouts::cursor::pda(program_id, settlement_program, chain_id)
 }
 
 /// The runtime's per-top-level-instruction realloc allowance for a new/growing account
@@ -93,13 +107,14 @@ fn ix(
 pub fn open_chunk_ix(
     program_id: &Pubkey,
     payer: &Pubkey,
+    settlement_program: &Pubkey,
     chain_id: u64,
     batch: u64,
     idx: u32,
     size: u32,
 ) -> solana_program::instruction::Instruction {
-    let (pda, _) = chunk_pda(program_id, chain_id, batch, idx);
-    let (batch_acct, _) = batch_pda(program_id, chain_id, batch);
+    let (pda, _) = chunk_pda(program_id, settlement_program, chain_id, batch, idx);
+    let (batch_acct, _) = batch_pda(program_id, settlement_program, chain_id, batch);
     ix(
         program_id,
         vec![
@@ -117,16 +132,18 @@ pub fn open_chunk_ix(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn write_chunk_ix(
     program_id: &Pubkey,
     authority: &Pubkey,
+    settlement_program: &Pubkey,
     chain_id: u64,
     batch: u64,
     idx: u32,
     offset: u32,
     data: Vec<u8>,
 ) -> solana_program::instruction::Instruction {
-    let (pda, _) = chunk_pda(program_id, chain_id, batch, idx);
+    let (pda, _) = chunk_pda(program_id, settlement_program, chain_id, batch, idx);
     ix(
         program_id,
         vec![
@@ -140,16 +157,18 @@ pub fn write_chunk_ix(
 /// `body_hash` must be `keccak256(body[..len])` for the exact bytes the caller wrote — compute it with
 /// [`chunk_body_hash`] from the same buffer passed to `write_chunk_ix`. The program recomputes this hash
 /// from the account's own bytes and rejects the seal if it doesn't match.
+#[allow(clippy::too_many_arguments)]
 pub fn seal_chunk_ix(
     program_id: &Pubkey,
     authority: &Pubkey,
+    settlement_program: &Pubkey,
     chain_id: u64,
     batch: u64,
     idx: u32,
     len: u32,
     body_hash: [u8; 32],
 ) -> solana_program::instruction::Instruction {
-    let (pda, _) = chunk_pda(program_id, chain_id, batch, idx);
+    let (pda, _) = chunk_pda(program_id, settlement_program, chain_id, batch, idx);
     ix(
         program_id,
         vec![
@@ -177,8 +196,8 @@ pub fn close_chunk_ix(
     batch: u64,
     idx: u32,
 ) -> solana_program::instruction::Instruction {
-    let (chunk, _) = chunk_pda(program_id, chain_id, batch, idx);
-    let (batch_acct, _) = batch_pda(program_id, chain_id, batch);
+    let (chunk, _) = chunk_pda(program_id, settlement_program, chain_id, batch, idx);
+    let (batch_acct, _) = batch_pda(program_id, settlement_program, chain_id, batch);
     let (root, _) = root_pda(settlement_program, chain_id);
     ix(
         program_id,
@@ -204,9 +223,9 @@ pub fn open_batch_ix(
     expected_count: u32,
     settlement_program: &Pubkey,
 ) -> solana_program::instruction::Instruction {
-    let (pda, _) = batch_pda(program_id, chain_id, batch);
+    let (pda, _) = batch_pda(program_id, settlement_program, chain_id, batch);
     let (root, _) = root_pda(settlement_program, chain_id);
-    let (cursor, _) = cursor_pda(program_id, chain_id);
+    let (cursor, _) = cursor_pda(program_id, settlement_program, chain_id);
     ix(
         program_id,
         vec![
@@ -231,10 +250,11 @@ pub fn open_batch_ix(
 pub fn grow_batch_ix(
     program_id: &Pubkey,
     payer: &Pubkey,
+    settlement_program: &Pubkey,
     chain_id: u64,
     batch: u64,
 ) -> solana_program::instruction::Instruction {
-    let (pda, _) = batch_pda(program_id, chain_id, batch);
+    let (pda, _) = batch_pda(program_id, settlement_program, chain_id, batch);
     ix(
         program_id,
         vec![
@@ -270,7 +290,13 @@ pub fn open_and_grow_batch_ixs(
         settlement_program,
     )];
     while current < target {
-        ixs.push(grow_batch_ix(program_id, payer, chain_id, batch));
+        ixs.push(grow_batch_ix(
+            program_id,
+            payer,
+            settlement_program,
+            chain_id,
+            batch,
+        ));
         current = current
             .saturating_add(MAX_PERMITTED_DATA_INCREASE)
             .min(target);
@@ -280,8 +306,10 @@ pub fn open_and_grow_batch_ixs(
 
 /// Authority-gated (same check `OpenBatch` uses) bootstrap of the per-chain `batch_cursor` PDA at
 /// `next_batch` — fails if the cursor already exists. Run once per chain;
-/// on a chain with prior batch history it must be initialised above every batch id ever opened there
-/// (see `examples/find_max_batch_id.rs` for a scanner that finds that ceiling).
+/// on a chain with prior batch history it must be initialised at `root.head_pending_batch + 1` — the id
+/// settlement will accept next — and never above it (a cursor above that id halts the chain: settlement's
+/// `PostRoot` wants exactly `head_pending_batch + 1`). `examples/find_max_batch_id.rs` reads the root and
+/// proposes that value (see [`cursor_proposal`]).
 pub fn init_batch_cursor_ix(
     program_id: &Pubkey,
     payer: &Pubkey,
@@ -289,7 +317,7 @@ pub fn init_batch_cursor_ix(
     next_batch: u64,
     settlement_program: &Pubkey,
 ) -> solana_program::instruction::Instruction {
-    let (cursor, _) = cursor_pda(program_id, chain_id);
+    let (cursor, _) = cursor_pda(program_id, settlement_program, chain_id);
     let (root, _) = root_pda(settlement_program, chain_id);
     ix(
         program_id,
@@ -310,12 +338,13 @@ pub fn init_batch_cursor_ix(
 /// Permissionless: the leaf hash is recomputed on-chain from the chunk's own sealed bytes.
 pub fn seal_leaf_ix(
     program_id: &Pubkey,
+    settlement_program: &Pubkey,
     chain_id: u64,
     batch: u64,
     idx: u32,
 ) -> solana_program::instruction::Instruction {
-    let (batch_acct, _) = batch_pda(program_id, chain_id, batch);
-    let (chunk, _) = chunk_pda(program_id, chain_id, batch, idx);
+    let (batch_acct, _) = batch_pda(program_id, settlement_program, chain_id, batch);
+    let (chunk, _) = chunk_pda(program_id, settlement_program, chain_id, batch, idx);
     ix(
         program_id,
         vec![
@@ -333,11 +362,12 @@ pub fn seal_leaf_ix(
 pub fn finalize_batch_ix(
     program_id: &Pubkey,
     authority: &Pubkey,
+    settlement_program: &Pubkey,
     chain_id: u64,
     batch: u64,
     step: u32,
 ) -> solana_program::instruction::Instruction {
-    let (batch_acct, _) = batch_pda(program_id, chain_id, batch);
+    let (batch_acct, _) = batch_pda(program_id, settlement_program, chain_id, batch);
     ix(
         program_id,
         vec![
@@ -355,7 +385,7 @@ pub fn close_batch_ix(
     chain_id: u64,
     batch: u64,
 ) -> solana_program::instruction::Instruction {
-    let (batch_acct, _) = batch_pda(program_id, chain_id, batch);
+    let (batch_acct, _) = batch_pda(program_id, settlement_program, chain_id, batch);
     let (root, _) = root_pda(settlement_program, chain_id);
     ix(
         program_id,
@@ -373,10 +403,11 @@ pub fn close_batch_ix(
 pub fn abandon_batch_ix(
     program_id: &Pubkey,
     authority: &Pubkey,
+    settlement_program: &Pubkey,
     chain_id: u64,
     batch: u64,
 ) -> solana_program::instruction::Instruction {
-    let (batch_acct, _) = batch_pda(program_id, chain_id, batch);
+    let (batch_acct, _) = batch_pda(program_id, settlement_program, chain_id, batch);
     ix(
         program_id,
         vec![
@@ -508,6 +539,125 @@ pub fn decode_batch_cursor(d: &[u8]) -> Result<BatchCursor, DecodeError> {
         chain_id: f.chain_id,
         next_batch: f.next_batch,
     })
+}
+
+/// The `InitBatchCursor` value `examples/find_max_batch_id.rs` proposes. Settlement accepts only
+/// `head_pending_batch + 1` as the next batch, so that is the whole answer; a scan of inbox accounts by chain id
+/// is never an input to it, because anyone can create inbox accounts for any chain id under their own settlement
+/// program, and a huge planted id would otherwise carry the cursor past the id settlement waits for.
+pub mod cursor_proposal {
+    /// The batch id of a batch account that belongs to `chain_id` under `settlement_program`: the account sits at
+    /// the settlement-keyed `batch_pda` address AND records that settlement program. Anything else (another
+    /// settlement program's batch for the same chain id) yields `None`.
+    pub fn settlement_keyed_batch_id(
+        inbox_program: &solana_program::pubkey::Pubkey,
+        settlement_program: &solana_program::pubkey::Pubkey,
+        chain_id: u64,
+        address: &solana_program::pubkey::Pubkey,
+        data: &[u8],
+    ) -> Option<u64> {
+        let f = rome_zk_layouts::batch::read(data).ok()?;
+        if f.chain_id != chain_id || f.settlement_program != settlement_program.to_bytes() {
+            return None;
+        }
+        let (expected, _) = super::batch_pda(inbox_program, settlement_program, chain_id, f.batch);
+        (expected == *address).then_some(f.batch)
+    }
+
+    /// `root.head_pending_batch + 1`, or an error naming the problem when a batch of this chain under THIS
+    /// settlement program already exists at that id or above (a cursor there would let `OpenBatch` collide with
+    /// it). `settlement_keyed_ids` are the ids `settlement_keyed_batch_id` accepted; foreign accounts never reach
+    /// this function.
+    pub fn propose_next_batch(
+        head_pending_batch: u64,
+        settlement_keyed_ids: &[u64],
+    ) -> Result<u64, String> {
+        let next = head_pending_batch
+            .checked_add(1)
+            .ok_or_else(|| "head_pending_batch is u64::MAX".to_string())?;
+        if let Some(h) = settlement_keyed_ids
+            .iter()
+            .copied()
+            .filter(|b| *b >= next)
+            .max()
+        {
+            return Err(format!(
+                "a batch account for this chain under this settlement program already exists at id {h}, \
+                 at or above head_pending_batch + 1 = {next}; the cursor cannot be initialised at {next} \
+                 without OpenBatch colliding with it. Inspect that account before going further"
+            ));
+        }
+        Ok(next)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use solana_program::pubkey::Pubkey;
+
+        fn batch_account(chain_id: u64, batch: u64, settlement: &Pubkey) -> Vec<u8> {
+            use rome_zk_layouts::batch as b;
+            let mut d = vec![0u8; b::account_len(0)];
+            d[b::OFF_MAGIC..b::OFF_MAGIC + 4].copy_from_slice(&b::MAGIC.to_le_bytes());
+            d[b::OFF_VERSION] = b::VERSION;
+            d[b::OFF_CHAIN_ID..b::OFF_CHAIN_ID + 8].copy_from_slice(&chain_id.to_le_bytes());
+            d[b::OFF_BATCH..b::OFF_BATCH + 8].copy_from_slice(&batch.to_le_bytes());
+            d[b::OFF_SETTLEMENT_PROGRAM..b::OFF_SETTLEMENT_PROGRAM + 32]
+                .copy_from_slice(&settlement.to_bytes());
+            d
+        }
+
+        #[test]
+        fn the_proposal_is_one_past_the_settlement_head() {
+            assert_eq!(propose_next_batch(0, &[]), Ok(1));
+            assert_eq!(propose_next_batch(7, &[3, 7]), Ok(8));
+        }
+
+        /// A third party opens a batch with a huge id for the same chain id under its own settlement program. The
+        /// account is a valid batch account at its own (foreign-keyed) address; it must not count, and the
+        /// proposal stays at head_pending_batch + 1.
+        #[test]
+        fn a_planted_foreign_batch_id_does_not_raise_the_proposed_cursor() {
+            let inbox = Pubkey::new_unique();
+            let ours = Pubkey::new_unique();
+            let theirs = Pubkey::new_unique();
+            let chain = 200_101u64;
+            let planted_id = u64::MAX / 2;
+
+            let (foreign_addr, _) = super::super::batch_pda(&inbox, &theirs, chain, planted_id);
+            let foreign = batch_account(chain, planted_id, &theirs);
+            // Wrong settlement program recorded, and wrong address for ours either way.
+            assert_eq!(
+                settlement_keyed_batch_id(&inbox, &ours, chain, &foreign_addr, &foreign),
+                None
+            );
+            // The same bytes copied to our address still record the foreign program: refused.
+            let (our_addr, _) = super::super::batch_pda(&inbox, &ours, chain, planted_id);
+            assert_eq!(
+                settlement_keyed_batch_id(&inbox, &ours, chain, &our_addr, &foreign),
+                None
+            );
+
+            let kept: Vec<u64> = [(foreign_addr, foreign)]
+                .iter()
+                .filter_map(|(a, d)| settlement_keyed_batch_id(&inbox, &ours, chain, a, d))
+                .collect();
+            assert_eq!(propose_next_batch(0, &kept), Ok(1));
+        }
+
+        #[test]
+        fn our_own_batch_at_its_own_address_counts() {
+            let inbox = Pubkey::new_unique();
+            let ours = Pubkey::new_unique();
+            let (addr, _) = super::super::batch_pda(&inbox, &ours, 5, 9);
+            let d = batch_account(5, 9, &ours);
+            assert_eq!(
+                settlement_keyed_batch_id(&inbox, &ours, 5, &addr, &d),
+                Some(9)
+            );
+            assert!(propose_next_batch(3, &[9]).is_err());
+        }
+    }
 }
 
 /// `getProgramAccounts` memcmp-filter helpers for `examples/find_max_batch_id.rs`: the earlier id-by-id scan only
@@ -780,6 +930,7 @@ mod tests {
         let ix = seal_chunk_ix(
             &Pubkey::new_unique(),
             &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
             200_101,
             4005,
             17,
@@ -804,11 +955,23 @@ mod tests {
     #[test]
     fn pda_derivations_use_the_documented_seeds() {
         let program_id = Pubkey::new_unique();
-        let (a, _) = chunk_pda(&program_id, 7, 3, 1);
-        let (b, _) = chunk_pda(&program_id, 7, 3, 1);
+        let settlement_program = Pubkey::new_unique();
+        let (a, _) = chunk_pda(&program_id, &settlement_program, 7, 3, 1);
+        let (b, _) = chunk_pda(&program_id, &settlement_program, 7, 3, 1);
         assert_eq!(a, b, "PDA derivation must be deterministic");
-        let (batch_a, _) = batch_pda(&program_id, 7, 3);
+        let (batch_a, _) = batch_pda(&program_id, &settlement_program, 7, 3);
         assert_ne!(a, batch_a, "chunk and batch PDAs must not collide");
+        let other_settlement = Pubkey::new_unique();
+        assert_ne!(
+            a,
+            chunk_pda(&program_id, &other_settlement, 7, 3, 1).0,
+            "the same chunk under another settlement program is a different account"
+        );
+        assert_ne!(
+            batch_a,
+            batch_pda(&program_id, &other_settlement, 7, 3).0,
+            "the same batch under another settlement program is a different account"
+        );
     }
 
     #[test]
@@ -862,20 +1025,38 @@ mod tests {
         let settlement_program = Pubkey::new_unique();
         let payer = Pubkey::new_unique();
         let authority = Pubkey::new_unique();
-        let (chunk, _) = chunk_pda(&program_id, 7, 3, 1);
-        let (batch_acct, _) = batch_pda(&program_id, 7, 3);
+        let (chunk, _) = chunk_pda(&program_id, &settlement_program, 7, 3, 1);
+        let (batch_acct, _) = batch_pda(&program_id, &settlement_program, 7, 3);
 
         let cases: Vec<solana_program::instruction::Instruction> = vec![
-            open_chunk_ix(&program_id, &payer, 7, 3, 1, 100),
-            write_chunk_ix(&program_id, &authority, 7, 3, 1, 0, vec![1, 2, 3]),
-            seal_chunk_ix(&program_id, &authority, 7, 3, 1, 100, [9u8; 32]),
+            open_chunk_ix(&program_id, &payer, &settlement_program, 7, 3, 1, 100),
+            write_chunk_ix(
+                &program_id,
+                &authority,
+                &settlement_program,
+                7,
+                3,
+                1,
+                0,
+                vec![1, 2, 3],
+            ),
+            seal_chunk_ix(
+                &program_id,
+                &authority,
+                &settlement_program,
+                7,
+                3,
+                1,
+                100,
+                [9u8; 32],
+            ),
             close_chunk_ix(&program_id, &authority, &settlement_program, 7, 3, 1),
             open_batch_ix(&program_id, &payer, 7, 3, 290, &settlement_program),
-            grow_batch_ix(&program_id, &payer, 7, 3),
-            seal_leaf_ix(&program_id, 7, 3, 1),
-            finalize_batch_ix(&program_id, &authority, 7, 3, 0),
+            grow_batch_ix(&program_id, &payer, &settlement_program, 7, 3),
+            seal_leaf_ix(&program_id, &settlement_program, 7, 3, 1),
+            finalize_batch_ix(&program_id, &authority, &settlement_program, 7, 3, 0),
             close_batch_ix(&program_id, &authority, &settlement_program, 7, 3),
-            abandon_batch_ix(&program_id, &authority, 7, 3),
+            abandon_batch_ix(&program_id, &authority, &settlement_program, 7, 3),
         ];
 
         for ix in &cases {
@@ -953,12 +1134,13 @@ mod tests {
     #[test]
     fn cursor_pda_derivation_is_deterministic_and_distinct_per_chain() {
         let program_id = Pubkey::new_unique();
-        let (a, _) = cursor_pda(&program_id, 7);
-        let (b, _) = cursor_pda(&program_id, 7);
+        let settlement_program = Pubkey::new_unique();
+        let (a, _) = cursor_pda(&program_id, &settlement_program, 7);
+        let (b, _) = cursor_pda(&program_id, &settlement_program, 7);
         assert_eq!(a, b);
-        let (c, _) = cursor_pda(&program_id, 8);
+        let (c, _) = cursor_pda(&program_id, &settlement_program, 8);
         assert_ne!(a, c);
-        let (batch0, _) = batch_pda(&program_id, 7, 0);
+        let (batch0, _) = batch_pda(&program_id, &settlement_program, 7, 0);
         assert_ne!(a, batch0, "cursor and batch PDAs must not collide");
     }
 
@@ -1022,31 +1204,37 @@ mod tests {
     #[test]
     fn chunk_pda_matches_program_and_layouts() {
         let program = Pubkey::new_unique();
-        let s = zk_inbox::pda_seeds(7, 3, 2);
+        let settlement_program = Pubkey::new_unique();
+        let s = zk_inbox::pda_seeds(&settlement_program, 7, 3, 2);
         let from_program_seeds =
-            Pubkey::find_program_address(&[&s[0], &s[1], &s[2], &s[3]], &program);
-        assert_eq!(chunk_pda(&program, 7, 3, 2), from_program_seeds);
+            Pubkey::find_program_address(&[&s[0], &s[1], &s[2], &s[3], &s[4]], &program);
         assert_eq!(
-            chunk_pda(&program, 7, 3, 2),
-            rome_zk_layouts::chunk::pda(&program, 7, 3, 2)
+            chunk_pda(&program, &settlement_program, 7, 3, 2),
+            from_program_seeds
+        );
+        assert_eq!(
+            chunk_pda(&program, &settlement_program, 7, 3, 2),
+            rome_zk_layouts::chunk::pda(&program, &settlement_program, 7, 3, 2)
         );
     }
 
     #[test]
     fn batch_pda_matches_program_and_layouts() {
         let program = Pubkey::new_unique();
+        let settlement_program = Pubkey::new_unique();
         assert_eq!(
-            batch_pda(&program, 7, 3),
-            rome_zk_layouts::batch::pda(&program, 7, 3)
+            batch_pda(&program, &settlement_program, 7, 3),
+            rome_zk_layouts::batch::pda(&program, &settlement_program, 7, 3)
         );
     }
 
     #[test]
     fn cursor_pda_matches_program_and_layouts() {
         let program = Pubkey::new_unique();
+        let settlement_program = Pubkey::new_unique();
         assert_eq!(
-            cursor_pda(&program, 7),
-            rome_zk_layouts::cursor::pda(&program, 7)
+            cursor_pda(&program, &settlement_program, 7),
+            rome_zk_layouts::cursor::pda(&program, &settlement_program, 7)
         );
     }
 

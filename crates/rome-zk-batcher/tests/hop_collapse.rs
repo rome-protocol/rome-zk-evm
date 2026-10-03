@@ -46,6 +46,7 @@ async fn send(
 struct Scaffold {
     ctx: solana_program_test::ProgramTestContext,
     program_id: Pubkey,
+    settlement_program: Pubkey,
     payer: Keypair,
     chain_id: u64,
     batch: u64,
@@ -68,7 +69,7 @@ async fn scaffold_with_one_frame_opened() -> Scaffold {
         root_account_with_authority(chain_id, &payer.pubkey(), settlement_program),
     );
     pt.add_account(
-        zk_inbox_client::cursor_pda(&program_id, chain_id).0,
+        zk_inbox_client::cursor_pda(&program_id, &settlement_program, chain_id).0,
         cursor_account(program_id, chain_id, batch),
     );
     pt.add_account(
@@ -98,6 +99,7 @@ async fn scaffold_with_one_frame_opened() -> Scaffold {
     Scaffold {
         ctx,
         program_id,
+        settlement_program,
         payer,
         chain_id,
         batch,
@@ -109,11 +111,13 @@ async fn scaffold_with_one_frame_opened() -> Scaffold {
 async fn finalize_and_decode(
     ctx: &mut solana_program_test::ProgramTestContext,
     program_id: Pubkey,
+    settlement_program: Pubkey,
     payer: &Keypair,
     chain_id: u64,
     batch: u64,
 ) -> zk_inbox_client::BatchAccount {
-    let (batch_pda, _) = zk_inbox_client::batch_pda(&program_id, chain_id, batch);
+    let (batch_pda, _) =
+        zk_inbox_client::batch_pda(&program_id, &settlement_program, chain_id, batch);
     let account = ctx
         .banks_client
         .get_account(batch_pda)
@@ -128,8 +132,14 @@ async fn finalize_and_decode(
     );
     assert!(!decoded.finalized, "must not already be finalized");
 
-    let finalize_ix =
-        zk_inbox_client::finalize_batch_ix(&program_id, &payer.pubkey(), chain_id, batch, 0);
+    let finalize_ix = zk_inbox_client::finalize_batch_ix(
+        &program_id,
+        &payer.pubkey(),
+        &settlement_program,
+        chain_id,
+        batch,
+        0,
+    );
     send(ctx, &[finalize_ix], payer)
         .await
         .expect("FinalizeBatch");
@@ -157,6 +167,7 @@ async fn run_one_frame_and_check(body: Vec<u8>) {
     let Scaffold {
         mut ctx,
         program_id,
+        settlement_program,
         payer,
         chain_id,
         batch,
@@ -169,7 +180,15 @@ async fn run_one_frame_and_check(body: Vec<u8>) {
         body,
     };
     let payload = frame.to_bytes();
-    let ixs = pipeline::plan_chunk(&program_id, &payer.pubkey(), chain_id, batch, 0, &payload);
+    let ixs = pipeline::plan_chunk(
+        &program_id,
+        &payer.pubkey(),
+        &settlement_program,
+        chain_id,
+        batch,
+        0,
+        &payload,
+    );
     assert_eq!(
         ixs.len(),
         4,
@@ -180,7 +199,15 @@ async fn run_one_frame_and_check(body: Vec<u8>) {
         .await
         .expect("Open+Write+Seal+SealLeaf transaction");
 
-    let decoded = finalize_and_decode(&mut ctx, program_id, &payer, chain_id, batch).await;
+    let decoded = finalize_and_decode(
+        &mut ctx,
+        program_id,
+        settlement_program,
+        &payer,
+        chain_id,
+        batch,
+    )
+    .await;
 
     let chunk_hash = solana_program::keccak::hashv(&[&payload]).to_bytes();
     let (_, _, reference_acc) =
@@ -190,7 +217,8 @@ async fn run_one_frame_and_check(body: Vec<u8>) {
         "on-chain acc must match the off-chain reference commitment"
     );
 
-    let (chunk_pda, _) = zk_inbox_client::chunk_pda(&program_id, chain_id, batch, 0);
+    let (chunk_pda, _) =
+        zk_inbox_client::chunk_pda(&program_id, &settlement_program, chain_id, batch, 0);
     let chunk_account = ctx
         .banks_client
         .get_account(chunk_pda)

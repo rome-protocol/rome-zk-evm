@@ -8,7 +8,8 @@
 //! completes; an RPC failure while looking is `CursorLookupFailed` (exit 1). `--next-batch` is 1 for a fresh chain
 //! (batch ids are 1-based per chain; 0 is the sentinel everywhere else in this system —
 //! `head_pending_batch`/`head_final_batch` == 0 always means "none"); on a chain with prior batch history it must be
-//! above every batch id ever opened (see `find_max_batch_id.rs`).
+//! `root.head_pending_batch + 1` — the id settlement accepts next — and never above it, since a higher cursor
+//! halts the chain (`find_max_batch_id.rs` reads the root and prints that value).
 //!
 //! `--next-batch 0` is refused by name unless `--allow-zero` is also passed. The inbox program's own
 //! `InitBatchCursor` handler accepts any value (a shipped instruction body doesn't change shape), so this refusal
@@ -169,7 +170,7 @@ async fn main() {
         .unwrap_or_else(|e| panic!("failed to read keypair at {keypair_path}: {e}"));
     let rpc = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
 
-    let (cursor, _) = zk_inbox_client::cursor_pda(&inbox, chain_id);
+    let (cursor, _) = zk_inbox_client::cursor_pda(&inbox, &settlement, chain_id);
     let lookup = rpc
         .get_account_with_commitment(&cursor, CommitmentConfig::confirmed())
         .await

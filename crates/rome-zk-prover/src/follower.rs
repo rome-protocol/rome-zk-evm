@@ -555,6 +555,7 @@ where
                 match rome_zk_prover_input::inbox::fetch_and_verify_batch(
                     fetch,
                     &cfg.inbox_program,
+                    &cfg.settlement_program,
                     cfg.chain_id,
                     candidate_batch,
                 ) {
@@ -2223,7 +2224,7 @@ mod tests {
                 expected_count: fx.chunk_bodies.len() as u32,
                 leaves_present: fx.chunk_bodies.len() as u32,
                 finalized: true,
-                settlement_program: [0u8; 32],
+                settlement_program: self.0.settlement_program.to_bytes(),
                 authority: [0u8; 32],
                 root,
                 forced_root,
@@ -2260,7 +2261,7 @@ mod tests {
                 expected_count: fx.chunk_bodies.len() as u32,
                 leaves_present: fx.chunk_bodies.len() as u32,
                 finalized: true,
-                settlement_program: [0u8; 32],
+                settlement_program: self.0.settlement_program.to_bytes(),
                 authority: [0u8; 32],
                 root,
                 forced_root,
@@ -2328,7 +2329,11 @@ mod tests {
                 zk_settlement_client::registry_pda(&self.0.settlement_program, GATE_CHAIN_ID);
             let (cc_pda, _) =
                 zk_settlement_client::chain_config_pda(&self.0.settlement_program, GATE_CHAIN_ID);
-            let (cursor_pda, _) = zk_inbox_client::cursor_pda(&self.0.inbox_program, GATE_CHAIN_ID);
+            let (cursor_pda, _) = zk_inbox_client::cursor_pda(
+                &self.0.inbox_program,
+                &self.0.settlement_program,
+                GATE_CHAIN_ID,
+            );
             let (global_pda, _) =
                 zk_settlement_client::global_config_pda(&self.0.settlement_program);
             let programdata_pda =
@@ -2400,6 +2405,7 @@ mod tests {
                                 (1..=200u64).find_map(|batch| {
                                     let pda = zk_settlement_client::inbox_batch_pda(
                                         &self.0.inbox_program,
+                                        &self.0.settlement_program,
                                         GATE_CHAIN_ID,
                                         batch,
                                     );
@@ -2429,14 +2435,20 @@ mod tests {
                 if !st.inbox_batches.contains(&batch) {
                     return None;
                 }
-                let batch_pda =
-                    zk_inbox_client::batch_pda(&self.0.inbox_program, GATE_CHAIN_ID, batch).0;
+                let batch_pda = zk_inbox_client::batch_pda(
+                    &self.0.inbox_program,
+                    &self.0.settlement_program,
+                    GATE_CHAIN_ID,
+                    batch,
+                )
+                .0;
                 if batch_pda == *pubkey {
                     return Some(self.encode_inbox_batch_da_view(&st, batch));
                 }
                 for idx in 0..chunk_count {
                     let chunk_pda = zk_inbox_client::chunk_pda(
                         &self.0.inbox_program,
+                        &self.0.settlement_program,
                         GATE_CHAIN_ID,
                         batch,
                         idx,

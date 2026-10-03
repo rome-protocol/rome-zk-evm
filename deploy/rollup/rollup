@@ -67,6 +67,11 @@ require_init() {
   [[ -f "$OUT/genesis.json" && -f "$OUT/compose.env" ]] || die NotInitialised "nothing rendered under $OUT (run ./rollup init first)"
 }
 
+# The largest chain id MetaMask accepts when a user adds a network: MAX_SAFE_CHAIN_ID in MetaMask's
+# shared/constants/network.ts (metamask-extension; core's controller-utils isSafeChainId checks the same bound).
+# Other wallets that follow it refuse a larger id too.
+MAX_WALLET_SAFE_CHAIN_ID=4503599627370476
+
 # The chain id is not chosen. A permissionless id is derived by the settlement program from the payer's key and the
 # number of chains that payer has registered so far, so it is read from Solana: the register_chain example's chain-id
 # command prints it and sends nothing. Sets D_AUTHORITY, D_NONCE and D_ID.
@@ -95,24 +100,63 @@ cmd_init() {
   load_programs
   local example="${SEQUENCER_EXAMPLE_CONFIG:-$REPO_ROOT/crates/rome-zk-sequencer/config.example.toml}"
 
-  local errf vals chosen funded close_after
+  local errf vals chosen fee_recipient close_after
   errf="$(mktemp)"
-  if ! vals="$(rz_toml_get "$CHAIN_TOML" chain_id genesis.funded_address batcher.batch_close_after_secs 2>"$errf")"; then
+  if ! vals="$(rz_toml_get "$CHAIN_TOML" chain_id batcher.batch_close_after_secs genesis.fee_recipient 2>"$errf")"; then
     local err; err="$(tail -1 "$errf")"; rm -f "$errf"
     case "$err" in Python311Required*) echo "$err" >&2; exit 1 ;; *) die ChainTomlInvalid "$CHAIN_TOML: $err" ;; esac
   fi
   rm -f "$errf"
-  chosen="$(sed -n 1p <<<"$vals")"; funded="$(sed -n 2p <<<"$vals")"; close_after="$(sed -n 3p <<<"$vals")"
+  chosen="$(sed -n 1p <<<"$vals")"; close_after="$(sed -n 2p <<<"$vals")"
+  fee_recipient="$(sed -n 3p <<<"$vals")"
   [[ -z "$chosen" ]] || die ChainIdNotChosen "chain_id in $CHAIN_TOML must be removed: a permissionless chain id is derived from your payer key and its registration count, and init reads it from Solana"
-  [[ "$funded" =~ ^0x[0-9a-fA-F]{40}$ ]] || die FundedAddressInvalid "genesis.funded_address in $CHAIN_TOML must be 0x followed by 40 hex characters (got '$funded')"
-  # The precompiles live at 0x00..00 to 0x00..ff on this chain (Prague has BLS precompiles above 0x0a), and the exit portal
-  # sits at 0x42..16: genesis supply put at any of them is in an account nobody can spend from, or collides.
-  local funded_lc="${funded,,}"
-  if [[ "$funded_lc" =~ ^0x0{38}[0-9a-f]{2}$ ]]; then
-    die FundedAddressReserved "genesis.funded_address in $CHAIN_TOML is $funded, a precompile address (or zero): nobody can spend from it. Use an address you control."
+  # A genesis that mints coins for one address can never take deposits safely: its holder could exit coins that other people's
+  # deposits paid for, and the genesis cannot change once registered. So there is no funded address any more; a genesis has
+  # no balances unless one backed balance is declared below.
+  [[ "$(rz_toml_kind "$CHAIN_TOML" genesis.funded_address)" == absent ]] || die FundedAddressRemoved "genesis.funded_address in $CHAIN_TOML is no longer supported: a genesis that mints coins can never take deposits safely, so a new chain starts with no balances. Remove it. If you need gas before deposits are available, declare one backed balance instead: genesis.backed_address and genesis.backed_balance_lamports (lock the same amount in your chain's vault before Rome registers your key)."
+  local gkey
+  while IFS= read -r gkey; do
+    case "$gkey" in
+      fee_recipient|backed_address|backed_balance_lamports) ;;
+      *) die GenesisKeyUnknown "[genesis] $gkey in $CHAIN_TOML is not a setting (allowed: fee_recipient, backed_address, backed_balance_lamports). A balance is written backed_balance_lamports, in lamports." ;;
+    esac
+  done < <(rz_toml_keys "$CHAIN_TOML" genesis)
+  # The fee recipient becomes the genesis coinbase: the sequencer, derive and the guest all read the chain's fee recipient
+  # from it, and it cannot change once the chain is registered. The same reserved addresses would hold the fees where
+  # nobody can spend them.
+  [[ -n "$fee_recipient" ]] || die FeeRecipientMissing "genesis.fee_recipient is not set in $CHAIN_TOML: it is the address that receives the priority fees (tips) of the chain's transactions, and it cannot be changed after you register. Use an address you control."
+  [[ "$fee_recipient" =~ ^0x[0-9a-fA-F]{40}$ ]] || die FeeRecipientInvalid "genesis.fee_recipient in $CHAIN_TOML must be 0x followed by 40 hex characters (got '$fee_recipient')"
+  local fee_lc="${fee_recipient,,}"
+  if [[ "$fee_lc" =~ ^0x0{38}[0-9a-f]{2}$ ]]; then
+    die FeeRecipientReserved "genesis.fee_recipient in $CHAIN_TOML is $fee_recipient, a precompile address (or zero): the fees sent there are lost. Use an address you control."
   fi
-  [[ "$funded_lc" != 0x4200000000000000000000000000000000000016 ]] || die FundedAddressReserved "genesis.funded_address in $CHAIN_TOML is the exit portal's address; use an address you control."
+  [[ "$fee_lc" != 0x4200000000000000000000000000000000000016 ]] || die FeeRecipientReserved "genesis.fee_recipient in $CHAIN_TOML is the exit portal's address; use an address you control."
   [[ "$close_after" =~ ^[1-9][0-9]*$ ]] || die BatchCloseAfterInvalid "batcher.batch_close_after_secs in $CHAIN_TOML must be a positive integer (got '$close_after')"
+
+  # An optional backed balance: one address that holds G at genesis, where G is locked in the chain's vault with zk-bridge
+  # Fund before Rome registers the key. The amount is written in lamports (wrapped SOL: 1 lamport = 1 gwei) and rendered as
+  # wei = lamports x 1e9, so it converts exactly into the vault mint's base units.
+  local backed="" backed_lamports="" backed_wei="" backed_alloc=""
+  local backed_addr_kind backed_bal_kind
+  backed_addr_kind="$(rz_toml_kind "$CHAIN_TOML" genesis.backed_address)"
+  backed_bal_kind="$(rz_toml_kind "$CHAIN_TOML" genesis.backed_balance_lamports)"
+  if [[ "$backed_addr_kind" != absent || "$backed_bal_kind" != absent ]]; then
+    backed="$(rz_toml_get "$CHAIN_TOML" genesis.backed_address)"
+    [[ -n "$backed" ]] || die BackedAddressMissing "genesis.backed_address is missing or empty in $CHAIN_TOML while a backed balance key is present: name the address that holds the backed balance, or remove both keys for a genesis with no balances."
+    [[ "$backed_bal_kind" != absent ]] || die BackedBalanceMissing "genesis.backed_address is set in $CHAIN_TOML but genesis.backed_balance_lamports is not: give the amount in lamports (a whole number), or remove both keys for a genesis with no balances."
+    [[ "$backed_addr_kind" == str && "$backed" =~ ^0x[0-9a-fA-F]{40}$ ]] || die BackedAddressInvalid "genesis.backed_address in $CHAIN_TOML must be 0x followed by 40 hex characters (got '$backed')"
+    local backed_lc="${backed,,}"
+    if [[ "$backed_lc" =~ ^0x0{38}[0-9a-f]{2}$ ]]; then
+      die BackedAddressReserved "genesis.backed_address in $CHAIN_TOML is $backed, a precompile address (or zero): nobody can spend from it. Use an address you control."
+    fi
+    [[ "$backed_lc" != 0x4200000000000000000000000000000000000016 ]] || die BackedAddressReserved "genesis.backed_address in $CHAIN_TOML is the exit portal's address; use an address you control."
+    backed_lamports="$(rz_toml_get "$CHAIN_TOML" genesis.backed_balance_lamports)"
+    if [[ "$backed_bal_kind" != int ]] || grep -qE '^[[:space:]]*"?backed_balance_lamports"?[[:space:]]*=[[:space:]]*0[xob]' "$CHAIN_TOML" \
+       || ! backed_wei="$(rz_lamports_to_wei_hex "$backed_lamports")"; then
+      die BackedBalanceInvalid "genesis.backed_balance_lamports in $CHAIN_TOML must be a whole number of lamports from 1 to 18446744073709551615, written as a plain integer such as 1_500_000_000 for 1.5 SOL (got '$backed_lamports'; no decimals, quotes, units, hex or exponents)"
+    fi
+    backed_alloc=", \"$backed\": { \"balance\": \"$backed_wei\" }"
+  fi
 
   # [profile] becomes sequencer settings, one for one. A name the example config does not have is refused by name, and so
   # is a name init sets itself: it would override the derived chain id or move a path off the mounted volume.
@@ -131,15 +175,29 @@ cmd_init() {
   local payer_key chain_id rec="$OUT/chain-id.env" rec_auth rec_nonce rec_id
   payer_key="$(abs "$(cfg PAYER_KEYPAIR_PATH ./keys/payer.json)")"
   fetch_chain_id "$payer_key"
+  local registered=0 fresh_nonce="$D_NONCE"
+  [[ ! -f "$OUT/pdas.env" ]] || registered=1   # register writes pdas.env when it finishes
   if [[ -f "$rec" ]]; then
     # A chain id init recorded stays: registering moves the payer's nonce forward, and the id derived from the new nonce
     # would be another chain. The record holds only while the payer is the key that was recorded.
     rec_auth="$(rz_env_get "$rec" AUTHORITY)"; rec_nonce="$(rz_env_get "$rec" NONCE)"; rec_id="$(rz_env_get "$rec" CHAIN_ID)"
     [[ -n "$rec_auth" && "$rec_nonce" =~ ^[0-9]+$ && "$rec_id" =~ ^[0-9]+$ ]] || die ChainIdRecordInvalid "$rec has no valid AUTHORITY, NONCE and CHAIN_ID (move $OUT aside to start a new chain)"
     [[ "$D_AUTHORITY" == "$rec_auth" ]] || die AuthorityChanged "the payer key $payer_key is $D_AUTHORITY, but $rec records the chain's authority as $rec_auth; use that key again (PAYER_KEYPAIR_PATH in $ENV_FILE), or move $OUT aside to start a new chain"
+    # Registering moves the payer's nonce, so a nonce past the recorded one means this chain was registered even if register
+    # stopped before it wrote pdas.env.
+    (( fresh_nonce > rec_nonce )) && registered=1
     D_NONCE="$rec_nonce"; D_ID="$rec_id"
   fi
   chain_id="$D_ID"
+  # Wallets cannot add a chain id above the bound. Before registration the id can still be avoided by another payer key; after
+  # it the id is permanent, so only say so.
+  if (( chain_id > MAX_WALLET_SAFE_CHAIN_ID )); then
+    if (( registered )); then
+      echo "ChainIdNotWalletSafe (warning): this chain's id $chain_id is above $MAX_WALLET_SAFE_CHAIN_ID, so wallets like MetaMask cannot add it. This chain looks registered (rendered/pdas.env exists or the payer's nonce has moved), so its id cannot change; continuing." >&2
+    else
+      die ChainIdNotWalletSafe "the chain id $chain_id that your payer key would get is above $MAX_WALLET_SAFE_CHAIN_ID, so wallets like MetaMask cannot add this chain. Create a new payer key (solana-keygen new), point PAYER_KEYPAIR_PATH in $ENV_FILE at it, fund it, and run ./rollup init again (if $OUT already holds an earlier init, move it aside first); nothing has been sent."
+    fi
+  fi
 
   local pairs=()
   pairs+=("chain_id=$chain_id" 'rpc_addr="0.0.0.0:9944"' 'metrics_addr="0.0.0.0:9001"' 'log_dir="/data/reth/log"'
@@ -164,7 +222,7 @@ cmd_init() {
   local portal_hex portal_file="${EXIT_PORTAL_RUNTIME_HEX:-$REPO_ROOT/contracts/exit-portal/RomeExitPortal.runtime.hex}"
   portal_hex="$(rz_hex_body "$portal_file" 2>/dev/null)" || die ExitPortalRuntimeMissing "$portal_file is absent, empty or not valid hex (run from a full checkout)"
   rz_render_template "$ROLLUP_DIR/genesis.json.template" "$STAGE/genesis.json" \
-    "CHAIN_ID=$chain_id" "GAS_LIMIT_HEX=$gas_hex" "FUNDED_ADDRESS=$funded" "EXIT_PORTAL_RUNTIME=$portal_hex" || exit 1
+    "CHAIN_ID=$chain_id" "GAS_LIMIT_HEX=$gas_hex" "BACKED_ALLOC=$backed_alloc" "FEE_RECIPIENT=$fee_recipient" "EXIT_PORTAL_RUNTIME=$portal_hex" || exit 1
   local common=("CHAIN_ID=$chain_id" "CLUSTER=$CLUSTER" "INBOX_PROGRAM_ID=$INBOX_ID" "SETTLEMENT_PROGRAM_ID=$SETTLEMENT_ID"
                 "SOLANA_RPC_URL=$SOLANA_RPC_URL" "BATCH_CLOSE_AFTER_SECS=$close_after" "BLOCKS_PER_BATCH=$blocks_per_batch")
   rz_render_template "$ROLLUP_DIR/batcher.toml.template" "$STAGE/batcher.toml" "${common[@]}" || exit 1
@@ -238,6 +296,11 @@ cmd_init() {
   fi
   [[ -e "$seq_key" ]] || echo "note: the sequencer key $seq_key does not exist yet (64 hex characters in a file, readable by uid 999)" >&2
   echo "rendered under $OUT: authority=$D_AUTHORITY nonce=$D_NONCE chain_id=$chain_id, genesis gas limit $gas_limit, blocks_per_batch=$blocks_per_batch, cluster=$CLUSTER"
+  if [[ -n "$backed" ]]; then
+    echo "backed genesis balance: $backed starts with $backed_lamports lamports (${backed_lamports}000000000 wei); every other balance is zero."
+    echo "Before you ask Rome to register your verification key, lock exactly $backed_lamports lamports in your chain's vault with zk-bridge Fund. Rome checks that the vault holds it before it registers the key."
+    echo "The bridge program is not deployed on devnet yet, so there is no vault to lock it in today."
+  fi
 }
 
 # ------------------------------------------------------------------------------------------------------ register

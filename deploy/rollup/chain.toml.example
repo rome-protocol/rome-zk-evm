@@ -7,10 +7,23 @@
 # config with it (see rendered/chain-id.env).
 
 [genesis]
-# The one funded account in the genesis (it receives 1e27 wei). Use an address you control. The zero address below is
-# a placeholder: init refuses it, and every other address from 0x00..00 to 0x00..ff, because those are precompiles
-# that nobody can spend from.
-funded_address = "0x0000000000000000000000000000000000000000"
+# A new chain starts with no balances: nobody is minted any coins in the genesis. L2 gas comes from deposits once they
+# ship. A genesis cannot change after you register, and one that mints coins could never take deposits safely, because its
+# holder could exit coins that other people's deposits paid for. So there is no funded address any more; init refuses
+# funded_address by name.
+#
+# If you need gas before deposits are available, you can declare ONE backed balance. You lock the same amount in your
+# chain's vault with zk-bridge Fund, and Rome checks that the vault holds it before it registers your verification key.
+# The amount is in LAMPORTS (wrapped SOL: 1 SOL = 1_000_000_000 lamports, and 1 lamport = 1 gwei on your chain). init
+# renders wei = lamports x 1e9, so it always converts exactly. Write a plain whole number between 1 and
+# 18446744073709551615, with no decimals, quotes or units. The example below is 1.5 SOL. Use an address you control;
+# init refuses zero, the precompiles (0x00..00 to 0x00..ff) and the exit portal's address. Both keys or neither.
+# The bridge program is not deployed on devnet yet, so on devnet there is no vault to lock a backed balance in today.
+# backed_address = "0x0000000000000000000000000000000000000000"
+# backed_balance_lamports = 1_500_000_000
+# The address that receives the priority fees (tips) of the chain's transactions; the base fee is burned, as on Ethereum.
+# It becomes the genesis coinbase. Required, and fixed once you register. init refuses zero, the precompiles and the exit portal's address, as for backed_address.
+fee_recipient = "0x0000000000000000000000000000000000000000"
 
 # The sequencer's settings. Every key must exist in crates/rome-zk-sequencer/config.example.toml; init refuses a
 # name it does not know. The genesis gas limit is sub_block_gas_limit x sub_blocks_per_block.

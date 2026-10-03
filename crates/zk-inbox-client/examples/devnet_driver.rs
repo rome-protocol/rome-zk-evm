@@ -219,14 +219,15 @@ async fn main() {
     // Batch ids are sequential and never reused — this driver must post under the chain's own
     // `batch_cursor.next_batch`, not a `SystemTime` guess that could easily collide with (or skip below)
     // whatever the cursor already expects.
-    let (cursor_pda, _) = zk_inbox_client::cursor_pda(&program_id, chain_id);
+    let (cursor_pda, _) =
+        zk_inbox_client::cursor_pda(&program_id, &args.settlement_program, chain_id);
     let cursor_data = rpc
         .get_account(&cursor_pda)
         .await
         .unwrap_or_else(|e| {
             panic!(
                 "chain {chain_id} has no batch_cursor account ({cursor_pda}): {e} — run \
-                 InitBatchCursor for this chain first (see examples/find_max_batch_id.rs)"
+                 InitBatchCursor for this chain first, at root.head_pending_batch + 1 (see examples/find_max_batch_id.rs)"
             )
         })
         .data;
@@ -246,6 +247,7 @@ async fn main() {
             zk_inbox_client::open_chunk_ix(
                 &program_id,
                 &payer.pubkey(),
+                &args.settlement_program,
                 chain_id,
                 batch,
                 idx,
@@ -254,6 +256,7 @@ async fn main() {
             zk_inbox_client::write_chunk_ix(
                 &program_id,
                 &payer.pubkey(),
+                &args.settlement_program,
                 chain_id,
                 batch,
                 idx,
@@ -263,6 +266,7 @@ async fn main() {
             zk_inbox_client::seal_chunk_ix(
                 &program_id,
                 &payer.pubkey(),
+                &args.settlement_program,
                 chain_id,
                 batch,
                 idx,
@@ -301,13 +305,20 @@ async fn main() {
             let rpc_url = args.rpc_url.clone();
             let payer_bytes = payer.to_bytes();
             let program_id = program_id;
+            let settlement_program = args.settlement_program;
             tokio::spawn(async move {
                 let rpc = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
                 // `Keypair::from_bytes` was removed in the Agave 4.x line (API fallout) — `TryFrom<&[u8]>` is the
                 // same reconstruction (64 bytes, secret+public, validates the public key matches the derived one),
                 // just via a different trait.
                 let payer = Keypair::try_from(payer_bytes.as_slice()).unwrap();
-                let ix = zk_inbox_client::seal_leaf_ix(&program_id, chain_id, batch, idx);
+                let ix = zk_inbox_client::seal_leaf_ix(
+                    &program_id,
+                    &settlement_program,
+                    chain_id,
+                    batch,
+                    idx,
+                );
                 let sig = send(&rpc, &payer, &[ix]).await;
                 (idx, sig)
             })
@@ -325,6 +336,7 @@ async fn main() {
         &[zk_inbox_client::finalize_batch_ix(
             &program_id,
             &payer.pubkey(),
+            &args.settlement_program,
             chain_id,
             batch,
             0,
@@ -335,7 +347,8 @@ async fn main() {
 
     // --- read back and verify acc against the client-side reference ---
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let (batch_pda, _) = zk_inbox_client::batch_pda(&program_id, chain_id, batch);
+    let (batch_pda, _) =
+        zk_inbox_client::batch_pda(&program_id, &args.settlement_program, chain_id, batch);
     let acct = rpc
         .get_account(&batch_pda)
         .await

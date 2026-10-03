@@ -293,7 +293,8 @@ pub async fn resolve_anchor<A: AccountOps>(
         }
     }
 
-    let (cursor_pda, _) = zk_inbox_client::cursor_pda(inbox_program_id, chain_id);
+    let (cursor_pda, _) =
+        zk_inbox_client::cursor_pda(inbox_program_id, settlement_program_id, chain_id);
     let n = match accounts.get_account(&cursor_pda).await? {
         None => 0, // InitBatchCursor never run for this chain — nothing has ever been posted.
         Some(data) => {
@@ -336,7 +337,9 @@ pub async fn resolve_anchor<A: AccountOps>(
         let ids: Vec<u64> = (lo..hi).collect();
         let pdas: Vec<Pubkey> = ids
             .iter()
-            .map(|&b| zk_inbox_client::batch_pda(inbox_program_id, chain_id, b).0)
+            .map(|&b| {
+                zk_inbox_client::batch_pda(inbox_program_id, settlement_program_id, chain_id, b).0
+            })
             .collect();
         let datas = accounts.get_multiple_account_data(&pdas).await?;
         for (&b, data) in ids.iter().zip(datas).rev() {
@@ -345,6 +348,7 @@ pub async fn resolve_anchor<A: AccountOps>(
                     match decode_anchor_from_finalized_batch(
                         accounts,
                         inbox_program_id,
+                        settlement_program_id,
                         chain_id,
                         b,
                     )
@@ -419,10 +423,12 @@ pub fn verify_first_block_matches(anchor: &Anchor, first_block: u64) -> Result<(
 async fn decode_anchor_from_finalized_batch<A: AccountOps>(
     accounts: &A,
     inbox_program_id: &Pubkey,
+    settlement_program_id: &Pubkey,
     chain_id: u64,
     batch: u64,
 ) -> Result<Anchor, AnchorError> {
-    let (batch_pda, _) = zk_inbox_client::batch_pda(inbox_program_id, chain_id, batch);
+    let (batch_pda, _) =
+        zk_inbox_client::batch_pda(inbox_program_id, settlement_program_id, chain_id, batch);
     let data = accounts
         .get_account(&batch_pda)
         .await?
@@ -431,7 +437,16 @@ async fn decode_anchor_from_finalized_batch<A: AccountOps>(
         .map_err(|source| AnchorError::BatchDecode { batch, source })?;
 
     let chunk_pdas: Vec<Pubkey> = (0..decoded.expected_count)
-        .map(|idx| zk_inbox_client::chunk_pda(inbox_program_id, chain_id, batch, idx).0)
+        .map(|idx| {
+            zk_inbox_client::chunk_pda(
+                inbox_program_id,
+                settlement_program_id,
+                chain_id,
+                batch,
+                idx,
+            )
+            .0
+        })
         .collect();
     let chunk_datas = accounts.get_multiple_account_data(&chunk_pdas).await?;
 
@@ -657,7 +672,13 @@ mod tests {
     ) {
         let authority = Pubkey::new_unique();
         for (idx, frame) in frames.iter().enumerate() {
-            let (pda, _) = zk_inbox_client::chunk_pda(&PROGRAM, chain_id, batch, idx as u32);
+            let (pda, _) = zk_inbox_client::chunk_pda(
+                &PROGRAM,
+                &SETTLEMENT_PROGRAM,
+                chain_id,
+                batch,
+                idx as u32,
+            );
             let mut d = vec![0u8; zk_inbox::HEADER_LEN];
             d[zk_inbox::OFF_MAGIC..zk_inbox::OFF_MAGIC + 4]
                 .copy_from_slice(&zk_inbox::MAGIC.to_le_bytes());
@@ -696,7 +717,8 @@ mod tests {
         d[rome_zk_layouts::batch::OFF_FINALIZED] = 1;
         d[rome_zk_layouts::batch::OFF_ACC..rome_zk_layouts::batch::OFF_ACC + 32]
             .copy_from_slice(&acc);
-        let (batch_pda, _) = zk_inbox_client::batch_pda(&PROGRAM, chain_id, batch);
+        let (batch_pda, _) =
+            zk_inbox_client::batch_pda(&PROGRAM, &SETTLEMENT_PROGRAM, chain_id, batch);
         chain.set_account(batch_pda, d);
     }
 
@@ -737,9 +759,15 @@ mod tests {
         assert!(frames.len() >= 3, "fixture needs several frames");
         frames[1].frame_no = 0; // stored at idx 1, claims to be frame 0
         seed_finalized_batch_frames(&chain, chain_id, batch, &frames);
-        let err = decode_anchor_from_finalized_batch(&chain, &PROGRAM, chain_id, batch)
-            .await
-            .unwrap_err();
+        let err = decode_anchor_from_finalized_batch(
+            &chain,
+            &PROGRAM,
+            &SETTLEMENT_PROGRAM,
+            chain_id,
+            batch,
+        )
+        .await
+        .unwrap_err();
         match err {
             AnchorError::FrameNoMismatch {
                 batch: b,
@@ -921,7 +949,7 @@ mod tests {
         // Every ever-opened batch missing (never opened) -> root fallback. root.number = 2: blocks 1
         // and 2 were already posted; the next block to post is 3.
         let chain = FakeChain::default();
-        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, CHAIN_ID);
+        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(cursor_pda, cursor_bytes(CHAIN_ID, 1));
         let (root_pda, _) = zk_settlement_client::root_pda(&SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(root_pda, root_bytes(CHAIN_ID, 0, 2));
@@ -960,7 +988,7 @@ mod tests {
     #[tokio::test]
     async fn a_finalized_batch_in_the_pending_window_is_decoded_for_its_last_block() {
         let chain = FakeChain::default();
-        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, CHAIN_ID);
+        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(cursor_pda, cursor_bytes(CHAIN_ID, 1));
         let (root_pda, _) = zk_settlement_client::root_pda(&SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(root_pda, root_bytes(CHAIN_ID, 0, 0));
@@ -997,7 +1025,7 @@ mod tests {
     #[tokio::test]
     async fn sentinel_anchor_with_a_1_based_inbox_decodes_the_newest_finalized_batch() {
         let chain = FakeChain::default();
-        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, CHAIN_ID);
+        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(cursor_pda, cursor_bytes(CHAIN_ID, 3));
         let (root_pda, _) = zk_settlement_client::root_pda(&SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(root_pda, root_bytes(CHAIN_ID, 0, 0));
@@ -1036,7 +1064,7 @@ mod tests {
     #[tokio::test]
     async fn batcher_anchor_over_a_real_0_based_log_via_the_finalized_batch_path_is_refused() {
         let chain = FakeChain::default();
-        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, CHAIN_ID);
+        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(cursor_pda, cursor_bytes(CHAIN_ID, 1));
         let (root_pda, _) = zk_settlement_client::root_pda(&SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(root_pda, root_bytes(CHAIN_ID, 0, 0));
@@ -1102,14 +1130,14 @@ mod tests {
     #[tokio::test]
     async fn a_tampered_finalized_batch_fails_acc_verification() {
         let chain = FakeChain::default();
-        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, CHAIN_ID);
+        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(cursor_pda, cursor_bytes(CHAIN_ID, 1));
         let (root_pda, _) = zk_settlement_client::root_pda(&SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(root_pda, root_bytes(CHAIN_ID, 0, 0));
         let blocks = vec![block(1, 1_757_000_000)];
         seed_finalized_batch(&chain, CHAIN_ID, 0, &blocks);
         // Tamper with the on-chain acc after seeding a genuinely matching batch.
-        let (batch_pda, _) = zk_inbox_client::batch_pda(&PROGRAM, CHAIN_ID, 0);
+        let (batch_pda, _) = zk_inbox_client::batch_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID, 0);
         let mut data = {
             let map = chain.0.lock().unwrap();
             map.get(&batch_pda).unwrap().clone()
@@ -1140,7 +1168,7 @@ mod tests {
     #[tokio::test]
     async fn an_abandoned_batch_in_the_pending_window_is_walked_past() {
         let chain = FakeChain::default();
-        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, CHAIN_ID);
+        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(cursor_pda, cursor_bytes(CHAIN_ID, 2));
         let (root_pda, _) = zk_settlement_client::root_pda(&SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(root_pda, root_bytes(CHAIN_ID, 0, 0));
@@ -1168,11 +1196,11 @@ mod tests {
     #[tokio::test]
     async fn an_open_not_finalized_batch_in_the_walk_is_a_named_caller_ordering_error() {
         let chain = FakeChain::default();
-        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, CHAIN_ID);
+        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(cursor_pda, cursor_bytes(CHAIN_ID, 1));
         let (root_pda, _) = zk_settlement_client::root_pda(&SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(root_pda, root_bytes(CHAIN_ID, 0, 0));
-        let (batch_pda, _) = zk_inbox_client::batch_pda(&PROGRAM, CHAIN_ID, 0);
+        let (batch_pda, _) = zk_inbox_client::batch_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID, 0);
         let mut d = vec![0u8; rome_zk_layouts::batch::account_len(0)];
         d[0..4].copy_from_slice(&rome_zk_layouts::batch::MAGIC.to_le_bytes());
         d[4] = rome_zk_layouts::batch::VERSION;
@@ -1203,7 +1231,7 @@ mod tests {
     #[tokio::test]
     async fn the_closed_batch_fallback_replays_the_log_for_an_exact_timestamp_seed() {
         let chain = FakeChain::default();
-        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, CHAIN_ID);
+        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(cursor_pda, cursor_bytes(CHAIN_ID, 1));
         // head_final_batch = 0, so the pending window (b in 1..=0) is empty — straight to the root
         // fallback. root.number = 2 (the last block actually posted; from_block =
@@ -1318,7 +1346,7 @@ mod tests {
     #[tokio::test]
     async fn a_finalized_batch_with_recycled_chunks_at_or_below_the_head_falls_back_to_the_root() {
         let chain = FakeChain::default();
-        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, CHAIN_ID);
+        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(cursor_pda, cursor_bytes(CHAIN_ID, 1));
         // batch 0 is Finalized (real header, finalized=1) but its chunks were never seeded — `Missing`
         // from the walk's point of view — and head_final_batch (1) >= batch (0): the chunks were
@@ -1330,7 +1358,7 @@ mod tests {
             ..rome_zk_layouts::batch::OFF_EXPECTED_COUNT + 4]
             .copy_from_slice(&2u32.to_le_bytes());
         d[rome_zk_layouts::batch::OFF_FINALIZED] = 1;
-        let (batch_pda, _) = zk_inbox_client::batch_pda(&PROGRAM, CHAIN_ID, 0);
+        let (batch_pda, _) = zk_inbox_client::batch_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID, 0);
         chain.set_account(batch_pda, d);
         // root.number = 0 (the sentinel) so the fallback's own timestamp seed needs no log replay at all
         // — this test is about the fallback firing, not the replay path (covered separately).
@@ -1362,7 +1390,7 @@ mod tests {
     #[tokio::test]
     async fn a_finalized_batch_with_missing_chunks_above_the_head_is_a_hard_refusal() {
         let chain = FakeChain::default();
-        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, CHAIN_ID);
+        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(cursor_pda, cursor_bytes(CHAIN_ID, 2));
         let mut d1 = vec![0u8; rome_zk_layouts::batch::account_len(2)];
         d1[0..4].copy_from_slice(&rome_zk_layouts::batch::MAGIC.to_le_bytes());
@@ -1371,7 +1399,8 @@ mod tests {
             ..rome_zk_layouts::batch::OFF_EXPECTED_COUNT + 4]
             .copy_from_slice(&2u32.to_le_bytes());
         d1[rome_zk_layouts::batch::OFF_FINALIZED] = 1;
-        let (batch1_pda, _) = zk_inbox_client::batch_pda(&PROGRAM, CHAIN_ID, 1);
+        let (batch1_pda, _) =
+            zk_inbox_client::batch_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID, 1);
         chain.set_account(batch1_pda, d1);
         let (root_pda, _) = zk_settlement_client::root_pda(&SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(root_pda, root_bytes(CHAIN_ID, 0, 0)); // head_final_batch = 0 < batch 1
@@ -1427,7 +1456,7 @@ mod tests {
     #[tokio::test]
     async fn the_closed_batch_fallback_refuses_when_the_log_does_not_start_at_block_one() {
         let chain = FakeChain::default();
-        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, CHAIN_ID);
+        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(cursor_pda, cursor_bytes(CHAIN_ID, 1));
         let (root_pda, _) = zk_settlement_client::root_pda(&SETTLEMENT_PROGRAM, CHAIN_ID);
         // root.number = 2: from_block = 3; the replay must walk blocks 1 and 2 before returning block
@@ -1483,7 +1512,7 @@ mod tests {
     #[tokio::test]
     async fn the_walk_spans_more_than_one_page_and_still_finds_the_finalized_batch() {
         let chain = FakeChain::default();
-        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, CHAIN_ID);
+        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
         // 150 ever-opened ids: batch 0 finalized with real chunks, 1..149 never opened (Missing) — the
         // walk must cross the 100-id page boundary to find it.
         chain.set_account(cursor_pda, cursor_bytes(CHAIN_ID, 150));
@@ -1513,7 +1542,7 @@ mod tests {
     #[tokio::test]
     async fn a_chunk_with_trailing_bytes_past_its_sealed_len_still_anchors() {
         let chain = FakeChain::default();
-        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, CHAIN_ID);
+        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(cursor_pda, cursor_bytes(CHAIN_ID, 1));
         let (root_pda, _) = zk_settlement_client::root_pda(&SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(root_pda, root_bytes(CHAIN_ID, 0, 0));
@@ -1522,7 +1551,8 @@ mod tests {
 
         // Append 8 trailing zero bytes past the one chunk's sealed `len` — exactly as an `Open` sized
         // larger than the eventual `Seal` would leave behind.
-        let (chunk_pda, _) = zk_inbox_client::chunk_pda(&PROGRAM, CHAIN_ID, 0, 0);
+        let (chunk_pda, _) =
+            zk_inbox_client::chunk_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID, 0, 0);
         let mut data = {
             let map = chain.0.lock().unwrap();
             map.get(&chunk_pda).unwrap().clone()
@@ -1571,9 +1601,9 @@ mod tests {
     #[tokio::test]
     async fn a_v1_shaped_batch_account_is_refused_as_bad_version() {
         let chain = FakeChain::default();
-        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, CHAIN_ID);
+        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(cursor_pda, cursor_bytes(CHAIN_ID, 1));
-        let (batch_pda, _) = zk_inbox_client::batch_pda(&PROGRAM, CHAIN_ID, 0);
+        let (batch_pda, _) = zk_inbox_client::batch_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID, 0);
         let mut d = vec![0u8; 202];
         d[rome_zk_layouts::batch::OFF_MAGIC..rome_zk_layouts::batch::OFF_MAGIC + 4]
             .copy_from_slice(&rome_zk_layouts::batch::MAGIC.to_le_bytes());

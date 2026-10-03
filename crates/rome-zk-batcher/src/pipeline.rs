@@ -153,6 +153,9 @@ pub fn re_derive_and_check(blocks: &[Block], compressed: &[u8]) -> Result<(), Pi
 #[derive(Debug, Clone, Copy)]
 pub struct BatchTarget {
     pub program_id: Pubkey,
+    /// The settlement program this chain is registered under — every inbox account (cursor, batch,
+    /// chunk) is keyed by it.
+    pub settlement_program: Pubkey,
     pub payer: Pubkey,
     pub chain_id: u64,
     pub batch: u64,
@@ -191,7 +194,6 @@ pub async fn open_and_grow_batch<S: Sender>(
     sender: &S,
     target: BatchTarget,
     expected_count: u32,
-    settlement_program: &Pubkey,
     tuning: SendTuning,
 ) -> Result<solana_signature::Signature, PipelineError> {
     let ixs = zk_inbox_client::open_and_grow_batch_ixs(
@@ -200,7 +202,7 @@ pub async fn open_and_grow_batch<S: Sender>(
         target.chain_id,
         target.batch,
         expected_count,
-        settlement_program,
+        &target.settlement_program,
     );
     Ok(sender.send_and_confirm(&ixs, tuning).await?)
 }
@@ -239,7 +241,8 @@ pub async fn abandon_open_batches_in_pending_window<A: AccountOps, S: Sender>(
     payer_pubkey: Pubkey,
     tuning: SendTuning,
 ) -> Result<Vec<u64>, PipelineError> {
-    let (cursor_pda, _) = zk_inbox_client::cursor_pda(inbox_program_id, chain_id);
+    let (cursor_pda, _) =
+        zk_inbox_client::cursor_pda(inbox_program_id, settlement_program_id, chain_id);
     let next_batch = match accounts.get_account(&cursor_pda).await? {
         None => return Ok(Vec::new()), // InitBatchCursor never run for this chain — nothing to abandon.
         Some(data) => zk_inbox_client::decode_batch_cursor(&data)?.next_batch,
@@ -257,8 +260,14 @@ pub async fn abandon_open_batches_in_pending_window<A: AccountOps, S: Sender>(
     // walk already uses (`resolve::PROBE_PAGE_SIZE` / `anchor::ANCHOR_WALK_PAGE_SIZE`, one shared home —
     // `resolve::probe_batch_states_paged`), never one-at-a-time.
     let ids: Vec<u64> = (head_final_batch..next_batch).collect();
-    let states =
-        resolve::probe_batch_states_paged(accounts, inbox_program_id, chain_id, &ids).await?;
+    let states = resolve::probe_batch_states_paged(
+        accounts,
+        inbox_program_id,
+        settlement_program_id,
+        chain_id,
+        &ids,
+    )
+    .await?;
 
     // Defense-in-depth: FinalizeBatch is authority-gated on chain now, so this shape can no
     // longer arise from a third party — only ever from this same chain's own authority (e.g. a program
@@ -295,15 +304,29 @@ pub async fn abandon_open_batches_in_pending_window<A: AccountOps, S: Sender>(
              next_batch={next_batch})) is open-not-finalized at startup — abandoning it and closing its \
              chunk PDAs before posting anything"
         );
-        let abandon_ix =
-            zk_inbox_client::abandon_batch_ix(inbox_program_id, &payer_pubkey, chain_id, batch);
+        let abandon_ix = zk_inbox_client::abandon_batch_ix(
+            inbox_program_id,
+            &payer_pubkey,
+            settlement_program_id,
+            chain_id,
+            batch,
+        );
         sender
             .send_and_confirm(std::slice::from_ref(&abandon_ix), tuning)
             .await?;
 
         if expected_count > 0 {
             let chunk_pdas: Vec<Pubkey> = (0..expected_count)
-                .map(|idx| zk_inbox_client::chunk_pda(inbox_program_id, chain_id, batch, idx).0)
+                .map(|idx| {
+                    zk_inbox_client::chunk_pda(
+                        inbox_program_id,
+                        settlement_program_id,
+                        chain_id,
+                        batch,
+                        idx,
+                    )
+                    .0
+                })
                 .collect();
             let exists = accounts.accounts_exist(&chunk_pdas).await?;
             let existing_idxs: Vec<u32> = exists
@@ -313,11 +336,19 @@ pub async fn abandon_open_batches_in_pending_window<A: AccountOps, S: Sender>(
                 .collect();
             // `Close` is cheap (a lamport move + a realloc(0), never
             // proportional to a batch's own leaf count — `programs/zk-inbox/src/lib.rs`'s `Close` arm), so
-            // several fit comfortably under one chunk-lane compute budget in one transaction — packing
-            // `CLOSE_IXS_PER_TX` at a time cuts a real, abandoned 900-chunk batch's restart cost from ~900
-            // sequential confirmations to ~225 (measured against `chunk_compute_unit_limit`,
+            // several ride in one transaction — packing `CLOSE_IXS_PER_TX` at a time cuts a real, abandoned
+            // 900-chunk batch's restart cost from ~900 sequential confirmations to ~225. Each `Close` derives
+            // its chunk, batch and root addresses from the chain's settlement program, so one `Close` costs
+            // about half of `chunk_compute_unit_limit` and four do not fit under a single one of them: a
+            // packed group asks for one `chunk_compute_unit_limit` per `Close` (measured in
             // `tests/abandon_cu_limit.rs`).
             for group in existing_idxs.chunks(CLOSE_IXS_PER_TX) {
+                let group_tuning = SendTuning {
+                    compute_unit_limit: tuning
+                        .compute_unit_limit
+                        .saturating_mul(group.len() as u32),
+                    ..tuning
+                };
                 let close_ixs: Vec<Instruction> = group
                     .iter()
                     .map(|&idx| {
@@ -331,7 +362,7 @@ pub async fn abandon_open_batches_in_pending_window<A: AccountOps, S: Sender>(
                         )
                     })
                     .collect();
-                sender.send_and_confirm(&close_ixs, tuning).await?;
+                sender.send_and_confirm(&close_ixs, group_tuning).await?;
             }
         }
         abandoned.push(batch);
@@ -340,8 +371,9 @@ pub async fn abandon_open_batches_in_pending_window<A: AccountOps, S: Sender>(
 }
 
 /// How many chunk `Close` instructions ride in one transaction during the startup
-/// abandon (`abandon_open_batches_in_pending_window`) — a conservative factor under `chunk_compute_unit_limit`
-/// (measured per-`Close` cost, `tests/abandon_cu_limit.rs`), not the account-list ceiling (each `Close`
+/// abandon (`abandon_open_batches_in_pending_window`) — a conservative factor given each group's compute
+/// budget of one `chunk_compute_unit_limit` per `Close` (measured per-`Close` cost,
+/// `tests/abandon_cu_limit.rs`), not the account-list ceiling (each `Close`
 /// only adds one unique writable account — the chunk PDA — atop the shared signer/batch/root triple, so
 /// Solana's 64-account-per-transaction limit is nowhere close to binding at this count).
 pub const CLOSE_IXS_PER_TX: usize = 4;
@@ -353,6 +385,7 @@ pub const CLOSE_IXS_PER_TX: usize = 4;
 pub fn plan_chunk(
     program_id: &Pubkey,
     payer: &Pubkey,
+    settlement_program: &Pubkey,
     chain_id: u64,
     batch: u64,
     idx: u32,
@@ -361,18 +394,36 @@ pub fn plan_chunk(
     let len = payload.len() as u32;
     let body_hash = zk_inbox_client::chunk_body_hash(payload);
     vec![
-        zk_inbox_client::open_chunk_ix(program_id, payer, chain_id, batch, idx, len),
+        zk_inbox_client::open_chunk_ix(
+            program_id,
+            payer,
+            settlement_program,
+            chain_id,
+            batch,
+            idx,
+            len,
+        ),
         zk_inbox_client::write_chunk_ix(
             program_id,
             payer,
+            settlement_program,
             chain_id,
             batch,
             idx,
             0,
             payload.to_vec(),
         ),
-        zk_inbox_client::seal_chunk_ix(program_id, payer, chain_id, batch, idx, len, body_hash),
-        zk_inbox_client::seal_leaf_ix(program_id, chain_id, batch, idx),
+        zk_inbox_client::seal_chunk_ix(
+            program_id,
+            payer,
+            settlement_program,
+            chain_id,
+            batch,
+            idx,
+            len,
+            body_hash,
+        ),
+        zk_inbox_client::seal_leaf_ix(program_id, settlement_program, chain_id, batch, idx),
     ]
 }
 
@@ -395,6 +446,7 @@ async fn send_frame<S: Sender>(
     let ixs = plan_chunk(
         &target.program_id,
         &target.payer,
+        &target.settlement_program,
         target.chain_id,
         target.batch,
         idx,
@@ -424,6 +476,7 @@ pub fn build_frame_jobs(target: BatchTarget, frames: &[Frame]) -> Vec<FramePlan>
             into_stages(plan_chunk(
                 &target.program_id,
                 &target.payer,
+                &target.settlement_program,
                 target.chain_id,
                 target.batch,
                 idx,
@@ -495,8 +548,12 @@ pub async fn finalize_and_verify<S: Sender, A: AccountOps>(
     poll: FinalizePoll,
     frames: &[Frame],
 ) -> Result<zk_inbox_client::BatchAccount, PipelineError> {
-    let (batch_pda, _) =
-        zk_inbox_client::batch_pda(&target.program_id, target.chain_id, target.batch);
+    let (batch_pda, _) = zk_inbox_client::batch_pda(
+        &target.program_id,
+        &target.settlement_program,
+        target.chain_id,
+        target.batch,
+    );
     let read_batch_account =
         |data: Vec<u8>| -> Result<zk_inbox_client::BatchAccount, PipelineError> {
             Ok(zk_inbox_client::decode_batch_account(&data)?)
@@ -552,6 +609,7 @@ pub async fn finalize_and_verify<S: Sender, A: AccountOps>(
         let finalize_ix = zk_inbox_client::finalize_batch_ix(
             &target.program_id,
             &target.payer,
+            &target.settlement_program,
             target.chain_id,
             target.batch,
             0,
@@ -920,6 +978,7 @@ impl<S: Sender + 'static, A: AccountOps + 'static> WindowedPoster<S, A> {
         let batch = match resolve::resolve_batch_id(
             self.accounts.as_ref(),
             &self.cfg.inbox_program_id,
+            &self.cfg.settlement_program_id,
             self.cfg.chain_id,
             &compressed,
             self.cfg.max_frame_body_len,
@@ -944,6 +1003,7 @@ impl<S: Sender + 'static, A: AccountOps + 'static> WindowedPoster<S, A> {
 
         let target = BatchTarget {
             program_id: self.cfg.inbox_program_id,
+            settlement_program: self.cfg.settlement_program_id,
             payer: self.cfg.payer,
             chain_id: self.cfg.chain_id,
             batch,
@@ -968,7 +1028,6 @@ impl<S: Sender + 'static, A: AccountOps + 'static> WindowedPoster<S, A> {
             self.sender.as_ref(),
             target,
             frames.len() as u32,
-            &self.cfg.settlement_program_id,
             self.cfg.chunk_tuning,
         )
         .await?;
@@ -981,8 +1040,12 @@ impl<S: Sender + 'static, A: AccountOps + 'static> WindowedPoster<S, A> {
         // its own committed open_unix_ts against this send's wall clock. Observability only — a read or
         // decode failure here is logged and skipped, never propagated: it must never affect whether this
         // OpenBatch is considered successful (it already confirmed, above).
-        let (batch_pda, _) =
-            zk_inbox_client::batch_pda(&target.program_id, target.chain_id, target.batch);
+        let (batch_pda, _) = zk_inbox_client::batch_pda(
+            &target.program_id,
+            &target.settlement_program,
+            target.chain_id,
+            target.batch,
+        );
         match self.accounts.get_account(&batch_pda).await {
             Ok(Some(data)) => match zk_inbox_client::decode_batch_account(&data) {
                 Ok(account) => self
@@ -1541,7 +1604,15 @@ mod tests {
         let payload: Vec<u8> = (0..(FRAME_HEADER_LEN + channel::DEFAULT_MAX_FRAME_BODY_LEN) as u32)
             .map(|i| i as u8)
             .collect();
-        let ixs = plan_chunk(&program_id, &payer, 1, 1, 0, &payload);
+        let ixs = plan_chunk(
+            &program_id,
+            &payer,
+            &Pubkey::new_unique(),
+            1,
+            1,
+            0,
+            &payload,
+        );
         assert_eq!(ixs.len(), 4, "Open + Write + Seal + SealLeaf, always");
 
         let write: zk_inbox::InboxIx =
@@ -1564,7 +1635,15 @@ mod tests {
         let program_id = Pubkey::new_unique();
         let payer = Pubkey::new_unique();
         let payload = vec![0u8; FRAME_HEADER_LEN + 50];
-        let ixs = plan_chunk(&program_id, &payer, 1, 1, 0, &payload);
+        let ixs = plan_chunk(
+            &program_id,
+            &payer,
+            &Pubkey::new_unique(),
+            1,
+            1,
+            0,
+            &payload,
+        );
         assert_eq!(ixs.len(), 4);
     }
 
@@ -1574,6 +1653,7 @@ mod tests {
     fn build_frame_jobs_returns_one_single_tx_stage_per_frame() {
         let target = BatchTarget {
             program_id: Pubkey::new_unique(),
+            settlement_program: Pubkey::new_unique(),
             payer: Pubkey::new_unique(),
             chain_id: 7,
             batch: 3,
@@ -1788,6 +1868,7 @@ mod tests {
         fn target() -> BatchTarget {
             BatchTarget {
                 program_id: Pubkey::new_unique(),
+                settlement_program: Pubkey::new_unique(),
                 payer: Pubkey::new_unique(),
                 chain_id: 7,
                 batch: 3,
@@ -1948,7 +2029,8 @@ mod tests {
 
         impl AccountOps for CountingAccounts {
             async fn get_account(&self, pubkey: &Pubkey) -> Result<Option<Vec<u8>>, ResolveError> {
-                let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, CHAIN_ID);
+                let (cursor_pda, _) =
+                    zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
                 let (root_pda, _) = zk_settlement_client::root_pda(&SETTLEMENT_PROGRAM, CHAIN_ID);
                 if *pubkey == cursor_pda {
                     let mut d = vec![0u8; rome_zk_layouts::cursor::LEN];
@@ -2055,7 +2137,8 @@ mod tests {
             let mut batch_pda_to_state = HashMap::new();
             let mut batch_pda_to_batch = HashMap::new();
             for batch in HEAD_FINAL_BATCH..NEXT_BATCH {
-                let (pda, _) = zk_inbox_client::batch_pda(&PROGRAM, CHAIN_ID, batch);
+                let (pda, _) =
+                    zk_inbox_client::batch_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID, batch);
                 batch_pda_to_batch.insert(pda, batch);
                 let state = match batch {
                     FINALIZED_A | FINALIZED_B => Scripted::Finalized,
@@ -2136,7 +2219,8 @@ mod tests {
             let mut batch_pda_to_state = HashMap::new();
             let mut batch_pda_to_batch = HashMap::new();
             for batch in 0u64..3 {
-                let (pda, _) = zk_inbox_client::batch_pda(&PROGRAM, CHAIN_ID, batch);
+                let (pda, _) =
+                    zk_inbox_client::batch_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID, batch);
                 batch_pda_to_batch.insert(pda, batch);
                 let state = match batch {
                     1 | 2 => Scripted::Finalized,

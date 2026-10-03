@@ -23,15 +23,12 @@
   "gasLimit": "__GAS_LIMIT_HEX__",
   "difficulty": "0x0",
   "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
-  "coinbase": "0x0000000000000000000000000000000000000000",
+  "coinbase": "__FEE_RECIPIENT__",
   "alloc": {
-    "__FUNDED_ADDRESS__": {
-      "balance": "0x33b2e3c9fd0803ce8000000"
-    },
     "0x4200000000000000000000000000000000000016": {
       "balance": "0x0",
       "code": "0x__EXIT_PORTAL_RUNTIME__"
-    }
+    }__BACKED_ALLOC__
   },
   "number": "0x0",
   "gasUsed": "0x0",

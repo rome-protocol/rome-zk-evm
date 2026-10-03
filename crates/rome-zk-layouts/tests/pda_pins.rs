@@ -43,12 +43,17 @@ fn tiber_live_root_pda() {
     );
 }
 
+/// The cursor is keyed by the settlement program as well as the chain id (`["batch_cursor",
+/// settlement_program, chain_id]`), so Tiber's cursor moves to a new address with the inbox-hardening
+/// migration. The old, chain-id-only address (`EiEySX3KbsJQ4YkrpAXcRMJvyKchHhFzssiMgp4d9EhX`) is no longer
+/// derived by anything.
 #[test]
 fn tiber_live_cursor_pda() {
-    let (pda, _bump) = rome_zk_layouts::cursor::pda(&inbox_program(), CHAIN_ID);
+    let (pda, _bump) =
+        rome_zk_layouts::cursor::pda(&inbox_program(), &settlement_program(), CHAIN_ID);
     assert_eq!(
         pda,
-        Pubkey::from_str("EiEySX3KbsJQ4YkrpAXcRMJvyKchHhFzssiMgp4d9EhX").unwrap()
+        Pubkey::from_str("7QZVu6DMfVmZx8ix7sKuHQQW6PH8drsWbstNErwoaq47").unwrap()
     );
 }
 
@@ -126,5 +131,41 @@ fn exit_record_pda_for_a_fixed_hash_derived_not_yet_on_chain() {
     assert_eq!(
         pda,
         Pubkey::from_str("4zKRen2M174kbMEzHfA9xFGyLs8Tc3kF6yZJ3x3U2Kzm").unwrap()
+    );
+}
+
+/// The three inbox accounts are keyed by the settlement program: the seed lists are written out here by hand
+/// (not through `seeds()`), so a reordering or a dropped seed in the crate shows up as a mismatch.
+#[test]
+fn inbox_accounts_are_keyed_by_the_settlement_program() {
+    let (inbox, settle) = (inbox_program(), settlement_program());
+    let chain = CHAIN_ID.to_le_bytes();
+    let batch = 3u64.to_le_bytes();
+    let idx = 2u32.to_le_bytes();
+    assert_eq!(
+        rome_zk_layouts::cursor::pda(&inbox, &settle, CHAIN_ID).0,
+        Pubkey::find_program_address(&[b"batch_cursor", settle.as_ref(), &chain], &inbox).0
+    );
+    assert_eq!(
+        rome_zk_layouts::batch::pda(&inbox, &settle, CHAIN_ID, 3).0,
+        Pubkey::find_program_address(&[b"batch", settle.as_ref(), &chain, &batch], &inbox).0
+    );
+    assert_eq!(
+        rome_zk_layouts::chunk::pda(&inbox, &settle, CHAIN_ID, 3, 2).0,
+        Pubkey::find_program_address(&[b"inbox", settle.as_ref(), &chain, &batch, &idx], &inbox).0
+    );
+    // A different settlement program never lands on the same address.
+    let other = Pubkey::new_from_array([7u8; 32]);
+    assert_ne!(
+        rome_zk_layouts::cursor::pda(&inbox, &other, CHAIN_ID).0,
+        rome_zk_layouts::cursor::pda(&inbox, &settle, CHAIN_ID).0
+    );
+    assert_ne!(
+        rome_zk_layouts::batch::pda(&inbox, &other, CHAIN_ID, 3).0,
+        rome_zk_layouts::batch::pda(&inbox, &settle, CHAIN_ID, 3).0
+    );
+    assert_ne!(
+        rome_zk_layouts::chunk::pda(&inbox, &other, CHAIN_ID, 3, 2).0,
+        rome_zk_layouts::chunk::pda(&inbox, &settle, CHAIN_ID, 3, 2).0
     );
 }

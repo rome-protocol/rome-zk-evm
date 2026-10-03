@@ -111,10 +111,12 @@ pub type BatchAccount = zk_inbox_client::BatchAccount;
 pub fn fetch_and_verify_batch(
     fetch: &mut impl AccountFetch,
     inbox_program_id: &Pubkey,
+    settlement_program: &Pubkey,
     chain_id: u64,
     batch: u64,
 ) -> Result<(BatchAccount, Vec<Vec<u8>>), InboxError> {
-    let (batch_pda, _) = zk_inbox_client::batch_pda(inbox_program_id, chain_id, batch);
+    let (batch_pda, _) =
+        zk_inbox_client::batch_pda(inbox_program_id, settlement_program, chain_id, batch);
     let batch_data = fetch
         .get_account(&batch_pda)?
         .ok_or_else(|| InboxError::BatchDecode(format!("batch account {batch_pda} not found")))?;
@@ -125,7 +127,9 @@ pub fn fetch_and_verify_batch(
     }
 
     let chunk_pdas: Vec<Pubkey> = (0..batch_account.expected_count)
-        .map(|idx| zk_inbox_client::chunk_pda(inbox_program_id, chain_id, batch, idx).0)
+        .map(|idx| {
+            zk_inbox_client::chunk_pda(inbox_program_id, settlement_program, chain_id, batch, idx).0
+        })
         .collect();
     let chunk_datas = fetch.get_multiple_accounts(&chunk_pdas)?;
 
@@ -248,6 +252,7 @@ mod tests {
     #[test]
     fn fetch_and_verify_batch_reads_a_real_shaped_batch() {
         let inbox_program = Pubkey::new_unique();
+        let settlement_program = Pubkey::new_unique();
         let (chain_id, batch, open_slot) = (200101u64, 7u64, 42u64);
         let body = b"a chunk body".to_vec();
         let chunk_hash = rome_zk_merkle::keccak256(&[&body]);
@@ -261,7 +266,7 @@ mod tests {
             expected_count: 1,
             leaves_present: 1,
             finalized: true,
-            settlement_program: [0u8; 32],
+            settlement_program: settlement_program.to_bytes(),
             authority: [0u8; 32],
             root,
             forced_root,
@@ -272,15 +277,23 @@ mod tests {
         let batch_data = rome_zk_layouts::batch::write_header(&batch_header);
 
         let mut fetch = FakeFetch::default();
-        let (batch_pda, _) = zk_inbox_client::batch_pda(&inbox_program, chain_id, batch);
+        let (batch_pda, _) =
+            zk_inbox_client::batch_pda(&inbox_program, &settlement_program, chain_id, batch);
         fetch.accounts.insert(batch_pda, batch_data.to_vec());
-        let (chunk_pda, _) = zk_inbox_client::chunk_pda(&inbox_program, chain_id, batch, 0);
+        let (chunk_pda, _) =
+            zk_inbox_client::chunk_pda(&inbox_program, &settlement_program, chain_id, batch, 0);
         fetch
             .accounts
             .insert(chunk_pda, chunk_account(chain_id, batch, 0, true, &body));
 
-        let (account, bodies) =
-            fetch_and_verify_batch(&mut fetch, &inbox_program, chain_id, batch).unwrap();
+        let (account, bodies) = fetch_and_verify_batch(
+            &mut fetch,
+            &inbox_program,
+            &settlement_program,
+            chain_id,
+            batch,
+        )
+        .unwrap();
         assert_eq!(account.acc, acc);
         assert_eq!(account.open_unix_ts, 1_789_337_436);
         assert_eq!(bodies, vec![body]);
@@ -292,6 +305,7 @@ mod tests {
     #[test]
     fn fetch_and_verify_batch_refuses_an_unfinalized_batch() {
         let inbox_program = Pubkey::new_unique();
+        let settlement_program = Pubkey::new_unique();
         let (chain_id, batch, open_slot) = (200101u64, 7u64, 42u64);
         let body = b"a chunk body".to_vec();
         let chunk_hash = rome_zk_merkle::keccak256(&[&body]);
@@ -305,7 +319,7 @@ mod tests {
             expected_count: 1,
             leaves_present: 1,
             finalized: false, // still open — not finalized
-            settlement_program: [0u8; 32],
+            settlement_program: settlement_program.to_bytes(),
             authority: [0u8; 32],
             root,
             forced_root,
@@ -316,12 +330,20 @@ mod tests {
         let batch_data = rome_zk_layouts::batch::write_header(&batch_header);
 
         let mut fetch = FakeFetch::default();
-        let (batch_pda, _) = zk_inbox_client::batch_pda(&inbox_program, chain_id, batch);
+        let (batch_pda, _) =
+            zk_inbox_client::batch_pda(&inbox_program, &settlement_program, chain_id, batch);
         fetch.accounts.insert(batch_pda, batch_data.to_vec());
         // Deliberately no chunk account inserted — a BatchNotFinalized refusal must fire before any
         // chunk is looked up at all.
 
-        let err = fetch_and_verify_batch(&mut fetch, &inbox_program, chain_id, batch).unwrap_err();
+        let err = fetch_and_verify_batch(
+            &mut fetch,
+            &inbox_program,
+            &settlement_program,
+            chain_id,
+            batch,
+        )
+        .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -348,8 +370,15 @@ mod tests {
     #[test]
     fn a_fetch_error_on_the_batch_account_read_is_a_named_fetch_error_not_a_missing_batch() {
         let inbox_program = Pubkey::new_unique();
-        let err =
-            fetch_and_verify_batch(&mut AlwaysErrorsFetch, &inbox_program, 200101, 7).unwrap_err();
+        let settlement_program = Pubkey::new_unique();
+        let err = fetch_and_verify_batch(
+            &mut AlwaysErrorsFetch,
+            &inbox_program,
+            &settlement_program,
+            200101,
+            7,
+        )
+        .unwrap_err();
         assert!(
             matches!(err, InboxError::Fetch(_)),
             "a transport failure must be InboxError::Fetch, not BatchDecode; got {err:?}"
@@ -361,6 +390,7 @@ mod tests {
     #[test]
     fn fetch_and_verify_batch_refuses_a_tampered_chunk_body() {
         let inbox_program = Pubkey::new_unique();
+        let settlement_program = Pubkey::new_unique();
         let (chain_id, batch, open_slot) = (200101u64, 7u64, 42u64);
         let real_body = b"the real body".to_vec();
         let chunk_hash = rome_zk_merkle::keccak256(&[&real_body]);
@@ -373,7 +403,7 @@ mod tests {
             expected_count: 1,
             leaves_present: 1,
             finalized: true,
-            settlement_program: [0u8; 32],
+            settlement_program: settlement_program.to_bytes(),
             authority: [0u8; 32],
             root,
             forced_root,
@@ -384,9 +414,11 @@ mod tests {
         let batch_data = rome_zk_layouts::batch::write_header(&batch_header);
 
         let mut fetch = FakeFetch::default();
-        let (batch_pda, _) = zk_inbox_client::batch_pda(&inbox_program, chain_id, batch);
+        let (batch_pda, _) =
+            zk_inbox_client::batch_pda(&inbox_program, &settlement_program, chain_id, batch);
         fetch.accounts.insert(batch_pda, batch_data.to_vec());
-        let (chunk_pda, _) = zk_inbox_client::chunk_pda(&inbox_program, chain_id, batch, 0);
+        let (chunk_pda, _) =
+            zk_inbox_client::chunk_pda(&inbox_program, &settlement_program, chain_id, batch, 0);
         // Tampered body served back — same length, different bytes.
         let tampered = b"a fake replaced body!!".to_vec();
         fetch.accounts.insert(
@@ -394,7 +426,14 @@ mod tests {
             chunk_account(chain_id, batch, 0, true, &tampered),
         );
 
-        let err = fetch_and_verify_batch(&mut fetch, &inbox_program, chain_id, batch).unwrap_err();
+        let err = fetch_and_verify_batch(
+            &mut fetch,
+            &inbox_program,
+            &settlement_program,
+            chain_id,
+            batch,
+        )
+        .unwrap_err();
         assert!(matches!(err, InboxError::AccMismatch { .. }), "got {err:?}");
     }
 
@@ -442,6 +481,7 @@ mod tests {
     #[test]
     fn fetch_and_verify_batch_pages_every_chunk_read_at_100_keys_per_call() {
         let inbox_program = Pubkey::new_unique();
+        let settlement_program = Pubkey::new_unique();
         let (chain_id, batch, open_slot) = (200101u64, 11u64, 99u64);
         let n = 250u32;
         let bodies: Vec<Vec<u8>> = (0..n)
@@ -461,7 +501,7 @@ mod tests {
             expected_count: n,
             leaves_present: n,
             finalized: true,
-            settlement_program: [0u8; 32],
+            settlement_program: settlement_program.to_bytes(),
             authority: [0u8; 32],
             root,
             forced_root,
@@ -472,19 +512,31 @@ mod tests {
         let batch_data = rome_zk_layouts::batch::write_header(&batch_header);
 
         let mut fetch = CountingPagedFetch::default();
-        let (batch_pda, _) = zk_inbox_client::batch_pda(&inbox_program, chain_id, batch);
+        let (batch_pda, _) =
+            zk_inbox_client::batch_pda(&inbox_program, &settlement_program, chain_id, batch);
         fetch.accounts.insert(batch_pda, batch_data.to_vec());
         for (idx, body) in bodies.iter().enumerate() {
-            let (chunk_pda, _) =
-                zk_inbox_client::chunk_pda(&inbox_program, chain_id, batch, idx as u32);
+            let (chunk_pda, _) = zk_inbox_client::chunk_pda(
+                &inbox_program,
+                &settlement_program,
+                chain_id,
+                batch,
+                idx as u32,
+            );
             fetch.accounts.insert(
                 chunk_pda,
                 chunk_account(chain_id, batch, idx as u32, true, body),
             );
         }
 
-        let (account, got_bodies) =
-            fetch_and_verify_batch(&mut fetch, &inbox_program, chain_id, batch).unwrap();
+        let (account, got_bodies) = fetch_and_verify_batch(
+            &mut fetch,
+            &inbox_program,
+            &settlement_program,
+            chain_id,
+            batch,
+        )
+        .unwrap();
         assert_eq!(account.acc, acc);
         assert_eq!(got_bodies, bodies);
         assert_eq!(

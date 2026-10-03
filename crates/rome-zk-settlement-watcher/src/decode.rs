@@ -11,6 +11,7 @@
 //! tx; two `Open`s for two different chunks in one tx must both be recorded).
 
 use serde::{Deserialize, Serialize};
+use solana_program::pubkey::Pubkey;
 use solana_transaction_status_client_types::UiRawMessage;
 use zk_inbox_client::{batch_account_index, chunk_account_index, InboxIx};
 
@@ -151,10 +152,25 @@ fn account_at<'a>(accounts: &[Option<&'a str>], idx: Option<usize>) -> Option<&'
 /// an extension seam) is skipped, not fatal -- this watcher must keep making progress on
 /// instructions it does understand rather than wedge the whole page on one it does not (a DB stall or
 /// RPC hang must never silently stop this service).
-pub fn decode_inbox_tx(message: &UiRawMessage, inbox_program_id: &str) -> DecodedTx {
+///
+/// `settlement_program` is the settlement program this watcher follows. The inbox program is shared by every
+/// settlement program and anyone can open a batch or chunk for any chain id under their own, so an instruction is
+/// attributed to this chain only when it belongs to `settlement_program`: an `OpenBatch` must name it, and a
+/// chunk `Open` must create the account at `chunk_pda(inbox, settlement_program, chain_id, batch, idx)`. Anything
+/// else is decoded (its name is still listed) but yields no event. `Seal`, `Close` and the later batch
+/// instructions carry no chain or batch of their own; they attach by account address to a row an accepted open
+/// created, so a foreign address finds nothing.
+pub fn decode_inbox_tx(
+    message: &UiRawMessage,
+    inbox_program_id: &str,
+    settlement_program: &Pubkey,
+) -> DecodedTx {
     let mut out = DecodedTx {
         signer: message.account_keys.first().cloned(),
         ..DecodedTx::default()
+    };
+    let Ok(inbox_key) = inbox_program_id.parse::<Pubkey>() else {
+        return out;
     };
     for ins in &message.instructions {
         let Some(program_key) = message.account_keys.get(ins.program_id_index as usize) else {
@@ -189,9 +205,18 @@ pub fn decode_inbox_tx(message: &UiRawMessage, inbox_program_id: &str) -> Decode
                 size,
             } => {
                 out.ix_names.push("Open");
-                out.chain_id = Some(chain_id);
-                out.batch_id = Some(batch);
-                if let Some(chunk_pda) = chunk_pda {
+                let expected_chunk = zk_inbox_client::chunk_pda(
+                    &inbox_key,
+                    settlement_program,
+                    chain_id,
+                    batch,
+                    idx,
+                )
+                .0
+                .to_string();
+                if let Some(chunk_pda) = chunk_pda.filter(|a| *a == expected_chunk) {
+                    out.chain_id = Some(chain_id);
+                    out.batch_id = Some(batch);
                     out.chunk_events.push(ChunkEvent {
                         chunk_pda,
                         kind: ChunkEventKind::Opened {
@@ -229,9 +254,13 @@ pub fn decode_inbox_tx(message: &UiRawMessage, inbox_program_id: &str) -> Decode
                 chain_id,
                 batch,
                 expected_count,
-                ..
+                settlement_program: opened_under,
             } => {
                 out.ix_names.push("OpenBatch");
+                // A batch opened under another settlement program for the same (chain_id, batch) is not ours.
+                if opened_under != *settlement_program {
+                    continue;
+                }
                 out.chain_id = Some(chain_id);
                 out.batch_id = Some(batch);
                 if let Some(pda) = batch_pda {
@@ -395,6 +424,9 @@ fn exit_message_hash(m: &zk_settlement_client::ExitMessageArg) -> [u8; 32] {
 mod tests {
     use super::*;
     use solana_program::pubkey::Pubkey;
+
+    /// Stand-in settlement program the fixture chain is registered under (inbox accounts are keyed by it).
+    const SETTLEMENT_PROGRAM: Pubkey = Pubkey::new_from_array([7u8; 32]);
     use solana_sdk::message::{Message, MessageHeader};
     use zk_inbox_client::{
         finalize_batch_ix, open_batch_ix, open_chunk_ix, seal_chunk_ix, write_chunk_ix,
@@ -442,14 +474,32 @@ mod tests {
     fn decode_inbox_tx_produces_opened_then_sealed_for_the_same_chunk_pda() {
         let program_id = Pubkey::new_unique();
         let payer = Pubkey::new_unique();
-        let chunk = zk_inbox_client::chunk_pda(&program_id, 200_101, 4005, 17).0;
+        let chunk =
+            zk_inbox_client::chunk_pda(&program_id, &SETTLEMENT_PROGRAM, 200_101, 4005, 17).0;
 
         let ixs = [
-            open_chunk_ix(&program_id, &payer, 200_101, 4005, 17, 3_681),
-            seal_chunk_ix(&program_id, &payer, 200_101, 4005, 17, 3_681, [9u8; 32]),
+            open_chunk_ix(
+                &program_id,
+                &payer,
+                &SETTLEMENT_PROGRAM,
+                200_101,
+                4005,
+                17,
+                3_681,
+            ),
+            seal_chunk_ix(
+                &program_id,
+                &payer,
+                &SETTLEMENT_PROGRAM,
+                200_101,
+                4005,
+                17,
+                3_681,
+                [9u8; 32],
+            ),
         ];
         let msg = raw_message(&payer, &ixs);
-        let decoded = decode_inbox_tx(&msg, &program_id.to_string());
+        let decoded = decode_inbox_tx(&msg, &program_id.to_string(), &SETTLEMENT_PROGRAM);
 
         assert_eq!(decoded.ix_names, vec!["Open", "Seal"]);
         assert_eq!(decoded.chain_id, Some(200_101));
@@ -482,16 +532,32 @@ mod tests {
         let program_id = Pubkey::new_unique();
         let payer = Pubkey::new_unique();
         let ixs = [
-            open_chunk_ix(&program_id, &payer, 200_101, 4005, 1, 100),
-            open_chunk_ix(&program_id, &payer, 200_101, 4005, 2, 200),
+            open_chunk_ix(
+                &program_id,
+                &payer,
+                &SETTLEMENT_PROGRAM,
+                200_101,
+                4005,
+                1,
+                100,
+            ),
+            open_chunk_ix(
+                &program_id,
+                &payer,
+                &SETTLEMENT_PROGRAM,
+                200_101,
+                4005,
+                2,
+                200,
+            ),
         ];
         let msg = raw_message(&payer, &ixs);
-        let decoded = decode_inbox_tx(&msg, &program_id.to_string());
+        let decoded = decode_inbox_tx(&msg, &program_id.to_string(), &SETTLEMENT_PROGRAM);
         assert_eq!(decoded.chunk_events.len(), 2);
-        let chunk1 = zk_inbox_client::chunk_pda(&program_id, 200_101, 4005, 1)
+        let chunk1 = zk_inbox_client::chunk_pda(&program_id, &SETTLEMENT_PROGRAM, 200_101, 4005, 1)
             .0
             .to_string();
-        let chunk2 = zk_inbox_client::chunk_pda(&program_id, 200_101, 4005, 2)
+        let chunk2 = zk_inbox_client::chunk_pda(&program_id, &SETTLEMENT_PROGRAM, 200_101, 4005, 2)
             .0
             .to_string();
         assert_ne!(chunk1, chunk2);
@@ -514,6 +580,7 @@ mod tests {
         let ixs = [seal_chunk_ix(
             &program_id,
             &payer,
+            &SETTLEMENT_PROGRAM,
             200_101,
             4005,
             17,
@@ -521,11 +588,11 @@ mod tests {
             [7u8; 32],
         )];
         let msg = raw_message(&payer, &ixs);
-        let decoded = decode_inbox_tx(&msg, &program_id.to_string());
+        let decoded = decode_inbox_tx(&msg, &program_id.to_string(), &SETTLEMENT_PROGRAM);
         assert_eq!(decoded.chunk_events.len(), 1);
         assert_eq!(
             decoded.chunk_events[0].chunk_pda,
-            zk_inbox_client::chunk_pda(&program_id, 200_101, 4005, 17)
+            zk_inbox_client::chunk_pda(&program_id, &SETTLEMENT_PROGRAM, 200_101, 4005, 17)
                 .0
                 .to_string()
         );
@@ -541,8 +608,9 @@ mod tests {
     fn decode_inbox_tx_close_carries_the_chunk_pda() {
         let program_id = Pubkey::new_unique();
         let payer = Pubkey::new_unique();
-        let settlement_program = Pubkey::new_unique();
-        let chunk = zk_inbox_client::chunk_pda(&program_id, 200_101, 4004, 3).0;
+        let settlement_program = SETTLEMENT_PROGRAM;
+        let chunk =
+            zk_inbox_client::chunk_pda(&program_id, &SETTLEMENT_PROGRAM, 200_101, 4004, 3).0;
         let ix = zk_inbox_client::close_chunk_ix(
             &program_id,
             &payer,
@@ -552,7 +620,7 @@ mod tests {
             3,
         );
         let msg = raw_message(&payer, &[ix]);
-        let decoded = decode_inbox_tx(&msg, &program_id.to_string());
+        let decoded = decode_inbox_tx(&msg, &program_id.to_string(), &SETTLEMENT_PROGRAM);
         assert_eq!(decoded.ix_names, vec!["Close"]);
         assert_eq!(
             decoded.chunk_events,
@@ -567,13 +635,13 @@ mod tests {
     fn decode_inbox_tx_open_batch_carries_the_batch_pda_account() {
         let program_id = Pubkey::new_unique();
         let payer = Pubkey::new_unique();
-        let settlement_program = Pubkey::new_unique();
+        let settlement_program = SETTLEMENT_PROGRAM;
         let ix = open_batch_ix(&program_id, &payer, 200_101, 4003, 290, &settlement_program);
-        let batch_pda = zk_inbox_client::batch_pda(&program_id, 200_101, 4003)
+        let batch_pda = zk_inbox_client::batch_pda(&program_id, &SETTLEMENT_PROGRAM, 200_101, 4003)
             .0
             .to_string();
         let msg = raw_message(&payer, &[ix]);
-        let decoded = decode_inbox_tx(&msg, &program_id.to_string());
+        let decoded = decode_inbox_tx(&msg, &program_id.to_string(), &SETTLEMENT_PROGRAM);
         assert_eq!(decoded.ix_names, vec!["OpenBatch"]);
         assert_eq!(
             decoded.batch_events,
@@ -586,6 +654,45 @@ mod tests {
         );
     }
 
+    /// The inbox program is shared by every settlement program, so anyone can open a batch for the same
+    /// `(chain_id, batch)` under their own. An `OpenBatch` naming another settlement program is listed by name but
+    /// yields no event and attributes no chain or batch id.
+    #[test]
+    fn decode_inbox_tx_ignores_an_open_batch_under_a_foreign_settlement_program() {
+        let program_id = Pubkey::new_unique();
+        let payer = Pubkey::new_unique();
+        let foreign = Pubkey::new_unique();
+        let ix = open_batch_ix(&program_id, &payer, 200_101, 4003, 290, &foreign);
+        let msg = raw_message(&payer, &[ix]);
+        let decoded = decode_inbox_tx(&msg, &program_id.to_string(), &SETTLEMENT_PROGRAM);
+        assert_eq!(decoded.ix_names, vec!["OpenBatch"]);
+        assert!(
+            decoded.batch_events.is_empty(),
+            "{:?}",
+            decoded.batch_events
+        );
+        assert_eq!((decoded.chain_id, decoded.batch_id), (None, None));
+    }
+
+    /// A chunk `Open` creates its account at the settlement-keyed address; one created at a foreign program's
+    /// address (same chain, batch and idx) is not attributed to this chain.
+    #[test]
+    fn decode_inbox_tx_ignores_a_chunk_open_at_a_foreign_settlement_address() {
+        let program_id = Pubkey::new_unique();
+        let payer = Pubkey::new_unique();
+        let foreign = Pubkey::new_unique();
+        let ix = open_chunk_ix(&program_id, &payer, &foreign, 200_101, 4005, 17, 3_681);
+        let msg = raw_message(&payer, &[ix]);
+        let decoded = decode_inbox_tx(&msg, &program_id.to_string(), &SETTLEMENT_PROGRAM);
+        assert_eq!(decoded.ix_names, vec!["Open"]);
+        assert!(
+            decoded.chunk_events.is_empty(),
+            "{:?}",
+            decoded.chunk_events
+        );
+        assert_eq!((decoded.chain_id, decoded.batch_id), (None, None));
+    }
+
     /// `FinalizeBatch { step }` must carry `step` through -- a partial call (`step` nonzero, or `step ==
     /// 0` on a batch that is not the caller's real intent to finish) is distinguishable downstream from a
     /// completing one.
@@ -593,12 +700,12 @@ mod tests {
     fn decode_inbox_tx_finalize_batch_carries_step() {
         let program_id = Pubkey::new_unique();
         let payer = Pubkey::new_unique();
-        let batch_pda = zk_inbox_client::batch_pda(&program_id, 200_101, 4003)
+        let batch_pda = zk_inbox_client::batch_pda(&program_id, &SETTLEMENT_PROGRAM, 200_101, 4003)
             .0
             .to_string();
-        let ix = finalize_batch_ix(&program_id, &payer, 200_101, 4003, 1);
+        let ix = finalize_batch_ix(&program_id, &payer, &SETTLEMENT_PROGRAM, 200_101, 4003, 1);
         let msg = raw_message(&payer, &[ix]);
-        let decoded = decode_inbox_tx(&msg, &program_id.to_string());
+        let decoded = decode_inbox_tx(&msg, &program_id.to_string(), &SETTLEMENT_PROGRAM);
         assert_eq!(
             decoded.batch_events,
             vec![BatchEvent::Finalized {
@@ -607,9 +714,9 @@ mod tests {
             }]
         );
 
-        let ix0 = finalize_batch_ix(&program_id, &payer, 200_101, 4003, 0);
+        let ix0 = finalize_batch_ix(&program_id, &payer, &SETTLEMENT_PROGRAM, 200_101, 4003, 0);
         let msg0 = raw_message(&payer, &[ix0]);
-        let decoded0 = decode_inbox_tx(&msg0, &program_id.to_string());
+        let decoded0 = decode_inbox_tx(&msg0, &program_id.to_string(), &SETTLEMENT_PROGRAM);
         assert_eq!(
             decoded0.batch_events,
             vec![BatchEvent::Finalized { batch_pda, step: 0 }]
@@ -621,9 +728,9 @@ mod tests {
         let program_id = Pubkey::new_unique();
         let other = Pubkey::new_unique();
         let payer = Pubkey::new_unique();
-        let ix = write_chunk_ix(&other, &payer, 1, 1, 1, 0, vec![1]);
+        let ix = write_chunk_ix(&other, &payer, &SETTLEMENT_PROGRAM, 1, 1, 1, 0, vec![1]);
         let msg = raw_message(&payer, &[ix]);
-        let decoded = decode_inbox_tx(&msg, &program_id.to_string());
+        let decoded = decode_inbox_tx(&msg, &program_id.to_string(), &SETTLEMENT_PROGRAM);
         assert!(decoded.ix_names.is_empty());
         assert!(decoded.chunk_events.is_empty());
     }
@@ -639,7 +746,7 @@ mod tests {
             data: vec![0, 1, 2],
         };
         let msg = raw_message(&payer, &[bogus]);
-        let decoded = decode_inbox_tx(&msg, &program_id.to_string());
+        let decoded = decode_inbox_tx(&msg, &program_id.to_string(), &SETTLEMENT_PROGRAM);
         assert!(decoded.ix_names.is_empty());
     }
 
@@ -652,14 +759,22 @@ mod tests {
     fn decode_inbox_tx_unresolvable_account_index_does_not_shift_later_accounts() {
         let program_id = Pubkey::new_unique();
         let payer = Pubkey::new_unique();
-        let ix = open_chunk_ix(&program_id, &payer, 200_101, 4005, 17, 3_681);
+        let ix = open_chunk_ix(
+            &program_id,
+            &payer,
+            &SETTLEMENT_PROGRAM,
+            200_101,
+            4005,
+            17,
+            3_681,
+        );
         let mut msg = raw_message(&payer, &[ix]);
         // `open_chunk_ix`'s account index 1 (`chunk_account_index`) -- corrupt it to an index this
         // message's own (short) `account_keys` cannot resolve.
         msg.instructions[0].accounts[1] = 200;
-        let decoded = decode_inbox_tx(&msg, &program_id.to_string());
+        let decoded = decode_inbox_tx(&msg, &program_id.to_string(), &SETTLEMENT_PROGRAM);
 
-        let batch_pda = zk_inbox_client::batch_pda(&program_id, 200_101, 4005)
+        let batch_pda = zk_inbox_client::batch_pda(&program_id, &SETTLEMENT_PROGRAM, 200_101, 4005)
             .0
             .to_string();
         for event in &decoded.chunk_events {

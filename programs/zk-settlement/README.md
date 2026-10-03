@@ -17,7 +17,10 @@ system.
   commitment.** `PostRoot`/`PostRootProved` require the caller's claimed previous batch, previous state
   root and first block number to match what the predecessor batch (or the chain's genesis, for the first
   batch) actually recorded — and require the inbox program's batch account to be finalized with its own
-  `acc` commitment equal to what the caller claims. On every chain, `PostRootProved` also requires the
+  `acc` commitment equal to what the caller claims. The inbox batch account is derived with this
+  program's own id as the settlement-program seed, and its recorded settlement program must be this
+  program (`WrongInboxAccount` otherwise), so a batch opened through any other settlement program is never
+  read. On every chain, `PostRootProved` also requires the
   proof's `parent_hash` to equal the predecessor's last block hash: `root.block_hash` when
   `head_pending_batch == 0`, otherwise the predecessor pending account's `last_block_hash`, whether that
   batch is pending or final. Both proof layouts reject a mismatch with `PredecessorHashMismatch` (84)

@@ -116,7 +116,7 @@ async fn open_batch_rejects_a_batch_id_that_is_not_the_cursors_next_batch() {
         root_account_with_authority(chain_id, &authority.pubkey(), settlement_program),
     );
     pt.add_account(
-        client::cursor_pda(&program_id, chain_id).0,
+        client::cursor_pda(&program_id, &settlement_program, chain_id).0,
         cursor_account(program_id, chain_id, 0),
     );
     pt.add_account(authority.pubkey(), funded_account());
@@ -148,7 +148,7 @@ async fn open_batch_rejects_a_batch_id_that_is_not_the_cursors_next_batch() {
         &settlement_program,
     );
     send(&mut ctx, &[ix], &authority, &[]).await.unwrap();
-    let (cursor_pda, _) = client::cursor_pda(&program_id, chain_id);
+    let (cursor_pda, _) = client::cursor_pda(&program_id, &settlement_program, chain_id);
     let data = ctx
         .banks_client
         .get_account(cursor_pda)
@@ -187,7 +187,7 @@ async fn abandon_batch_never_decrements_the_cursor_so_the_same_id_stays_rejected
         root_account_with_authority(chain_id, &authority.pubkey(), settlement_program),
     );
     pt.add_account(
-        client::cursor_pda(&program_id, chain_id).0,
+        client::cursor_pda(&program_id, &settlement_program, chain_id).0,
         cursor_account(program_id, chain_id, 0),
     );
     pt.add_account(authority.pubkey(), funded_account());
@@ -203,12 +203,18 @@ async fn abandon_batch_never_decrements_the_cursor_so_the_same_id_stays_rejected
     );
     send(&mut ctx, &[open_ix], &authority, &[]).await.unwrap();
 
-    let abandon_ix = client::abandon_batch_ix(&program_id, &authority.pubkey(), chain_id, 0);
+    let abandon_ix = client::abandon_batch_ix(
+        &program_id,
+        &authority.pubkey(),
+        &settlement_program,
+        chain_id,
+        0,
+    );
     send(&mut ctx, &[abandon_ix], &authority, &[])
         .await
         .unwrap();
 
-    let (cursor_pda, _) = client::cursor_pda(&program_id, chain_id);
+    let (cursor_pda, _) = client::cursor_pda(&program_id, &settlement_program, chain_id);
     let data = ctx
         .banks_client
         .get_account(cursor_pda)
@@ -279,7 +285,7 @@ async fn init_batch_cursor_twice_is_rejected() {
         .await
         .expect("first InitBatchCursor must succeed");
 
-    let (cursor_pda, _) = client::cursor_pda(&program_id, chain_id);
+    let (cursor_pda, _) = client::cursor_pda(&program_id, &settlement_program, chain_id);
     let data = ctx
         .banks_client
         .get_account(cursor_pda)
@@ -344,7 +350,7 @@ async fn init_batch_cursor_rejects_a_non_authority_signer() {
         .await
         .expect_err("a signer that is not the root's authority must not bootstrap the cursor");
     assert!(matches!(err, TransactionError::InstructionError(_, _)));
-    let (cursor_pda, _) = client::cursor_pda(&program_id, chain_id);
+    let (cursor_pda, _) = client::cursor_pda(&program_id, &settlement_program, chain_id);
     assert!(
         ctx.banks_client
             .get_account(cursor_pda)
@@ -383,13 +389,13 @@ async fn open_batch_succeeds_even_when_an_attacker_prefunds_its_pda() {
         root_account_with_authority(chain_id, &authority.pubkey(), settlement_program),
     );
     pt.add_account(
-        client::cursor_pda(&program_id, chain_id).0,
+        client::cursor_pda(&program_id, &settlement_program, chain_id).0,
         cursor_account(program_id, chain_id, 0),
     );
     pt.add_account(authority.pubkey(), funded_account());
     let mut ctx = pt.start_with_context().await;
 
-    let (batch_pda, _) = client::batch_pda(&program_id, chain_id, 0);
+    let (batch_pda, _) = client::batch_pda(&program_id, &settlement_program, chain_id, 0);
     prefund_pda(&mut ctx, batch_pda).await;
     let donated_lamports = ctx
         .banks_client
@@ -442,7 +448,7 @@ async fn open_batch_succeeds_even_when_an_attacker_prefunds_its_pda() {
 
     // The cursor must have advanced exactly as it would for an unfunded PDA — the core liveness
     // property these tests protect.
-    let (cursor_pda, _) = client::cursor_pda(&program_id, chain_id);
+    let (cursor_pda, _) = client::cursor_pda(&program_id, &settlement_program, chain_id);
     let cursor_data = ctx
         .banks_client
         .get_account(cursor_pda)
@@ -482,7 +488,7 @@ async fn init_batch_cursor_succeeds_even_when_an_attacker_prefunds_its_pda() {
     pt.add_account(authority.pubkey(), funded_account());
     let mut ctx = pt.start_with_context().await;
 
-    let (cursor_pda, _) = client::cursor_pda(&program_id, chain_id);
+    let (cursor_pda, _) = client::cursor_pda(&program_id, &settlement_program, chain_id);
     prefund_pda(&mut ctx, cursor_pda).await;
     let donated_lamports = ctx
         .banks_client
@@ -641,7 +647,7 @@ async fn open_batch_rejects_a_cursor_pda_whose_stored_chain_id_does_not_match() 
         root,
         root_account_with_authority(chain_id, &authority.pubkey(), settlement_program),
     );
-    let (cursor_pda, _) = client::cursor_pda(&program_id, chain_id);
+    let (cursor_pda, _) = client::cursor_pda(&program_id, &settlement_program, chain_id);
     pt.add_account(
         cursor_pda,
         Account {
@@ -691,7 +697,7 @@ async fn open_batch_rejects_a_cursor_pda_owned_by_a_foreign_program() {
         root,
         root_account_with_authority(chain_id, &authority.pubkey(), settlement_program),
     );
-    let (cursor_pda, _) = client::cursor_pda(&program_id, chain_id);
+    let (cursor_pda, _) = client::cursor_pda(&program_id, &settlement_program, chain_id);
     pt.add_account(
         cursor_pda,
         Account {
@@ -735,9 +741,15 @@ async fn grow_batch_rejects_a_well_formed_batch_account_at_the_wrong_address() {
         true,
     );
     let payer = Keypair::new();
+    let settlement_program = rome_zk_testkit::fixed_settlement_program_id();
     let wrong_address = Pubkey::new_unique(); // never the real seeds(chain_id, batch) PDA
     let n = 5u32;
     let mut data = vec![0u8; rome_zk_layouts::batch::account_len(n)];
+    // The batch account records the settlement program it was opened through; GrowBatch derives the
+    // batch address from that recorded field.
+    data[rome_zk_layouts::batch::OFF_SETTLEMENT_PROGRAM
+        ..rome_zk_layouts::batch::OFF_SETTLEMENT_PROGRAM + 32]
+        .copy_from_slice(settlement_program.as_ref());
     data[rome_zk_layouts::batch::OFF_MAGIC..rome_zk_layouts::batch::OFF_MAGIC + 4]
         .copy_from_slice(&rome_zk_layouts::batch::MAGIC.to_le_bytes());
     data[rome_zk_layouts::batch::OFF_VERSION] = rome_zk_layouts::batch::VERSION;
@@ -763,7 +775,13 @@ async fn grow_batch_rejects_a_well_formed_batch_account_at_the_wrong_address() {
     pt.add_account(payer.pubkey(), funded_account());
     let mut ctx = pt.start_with_context().await;
 
-    let mut ix = client::grow_batch_ix(&program_id, &payer.pubkey(), chain_id, batch);
+    let mut ix = client::grow_batch_ix(
+        &program_id,
+        &payer.pubkey(),
+        &settlement_program,
+        chain_id,
+        batch,
+    );
     ix.accounts[1].pubkey = wrong_address;
     let err = send(&mut ctx, &[ix], &payer, &[]).await.unwrap_err();
     assert_eq!(
@@ -787,9 +805,15 @@ async fn grow_batch_rejects_a_batch_account_whose_stored_header_does_not_match_t
         true,
     );
     let payer = Keypair::new();
-    let (batch_pda, _) = client::batch_pda(&program_id, chain_id, batch);
+    let settlement_program = rome_zk_testkit::fixed_settlement_program_id();
+    let (batch_pda, _) = client::batch_pda(&program_id, &settlement_program, chain_id, batch);
     let n = 5u32;
     let mut data = vec![0u8; rome_zk_layouts::batch::account_len(n)];
+    // The batch account records the settlement program it was opened through; GrowBatch derives the
+    // batch address from that recorded field.
+    data[rome_zk_layouts::batch::OFF_SETTLEMENT_PROGRAM
+        ..rome_zk_layouts::batch::OFF_SETTLEMENT_PROGRAM + 32]
+        .copy_from_slice(settlement_program.as_ref());
     data[rome_zk_layouts::batch::OFF_MAGIC..rome_zk_layouts::batch::OFF_MAGIC + 4]
         .copy_from_slice(&rome_zk_layouts::batch::MAGIC.to_le_bytes());
     data[rome_zk_layouts::batch::OFF_VERSION] = rome_zk_layouts::batch::VERSION;
@@ -815,7 +839,13 @@ async fn grow_batch_rejects_a_batch_account_whose_stored_header_does_not_match_t
     pt.add_account(payer.pubkey(), funded_account());
     let mut ctx = pt.start_with_context().await;
 
-    let ix = client::grow_batch_ix(&program_id, &payer.pubkey(), chain_id, batch);
+    let ix = client::grow_batch_ix(
+        &program_id,
+        &payer.pubkey(),
+        &settlement_program,
+        chain_id,
+        batch,
+    );
     let err = send(&mut ctx, &[ix], &payer, &[]).await.unwrap_err();
     assert_eq!(
         err,
@@ -838,9 +868,15 @@ async fn grow_batch_rejects_a_batch_account_owned_by_a_foreign_program() {
         true,
     );
     let payer = Keypair::new();
-    let (batch_pda, _) = client::batch_pda(&program_id, chain_id, batch);
+    let settlement_program = rome_zk_testkit::fixed_settlement_program_id();
+    let (batch_pda, _) = client::batch_pda(&program_id, &settlement_program, chain_id, batch);
     let n = 5u32;
     let mut data = vec![0u8; rome_zk_layouts::batch::account_len(n)];
+    // The batch account records the settlement program it was opened through; GrowBatch derives the
+    // batch address from that recorded field.
+    data[rome_zk_layouts::batch::OFF_SETTLEMENT_PROGRAM
+        ..rome_zk_layouts::batch::OFF_SETTLEMENT_PROGRAM + 32]
+        .copy_from_slice(settlement_program.as_ref());
     data[rome_zk_layouts::batch::OFF_MAGIC..rome_zk_layouts::batch::OFF_MAGIC + 4]
         .copy_from_slice(&rome_zk_layouts::batch::MAGIC.to_le_bytes());
     data[rome_zk_layouts::batch::OFF_VERSION] = rome_zk_layouts::batch::VERSION;
@@ -864,7 +900,13 @@ async fn grow_batch_rejects_a_batch_account_owned_by_a_foreign_program() {
     pt.add_account(payer.pubkey(), funded_account());
     let mut ctx = pt.start_with_context().await;
 
-    let ix = client::grow_batch_ix(&program_id, &payer.pubkey(), chain_id, batch);
+    let ix = client::grow_batch_ix(
+        &program_id,
+        &payer.pubkey(),
+        &settlement_program,
+        chain_id,
+        batch,
+    );
     let err = send(&mut ctx, &[ix], &payer, &[]).await.unwrap_err();
     assert_eq!(
         err,
@@ -899,7 +941,7 @@ async fn open_batch_313_leaves_opens_capped_then_grows_and_finalizes() {
         root_account_with_authority(chain_id, &authority.pubkey(), settlement_program),
     );
     pt.add_account(
-        client::cursor_pda(&program_id, chain_id).0,
+        client::cursor_pda(&program_id, &settlement_program, chain_id).0,
         cursor_account(program_id, chain_id, batch),
     );
     pt.add_account(authority.pubkey(), funded_account());
@@ -907,7 +949,13 @@ async fn open_batch_313_leaves_opens_capped_then_grows_and_finalizes() {
     // batch account's creation/growth is under test here).
     let bodies: Vec<Vec<u8>> = (0..n).map(|i| i.to_le_bytes().to_vec()).collect();
     for (idx, body) in bodies.iter().enumerate() {
-        let (cpda, _) = client::chunk_pda(&program_id, chain_id, batch, idx as u32);
+        let (cpda, _) = client::chunk_pda(
+            &program_id,
+            &settlement_program,
+            chain_id,
+            batch,
+            idx as u32,
+        );
         pt.add_account(
             cpda,
             chunk_account(
@@ -935,7 +983,7 @@ async fn open_batch_313_leaves_opens_capped_then_grows_and_finalizes() {
         .expect("OpenBatch must succeed even though it cannot reach full size in one CPI");
     eprintln!("OpenBatch(313 leaves, capped) consumed {open_cu} CU");
 
-    let (batch_pda, _) = client::batch_pda(&program_id, chain_id, batch);
+    let (batch_pda, _) = client::batch_pda(&program_id, &settlement_program, chain_id, batch);
     let target = rome_zk_layouts::batch::account_len(n);
     let capped_len = ctx
         .banks_client
@@ -954,13 +1002,20 @@ async fn open_batch_313_leaves_opens_capped_then_grows_and_finalizes() {
 
     // Fully grown before `GrowBatch`: chunk Open (defensive, no chunk pdas pre-created for this check —
     // reuse idx 0's account we seeded) and SealLeaf must both refuse (`BatchNotGrown`).
-    let seal_before_grow = client::seal_leaf_ix(&program_id, chain_id, batch, 0);
+    let seal_before_grow =
+        client::seal_leaf_ix(&program_id, &settlement_program, chain_id, batch, 0);
     let err = send(&mut ctx, &[seal_before_grow], &authority, &[])
         .await
         .expect_err("SealLeaf must refuse before the batch is fully grown");
     assert!(format!("{err:?}").contains(INBOX_ERR_BATCH_NOT_GROWN));
 
-    let grow_ix = client::grow_batch_ix(&program_id, &authority.pubkey(), chain_id, batch);
+    let grow_ix = client::grow_batch_ix(
+        &program_id,
+        &authority.pubkey(),
+        &settlement_program,
+        chain_id,
+        batch,
+    );
     let (grow_cu, _) = send(&mut ctx, &[grow_ix], &authority, &[])
         .await
         .expect("GrowBatch must succeed");
@@ -983,15 +1038,27 @@ async fn open_batch_313_leaves_opens_capped_then_grows_and_finalizes() {
     for idx in 0..n {
         send(
             &mut ctx,
-            &[client::seal_leaf_ix(&program_id, chain_id, batch, idx)],
+            &[client::seal_leaf_ix(
+                &program_id,
+                &settlement_program,
+                chain_id,
+                batch,
+                idx,
+            )],
             &authority,
             &[],
         )
         .await
         .unwrap_or_else(|e| panic!("SealLeaf({idx}) failed: {e:?}"));
     }
-    let finalize_ix =
-        client::finalize_batch_ix(&program_id, &authority.pubkey(), chain_id, batch, 0);
+    let finalize_ix = client::finalize_batch_ix(
+        &program_id,
+        &authority.pubkey(),
+        &settlement_program,
+        chain_id,
+        batch,
+        0,
+    );
     let (finalize_cu, _) = send(&mut ctx, &[finalize_ix], &authority, &[])
         .await
         .expect(
@@ -1031,7 +1098,7 @@ async fn grow_batch_at_full_size_is_a_no_op() {
         root_account_with_authority(chain_id, &authority.pubkey(), settlement_program),
     );
     pt.add_account(
-        client::cursor_pda(&program_id, chain_id).0,
+        client::cursor_pda(&program_id, &settlement_program, chain_id).0,
         cursor_account(program_id, chain_id, batch),
     );
     pt.add_account(authority.pubkey(), funded_account());
@@ -1047,7 +1114,7 @@ async fn grow_batch_at_full_size_is_a_no_op() {
     );
     send(&mut ctx, &[open_ix], &authority, &[]).await.unwrap();
 
-    let (batch_pda, _) = client::batch_pda(&program_id, chain_id, batch);
+    let (batch_pda, _) = client::batch_pda(&program_id, &settlement_program, chain_id, batch);
     let len_before = ctx
         .banks_client
         .get_account(batch_pda)
@@ -1065,7 +1132,13 @@ async fn grow_batch_at_full_size_is_a_no_op() {
         .unwrap()
         .lamports;
 
-    let grow_ix = client::grow_batch_ix(&program_id, &authority.pubkey(), chain_id, batch);
+    let grow_ix = client::grow_batch_ix(
+        &program_id,
+        &authority.pubkey(),
+        &settlement_program,
+        chain_id,
+        batch,
+    );
     send(&mut ctx, &[grow_ix], &authority, &[])
         .await
         .expect("GrowBatch at full size must be a no-op Ok, not an error");
@@ -1109,7 +1182,7 @@ async fn grow_batch_by_a_random_payer_succeeds_and_cannot_exceed_account_len() {
         root_account_with_authority(chain_id, &authority.pubkey(), settlement_program),
     );
     pt.add_account(
-        client::cursor_pda(&program_id, chain_id).0,
+        client::cursor_pda(&program_id, &settlement_program, chain_id).0,
         cursor_account(program_id, chain_id, batch),
     );
     pt.add_account(authority.pubkey(), funded_account());
@@ -1126,7 +1199,7 @@ async fn grow_batch_by_a_random_payer_succeeds_and_cannot_exceed_account_len() {
     );
     send(&mut ctx, &[open_ix], &authority, &[]).await.unwrap();
 
-    let (batch_pda, _) = client::batch_pda(&program_id, chain_id, batch);
+    let (batch_pda, _) = client::batch_pda(&program_id, &settlement_program, chain_id, batch);
     let target = rome_zk_layouts::batch::account_len(n);
     assert!(target > client::MAX_PERMITTED_DATA_INCREASE);
 
@@ -1139,7 +1212,13 @@ async fn grow_batch_by_a_random_payer_succeeds_and_cannot_exceed_account_len() {
         .lamports;
 
     // random_payer, never the batch/chain authority, funds and sends GrowBatch.
-    let grow_ix = client::grow_batch_ix(&program_id, &random_payer.pubkey(), chain_id, batch);
+    let grow_ix = client::grow_batch_ix(
+        &program_id,
+        &random_payer.pubkey(),
+        &settlement_program,
+        chain_id,
+        batch,
+    );
     send(&mut ctx, &[grow_ix], &random_payer, &[])
         .await
         .expect("GrowBatch must be permissionless — any payer may call it");
@@ -1170,7 +1249,13 @@ async fn grow_batch_by_a_random_payer_succeeds_and_cannot_exceed_account_len() {
 
     // A further GrowBatch (still by the random payer) is a no-op — never exceeds account_len.
     let lamports_before_noop = random_payer_lamports_after;
-    let grow_again_ix = client::grow_batch_ix(&program_id, &random_payer.pubkey(), chain_id, batch);
+    let grow_again_ix = client::grow_batch_ix(
+        &program_id,
+        &random_payer.pubkey(),
+        &settlement_program,
+        chain_id,
+        batch,
+    );
     send(&mut ctx, &[grow_again_ix], &random_payer, &[])
         .await
         .expect("a second GrowBatch at full size must still be a no-op Ok");
@@ -1222,7 +1307,7 @@ async fn chunk_open_and_finalize_batch_reject_before_the_batch_is_fully_grown() 
         root_account_with_authority(chain_id, &authority.pubkey(), settlement_program),
     );
     pt.add_account(
-        client::cursor_pda(&program_id, chain_id).0,
+        client::cursor_pda(&program_id, &settlement_program, chain_id).0,
         cursor_account(program_id, chain_id, batch),
     );
     pt.add_account(authority.pubkey(), funded_account());
@@ -1240,15 +1325,28 @@ async fn chunk_open_and_finalize_batch_reject_before_the_batch_is_fully_grown() 
         .await
         .unwrap();
 
-    let open_chunk_ix =
-        client::open_chunk_ix(&program_id, &authority.pubkey(), chain_id, batch, 0, 8);
+    let open_chunk_ix = client::open_chunk_ix(
+        &program_id,
+        &authority.pubkey(),
+        &settlement_program,
+        chain_id,
+        batch,
+        0,
+        8,
+    );
     let err = send(&mut ctx, &[open_chunk_ix], &authority, &[])
         .await
         .expect_err("chunk Open must refuse before the batch is fully grown");
     assert!(format!("{err:?}").contains(INBOX_ERR_BATCH_NOT_GROWN));
 
-    let finalize_ix =
-        client::finalize_batch_ix(&program_id, &authority.pubkey(), chain_id, batch, 0);
+    let finalize_ix = client::finalize_batch_ix(
+        &program_id,
+        &authority.pubkey(),
+        &settlement_program,
+        chain_id,
+        batch,
+        0,
+    );
     let err = send(&mut ctx, &[finalize_ix], &authority, &[])
         .await
         .expect_err("FinalizeBatch must refuse before the batch is fully grown");
@@ -1278,7 +1376,7 @@ async fn open_and_grow_batch_900_leaves_in_one_transaction_finalizes_within_cu_b
         root_account_with_authority(chain_id, &authority.pubkey(), settlement_program),
     );
     pt.add_account(
-        client::cursor_pda(&program_id, chain_id).0,
+        client::cursor_pda(&program_id, &settlement_program, chain_id).0,
         cursor_account(program_id, chain_id, batch),
     );
     pt.add_account(authority.pubkey(), funded_account());
@@ -1312,7 +1410,7 @@ async fn open_and_grow_batch_900_leaves_in_one_transaction_finalizes_within_cu_b
         per_ix_cu[0], per_ix_cu[1], per_ix_cu[2]
     );
 
-    let (batch_pda, _) = client::batch_pda(&program_id, chain_id, batch);
+    let (batch_pda, _) = client::batch_pda(&program_id, &settlement_program, chain_id, batch);
     let target = rome_zk_layouts::batch::account_len(n);
     let account = ctx
         .banks_client
@@ -1349,8 +1447,14 @@ async fn open_and_grow_batch_900_leaves_in_one_transaction_finalizes_within_cu_b
     ctx.set_account(&batch_pda, &AccountSharedData::from(new_account));
 
     // --- FinalizeBatch ---
-    let finalize_ix =
-        client::finalize_batch_ix(&program_id, &authority.pubkey(), chain_id, batch, 0);
+    let finalize_ix = client::finalize_batch_ix(
+        &program_id,
+        &authority.pubkey(),
+        &settlement_program,
+        chain_id,
+        batch,
+        0,
+    );
     let (finalize_cu, _) = send(&mut ctx, &[finalize_ix], &authority, &[])
         .await
         .expect("FinalizeBatch must succeed on the real Open+Grow-produced account");

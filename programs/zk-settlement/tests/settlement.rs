@@ -625,7 +625,7 @@ async fn inbox_open_batch_and_close_pass_against_a_real_initchain_root_account()
     let chain_id = 1u64;
     let batch = 1u64;
     pt.add_account(
-        zk_inbox_client::cursor_pda(&inbox_program, chain_id).0,
+        zk_inbox_client::cursor_pda(&inbox_program, &settlement_program, chain_id).0,
         cursor_account(inbox_program, chain_id, batch),
     );
     let mut ctx = pt.start_with_context().await;
@@ -660,6 +660,7 @@ async fn inbox_open_batch_and_close_pass_against_a_real_initchain_root_account()
             zk_inbox_client::open_chunk_ix(
                 &inbox_program,
                 &c.authority.pubkey(),
+                &settlement_program,
                 c.chain_id,
                 batch,
                 idx,
@@ -668,6 +669,7 @@ async fn inbox_open_batch_and_close_pass_against_a_real_initchain_root_account()
             zk_inbox_client::write_chunk_ix(
                 &inbox_program,
                 &c.authority.pubkey(),
+                &settlement_program,
                 c.chain_id,
                 batch,
                 idx,
@@ -677,13 +679,20 @@ async fn inbox_open_batch_and_close_pass_against_a_real_initchain_root_account()
             zk_inbox_client::seal_chunk_ix(
                 &inbox_program,
                 &c.authority.pubkey(),
+                &settlement_program,
                 c.chain_id,
                 batch,
                 idx,
                 body.len() as u32,
                 zk_inbox_client::chunk_body_hash(body),
             ),
-            zk_inbox_client::seal_leaf_ix(&inbox_program, c.chain_id, batch, idx),
+            zk_inbox_client::seal_leaf_ix(
+                &inbox_program,
+                &settlement_program,
+                c.chain_id,
+                batch,
+                idx,
+            ),
         ];
         send(&mut ctx, &ixs, &c.authority, &[])
             .await
@@ -694,6 +703,7 @@ async fn inbox_open_batch_and_close_pass_against_a_real_initchain_root_account()
         &[zk_inbox_client::finalize_batch_ix(
             &inbox_program,
             &c.authority.pubkey(),
+            &settlement_program,
             c.chain_id,
             batch,
             0,
@@ -722,7 +732,8 @@ async fn inbox_open_batch_and_close_pass_against_a_real_initchain_root_account()
     );
 
     // --- now settle the batch to Final via PostRoot + FinalizeBatch (window elapsed) ---
-    let (inbox_batch_pda, _) = zk_inbox_client::batch_pda(&inbox_program, c.chain_id, batch);
+    let (inbox_batch_pda, _) =
+        zk_inbox_client::batch_pda(&inbox_program, &settlement_program, c.chain_id, batch);
     let inbox_acct = ctx
         .banks_client
         .get_account(inbox_batch_pda)
@@ -838,7 +849,7 @@ async fn post_root_happy_path_creates_pending_pda_and_advances_head() {
     init_chain(&mut ctx, &payer, &c).await;
 
     let acc = keccak::hashv(&[b"inbox acc 1"]).to_bytes();
-    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, c.chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 1);
     ctx.set_account(
         &inbox_pda,
         &inbox_batch_account(
@@ -926,7 +937,7 @@ async fn post_root_creates_pending_pda_even_when_an_attacker_prefunds_it() {
     init_chain(&mut ctx, &payer, &c).await;
 
     let acc = keccak::hashv(&[b"inbox acc 1"]).to_bytes();
-    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, c.chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 1);
     ctx.set_account(
         &inbox_pda,
         &inbox_batch_account(
@@ -1004,7 +1015,7 @@ async fn post_root_rig() -> (ProgramTest, Pubkey, Keypair, Chain, [u8; 32]) {
     let c = default_chain(settlement_program);
     pt.add_account(c.authority.pubkey(), funded_account());
     let acc = keccak::hashv(&[b"inbox acc 1"]).to_bytes();
-    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, c.chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 1);
     pt.add_account(
         inbox_pda,
         inbox_batch_account(
@@ -1028,7 +1039,7 @@ fn add_batch2_inbox_account(
     settlement_program: Pubkey,
     acc: [u8; 32],
 ) {
-    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, c.chain_id, 2);
+    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 2);
     pt.add_account(
         inbox_pda,
         inbox_batch_account(
@@ -1048,7 +1059,7 @@ async fn post_root_rejects_non_authority_signer() {
     let (pt, settlement_program, payer, c, acc) = post_root_rig().await;
     let mut ctx = pt.start_with_context().await;
     init_chain(&mut ctx, &payer, &c).await;
-    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, c.chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 1);
     ctx.set_account(
         &inbox_pda,
         &inbox_batch_account(
@@ -1092,7 +1103,7 @@ async fn post_root_rejects_wrong_prev_batch() {
     let (pt, settlement_program, payer, c, acc) = post_root_rig().await;
     let mut ctx = pt.start_with_context().await;
     init_chain(&mut ctx, &payer, &c).await;
-    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, c.chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 1);
     ctx.set_account(
         &inbox_pda,
         &inbox_batch_account(
@@ -1135,7 +1146,7 @@ async fn post_root_rejects_wrong_pre_state_root() {
     let (pt, settlement_program, payer, c, acc) = post_root_rig().await;
     let mut ctx = pt.start_with_context().await;
     init_chain(&mut ctx, &payer, &c).await;
-    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, c.chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 1);
     ctx.set_account(
         &inbox_pda,
         &inbox_batch_account(
@@ -1178,7 +1189,7 @@ async fn post_root_rejects_first_block_gap() {
     let (pt, settlement_program, payer, c, acc) = post_root_rig().await;
     let mut ctx = pt.start_with_context().await;
     init_chain(&mut ctx, &payer, &c).await;
-    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, c.chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 1);
     ctx.set_account(
         &inbox_pda,
         &inbox_batch_account(
@@ -1221,7 +1232,7 @@ async fn post_root_rejects_inbox_batch_not_finalized() {
     let (pt, settlement_program, payer, c, acc) = post_root_rig().await;
     let mut ctx = pt.start_with_context().await;
     init_chain(&mut ctx, &payer, &c).await;
-    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, c.chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 1);
     ctx.set_account(
         &inbox_pda,
         &inbox_batch_account(
@@ -1263,7 +1274,7 @@ async fn post_root_rejects_acc_mismatch() {
     let (pt, settlement_program, payer, c, acc) = post_root_rig().await;
     let mut ctx = pt.start_with_context().await;
     init_chain(&mut ctx, &payer, &c).await;
-    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, c.chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 1);
     ctx.set_account(
         &inbox_pda,
         &inbox_batch_account(
@@ -1306,7 +1317,7 @@ async fn post_root_rejects_wrong_inbox_owner() {
     let (pt, settlement_program, payer, c, acc) = post_root_rig().await;
     let mut ctx = pt.start_with_context().await;
     init_chain(&mut ctx, &payer, &c).await;
-    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, c.chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 1);
     // wrong owner: not the registered inbox program
     ctx.set_account(
         &inbox_pda,
@@ -1360,7 +1371,7 @@ async fn post_root_rejects_a_v1_shaped_inbox_batch_account() {
     let (pt, settlement_program, payer, c, acc) = post_root_rig().await;
     let mut ctx = pt.start_with_context().await;
     init_chain(&mut ctx, &payer, &c).await;
-    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, c.chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 1);
     let mut v1_account = inbox_batch_account(
         c.inbox_program,
         c.chain_id,
@@ -1415,7 +1426,7 @@ async fn post_root_rejects_wrong_inbox_seeds() {
     c.chain_id = 99;
     pt.add_account(c.authority.pubkey(), funded_account());
     let acc = keccak::hashv(&[b"inbox acc 1"]).to_bytes();
-    let wrong_pda = sclient::inbox_batch_pda(&c.inbox_program, c.chain_id, 2);
+    let wrong_pda = sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 2);
     pt.add_account(
         wrong_pda,
         inbox_batch_account(
@@ -1456,7 +1467,7 @@ async fn post_root_rejects_max_pending_reached() {
     init_chain_with_max_pending(&mut ctx, &payer, &c, 0).await;
 
     let acc = keccak::hashv(&[b"acc"]).to_bytes();
-    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, c.chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 1);
     ctx.set_account(
         &inbox_pda,
         &inbox_batch_account(
@@ -2032,7 +2043,8 @@ async fn layout1_post_over_predecessor(
 
     let open_unix_ts: i64 = 1_700_000_000;
     let acc = keccak::hashv(&[b"layout1 predecessor acc"]).to_bytes();
-    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, c.chain_id, batch);
+    let inbox_pda =
+        sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, batch);
     ctx.set_account(
         &inbox_pda,
         &inbox_batch_account_with_open_ts(
@@ -2213,7 +2225,7 @@ async fn layout2_post_over_genesis(
     .expect("InitChain should succeed");
 
     let acc = keccak::hashv(&[b"layout2 predecessor acc"]).to_bytes();
-    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, c.chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 1);
     ctx.set_account(
         &inbox_pda,
         &inbox_batch_account(
@@ -2305,7 +2317,7 @@ async fn post_root_proved_with_real_fixture_fails_header_binding_before_the_expe
     init_chain(&mut ctx, &payer, &c).await;
 
     let acc = keccak::hashv(&[b"inbox acc"]).to_bytes();
-    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, c.chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 1);
     ctx.set_account(
         &inbox_pda,
         &inbox_batch_account(
@@ -2378,7 +2390,7 @@ async fn post_root_proved_rejects_unregistered_vkey_cheaply_before_header_or_pro
     c.chain_id = 6;
     pt.add_account(c.authority.pubkey(), funded_account());
     let acc = keccak::hashv(&[b"inbox acc registry test"]).to_bytes();
-    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, c.chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 1);
     pt.add_account(
         inbox_pda,
         inbox_batch_account(
@@ -2632,7 +2644,7 @@ async fn post_root_proved_layout1_rejects_the_real_header_hash_fixture_before_th
     .expect("InitChain should succeed");
 
     let acc = keccak::hashv(&[b"layout1 inbox acc"]).to_bytes();
-    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, c.chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 1);
     ctx.set_account(
         &inbox_pda,
         &inbox_batch_account(
@@ -2748,7 +2760,7 @@ async fn post_root_proved_layout1_rejects_a_v1_chain_config_before_the_pairing()
 
     let open_unix_ts: i64 = 1_700_000_000;
     let acc = keccak::hashv(&[b"layout1 inbox acc v1"]).to_bytes();
-    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, c.chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 1);
     ctx.set_account(
         &inbox_pda,
         &inbox_batch_account_with_open_ts(
@@ -2855,7 +2867,7 @@ async fn post_root_proved_layout1_refuses_a_non_empty_header_rlp_before_the_pair
 
     let open_unix_ts: i64 = 1_700_000_000;
     let acc = keccak::hashv(&[b"layout1 inbox acc v1"]).to_bytes();
-    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, c.chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 1);
     ctx.set_account(
         &inbox_pda,
         &inbox_batch_account_with_open_ts(
@@ -2963,7 +2975,7 @@ async fn post_root_proved_layout1_with_matching_bindings_reaches_the_pairing() {
 
     let open_unix_ts: i64 = 1_700_000_000;
     let acc = keccak::hashv(&[b"layout1 inbox acc v2"]).to_bytes();
-    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, c.chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 1);
     ctx.set_account(
         &inbox_pda,
         &inbox_batch_account_with_open_ts(
@@ -3078,7 +3090,7 @@ async fn post_root_proved_layout1_refuses_a_malformed_zisk_packing_by_name_befor
 
     let open_unix_ts: i64 = 1_700_000_000;
     let acc = keccak::hashv(&[b"layout1 inbox acc v2"]).to_bytes();
-    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, c.chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 1);
     ctx.set_account(
         &inbox_pda,
         &inbox_batch_account_with_open_ts(
@@ -3244,7 +3256,7 @@ async fn set_registry_entry_appends_layout1_entry_and_post_root_proved_reaches_t
 
     let open_unix_ts: i64 = 1_700_000_000;
     let acc = keccak::hashv(&[b"set_registry_entry layout1 inbox acc"]).to_bytes();
-    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, c.chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 1);
     ctx.set_account(
         &inbox_pda,
         &inbox_batch_account_with_open_ts(
@@ -3370,7 +3382,7 @@ async fn permissionless_chain_is_inert_until_the_registry_authority_registers_it
 
     let open_unix_ts: i64 = 1_700_000_000;
     let acc = keccak::hashv(&[b"permissionless inert inbox acc"]).to_bytes();
-    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, c.chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 1);
     ctx.set_account(
         &inbox_pda,
         &inbox_batch_account_with_open_ts(
@@ -3507,7 +3519,7 @@ async fn set_registry_entry_activation_delay_refuses_until_the_slot_then_reaches
     c.chain_id = 41;
     let open_unix_ts: i64 = 1_700_000_000;
     let acc = keccak::hashv(&[b"set_registry_entry delay inbox acc"]).to_bytes();
-    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, c.chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 1);
     pt.add_account(
         inbox_pda,
         inbox_batch_account_with_open_ts(
@@ -4647,7 +4659,7 @@ async fn set_registry_entry_r1_delayed_rotation_never_touches_the_old_key_until_
     c.chain_id = 47;
     let open_unix_ts: i64 = 1_700_000_000;
     let acc = keccak::hashv(&[b"r1 rotation inbox acc"]).to_bytes();
-    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, c.chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 1);
     pt.add_account(
         inbox_pda,
         inbox_batch_account_with_open_ts(
@@ -4975,7 +4987,7 @@ async fn set_registry_entry_rev_unretire_via_same_vkey_update_is_refused() {
     c.chain_id = 471;
     let open_unix_ts: i64 = 1_700_000_000;
     let acc = keccak::hashv(&[b"unretire inbox acc"]).to_bytes();
-    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, c.chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 1);
     pt.add_account(
         inbox_pda,
         inbox_batch_account_with_open_ts(
@@ -5177,7 +5189,7 @@ async fn set_registry_entry_retired_vkey_re_registers_once_its_slot_has_been_reu
     c.chain_id = 472;
     let open_unix_ts: i64 = 1_700_000_000;
     let acc = keccak::hashv(&[b"reuse bound inbox acc"]).to_bytes();
-    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, c.chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 1);
     pt.add_account(
         inbox_pda,
         inbox_batch_account_with_open_ts(
@@ -5397,7 +5409,7 @@ async fn post_root_proved_layout2_still_rejects_a_multi_block_batch() {
     init_chain(&mut ctx, &payer, &c).await; // default registry_entries(): LAYOUT_HEADER_FALLBACK
 
     let acc = keccak::hashv(&[b"layout2 multiblock"]).to_bytes();
-    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, c.chain_id, 1);
+    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 1);
     ctx.set_account(
         &inbox_pda,
         &inbox_batch_account(
@@ -5647,7 +5659,7 @@ async fn full_flow_inbox_to_settlement_to_close() {
     let chain_id = 1u64;
     let batch = 1u64;
     pt.add_account(
-        zk_inbox_client::cursor_pda(&inbox_program, chain_id).0,
+        zk_inbox_client::cursor_pda(&inbox_program, &settlement_program, chain_id).0,
         cursor_account(inbox_program, chain_id, batch),
     );
     let mut ctx = pt.start_with_context().await;
@@ -5684,6 +5696,7 @@ async fn full_flow_inbox_to_settlement_to_close() {
             zk_inbox_client::open_chunk_ix(
                 &inbox_program,
                 &c.authority.pubkey(),
+                &settlement_program,
                 c.chain_id,
                 batch,
                 idx,
@@ -5692,6 +5705,7 @@ async fn full_flow_inbox_to_settlement_to_close() {
             zk_inbox_client::write_chunk_ix(
                 &inbox_program,
                 &c.authority.pubkey(),
+                &settlement_program,
                 c.chain_id,
                 batch,
                 idx,
@@ -5701,13 +5715,20 @@ async fn full_flow_inbox_to_settlement_to_close() {
             zk_inbox_client::seal_chunk_ix(
                 &inbox_program,
                 &c.authority.pubkey(),
+                &settlement_program,
                 c.chain_id,
                 batch,
                 idx,
                 body.len() as u32,
                 zk_inbox_client::chunk_body_hash(body),
             ),
-            zk_inbox_client::seal_leaf_ix(&inbox_program, c.chain_id, batch, idx),
+            zk_inbox_client::seal_leaf_ix(
+                &inbox_program,
+                &settlement_program,
+                c.chain_id,
+                batch,
+                idx,
+            ),
         ];
         send(&mut ctx, &ixs, &c.authority, &[])
             .await
@@ -5718,6 +5739,7 @@ async fn full_flow_inbox_to_settlement_to_close() {
         &[zk_inbox_client::finalize_batch_ix(
             &inbox_program,
             &c.authority.pubkey(),
+            &settlement_program,
             c.chain_id,
             batch,
             0,
@@ -5728,7 +5750,8 @@ async fn full_flow_inbox_to_settlement_to_close() {
     .await
     .expect("inbox FinalizeBatch");
 
-    let (inbox_batch_pda, _) = zk_inbox_client::batch_pda(&inbox_program, c.chain_id, batch);
+    let (inbox_batch_pda, _) =
+        zk_inbox_client::batch_pda(&inbox_program, &settlement_program, c.chain_id, batch);
     let inbox_decoded = zk_inbox_client::decode_batch_account(
         &ctx.banks_client
             .get_account(inbox_batch_pda)
@@ -6601,4 +6624,596 @@ async fn propose_single_field_succeeds() {
         f.pending_mask,
         rome_zk_layouts::exit::exit_config::PENDING_MASK_CAP
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// INBOX-THIRD-PARTY-HALT: a third party's own settlement deployment against the shared inbox.
+//
+// The inbox keys a chain's batch cursor and batch accounts by chain id alone and takes the chain's
+// authority from a root account under whichever settlement program the caller names. The attacker here
+// needs nothing injected: he deploys his OWN copy of zk-settlement (a second program id), runs a genuine
+// `InitChain` for the victim's chain id on it (so a genuine root with HIS authority exists at
+// `["root", chain_id]` under his program), and then drives the shared inbox through it.
+//
+// Every test asserts the SAFE behaviour, so it is red while the defect exists. No program code changes here.
+// ---------------------------------------------------------------------------------------------
+
+struct TwoDeployments {
+    ctx: solana_program_test::ProgramTestContext,
+    inbox: Pubkey,
+    /// The chain's real settlement program, chain and authority.
+    victim: Chain,
+    /// The attacker's own settlement deployment, with a genuine `InitChain` for the same chain id.
+    attacker: Chain,
+}
+
+async fn two_deployments() -> TwoDeployments {
+    let real_settlement = Pubkey::new_unique();
+    let attacker_settlement = Pubkey::new_unique();
+    let inbox = Pubkey::new_unique();
+    let payer = funded_keypair();
+    let mut pt = rome_zk_testkit::program_test(
+        &[
+            rome_zk_testkit::ProgramSpec::upgradeable("zk_settlement", real_settlement),
+            rome_zk_testkit::ProgramSpec::upgradeable("zk_settlement", attacker_settlement),
+            rome_zk_testkit::ProgramSpec::new("zk_inbox", inbox),
+        ],
+        true,
+    );
+    let mut victim = default_chain(real_settlement);
+    victim.inbox_program = inbox;
+    let mut attacker = default_chain(attacker_settlement);
+    attacker.inbox_program = inbox;
+    assert_eq!(victim.chain_id, attacker.chain_id);
+    pt.add_account(payer.pubkey(), funded_account());
+    pt.add_account(victim.authority.pubkey(), funded_account());
+    pt.add_account(attacker.authority.pubkey(), funded_account());
+    let mut ctx = pt.start_with_context().await;
+    init_chain(&mut ctx, &payer, &victim).await;
+    init_chain(&mut ctx, &payer, &attacker).await;
+    TwoDeployments {
+        ctx,
+        inbox,
+        victim,
+        attacker,
+    }
+}
+
+/// Opens `batch` for `c` (naming `c.settlement_program`), seals one chunk and finalizes it, signed by
+/// `c.authority`. Stops at the first refusal and returns it.
+async fn open_and_finalize_one_chunk_batch(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    inbox: &Pubkey,
+    c: &Chain,
+    batch: u64,
+) -> Result<(), TransactionError> {
+    let a = &c.authority;
+    let body = format!("chunk of batch {batch}").into_bytes();
+    send(
+        ctx,
+        &[zk_inbox_client::open_batch_ix(
+            inbox,
+            &a.pubkey(),
+            c.chain_id,
+            batch,
+            1,
+            &c.settlement_program,
+        )],
+        a,
+        &[],
+    )
+    .await?;
+    send(
+        ctx,
+        &[
+            zk_inbox_client::open_chunk_ix(
+                inbox,
+                &a.pubkey(),
+                &c.settlement_program,
+                c.chain_id,
+                batch,
+                0,
+                body.len() as u32,
+            ),
+            zk_inbox_client::write_chunk_ix(
+                inbox,
+                &a.pubkey(),
+                &c.settlement_program,
+                c.chain_id,
+                batch,
+                0,
+                0,
+                body.clone(),
+            ),
+            zk_inbox_client::seal_chunk_ix(
+                inbox,
+                &a.pubkey(),
+                &c.settlement_program,
+                c.chain_id,
+                batch,
+                0,
+                body.len() as u32,
+                zk_inbox_client::chunk_body_hash(&body),
+            ),
+            zk_inbox_client::seal_leaf_ix(inbox, &c.settlement_program, c.chain_id, batch, 0),
+        ],
+        a,
+        &[],
+    )
+    .await?;
+    send(
+        ctx,
+        &[zk_inbox_client::finalize_batch_ix(
+            inbox,
+            &a.pubkey(),
+            &c.settlement_program,
+            c.chain_id,
+            batch,
+            0,
+        )],
+        a,
+        &[],
+    )
+    .await?;
+    Ok(())
+}
+
+async fn inbox_batch_acc(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    inbox: &Pubkey,
+    settlement_program: &Pubkey,
+    chain_id: u64,
+    batch: u64,
+) -> Option<[u8; 32]> {
+    let acct = ctx
+        .banks_client
+        .get_account(zk_inbox_client::batch_pda(inbox, settlement_program, chain_id, batch).0)
+        .await
+        .unwrap()?;
+    Some(zk_inbox_client::decode_batch_account(&acct.data).ok()?.acc)
+}
+
+async fn cursor_next(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    inbox: &Pubkey,
+    settlement_program: &Pubkey,
+    chain_id: u64,
+) -> u64 {
+    let acct = ctx
+        .banks_client
+        .get_account(zk_inbox_client::cursor_pda(inbox, settlement_program, chain_id).0)
+        .await
+        .unwrap()
+        .expect("cursor exists");
+    zk_inbox_client::decode_batch_cursor(&acct.data)
+        .unwrap()
+        .next_batch
+}
+
+fn post_root_for(c: &Chain, batch: u64, acc: [u8; 32]) -> sclient::PostRootFields {
+    sclient::PostRootFields {
+        chain_id: c.chain_id,
+        batch,
+        prev_batch: batch - 1,
+        pre_state_root: c.genesis_state_root,
+        first_block: 1,
+        last_block: 1,
+        state_root: keccak::hashv(&[b"state root after the attack"]).to_bytes(),
+        block_roots_merkle: [0u8; 32],
+        inbox_commitment: acc,
+        forced_outcome_commitment: rome_zk_layouts::forced_empty_root(&rome_zk_merkle::keccak256),
+        parent_hash: keccak::hashv(&[b"parent hash"]).to_bytes(),
+        last_block_hash: keccak::hashv(&[b"block hash"]).to_bytes(),
+        gas_in_batch: 0,
+    }
+}
+
+async fn victim_post_root(
+    w: &mut TwoDeployments,
+    batch: u64,
+    acc: [u8; 32],
+) -> Result<u64, TransactionError> {
+    let ix = sclient::post_root_ix(
+        &w.victim.settlement_program,
+        &w.victim.authority.pubkey(),
+        &w.inbox,
+        &w.victim.treasury,
+        post_root_for(&w.victim, batch, acc),
+    )
+    .expect("reserved chain");
+    send(&mut w.ctx, &[ix], &w.victim.authority, &[]).await
+}
+
+/// Third party burns the victim's first batch id through his own settlement deployment (opens it, then
+/// abandons it). The attack's own outcome is not asserted here; the tests assert what it does to the victim.
+async fn attacker_burns_batch(w: &mut TwoDeployments, batch: u64) {
+    let open = zk_inbox_client::open_batch_ix(
+        &w.inbox,
+        &w.attacker.authority.pubkey(),
+        w.attacker.chain_id,
+        batch,
+        1,
+        &w.attacker.settlement_program,
+    );
+    let _ = send(&mut w.ctx, &[open], &w.attacker.authority, &[]).await;
+    let abandon = zk_inbox_client::abandon_batch_ix(
+        &w.inbox,
+        &w.attacker.authority.pubkey(),
+        &w.attacker.settlement_program,
+        w.attacker.chain_id,
+        batch,
+    );
+    let _ = send(&mut w.ctx, &[abandon], &w.attacker.authority, &[]).await;
+}
+
+/// The attacker's deployment initialises the victim chain id's cursor first, far above any real batch id.
+/// SAFE behaviour: the chain still bootstraps, opens, and settles its first batch.
+#[tokio::test]
+async fn third_party_cursor_init_first_does_not_stop_the_chain_posting_its_first_batch() {
+    let mut w = two_deployments().await;
+    let attack = zk_inbox_client::init_batch_cursor_ix(
+        &w.inbox,
+        &w.attacker.authority.pubkey(),
+        w.attacker.chain_id,
+        u64::MAX,
+        &w.attacker.settlement_program,
+    );
+    let _ = send(&mut w.ctx, &[attack], &w.attacker.authority, &[]).await;
+
+    let init = zk_inbox_client::init_batch_cursor_ix(
+        &w.inbox,
+        &w.victim.authority.pubkey(),
+        w.victim.chain_id,
+        1,
+        &w.victim.settlement_program,
+    );
+    send(&mut w.ctx, &[init], &w.victim.authority, &[])
+        .await
+        .expect("the real chain's own InitBatchCursor was refused");
+    let inbox = w.inbox;
+    let c = clone_chain(&w.victim);
+    open_and_finalize_one_chunk_batch(&mut w.ctx, &inbox, &c, 1)
+        .await
+        .expect("the real chain could not open and finalize its first batch");
+    let acc = inbox_batch_acc(&mut w.ctx, &inbox, &c.settlement_program, c.chain_id, 1)
+        .await
+        .unwrap();
+    victim_post_root(&mut w, 1, acc)
+        .await
+        .expect("settlement refused the real chain's first batch");
+}
+
+/// The attacker's deployment burns the victim's first batch id after the victim bootstrapped its cursor.
+/// SAFE behaviour: the real chain still opens, finalizes and posts its first batch.
+#[tokio::test]
+async fn third_party_burning_the_first_batch_id_does_not_stop_the_chain_posting_it() {
+    let mut w = two_deployments().await;
+    let init = zk_inbox_client::init_batch_cursor_ix(
+        &w.inbox,
+        &w.victim.authority.pubkey(),
+        w.victim.chain_id,
+        1,
+        &w.victim.settlement_program,
+    );
+    send(&mut w.ctx, &[init], &w.victim.authority, &[])
+        .await
+        .expect("victim InitBatchCursor");
+
+    attacker_burns_batch(&mut w, 1).await;
+
+    let c = clone_chain(&w.victim);
+    let inbox = w.inbox;
+    open_and_finalize_one_chunk_batch(&mut w.ctx, &inbox, &c, 1)
+        .await
+        .expect("the real chain cannot open its first batch: a third party consumed id 1");
+    let acc = inbox_batch_acc(&mut w.ctx, &inbox, &c.settlement_program, c.chain_id, 1)
+        .await
+        .unwrap();
+    victim_post_root(&mut w, 1, acc)
+        .await
+        .expect("settlement refused the real chain's first batch");
+}
+
+/// Same attack, but the victim does the only other thing it can: it follows its cursor and uses whatever id
+/// the cursor hands out next. Settlement posts only `head_pending + 1`, so this must still end with the
+/// chain's batch accepted. SAFE behaviour: the cursor hands out batch 1 (the attack did not move it).
+#[tokio::test]
+async fn real_chain_following_its_cursor_after_a_third_party_burn_still_settles() {
+    let mut w = two_deployments().await;
+    let init = zk_inbox_client::init_batch_cursor_ix(
+        &w.inbox,
+        &w.victim.authority.pubkey(),
+        w.victim.chain_id,
+        1,
+        &w.victim.settlement_program,
+    );
+    send(&mut w.ctx, &[init], &w.victim.authority, &[])
+        .await
+        .expect("victim InitBatchCursor");
+
+    attacker_burns_batch(&mut w, 1).await;
+
+    let (inbox, chain_id) = (w.inbox, w.victim.chain_id);
+    let next = cursor_next(&mut w.ctx, &inbox, &w.victim.settlement_program, chain_id).await;
+    let c = clone_chain(&w.victim);
+    open_and_finalize_one_chunk_batch(&mut w.ctx, &inbox, &c, next)
+        .await
+        .expect("the real chain cannot open the batch its own cursor names");
+    let acc = inbox_batch_acc(
+        &mut w.ctx,
+        &inbox,
+        &w.victim.settlement_program,
+        chain_id,
+        next,
+    )
+    .await
+    .unwrap();
+    // `PostRoot` for batch `next` needs `prev_batch == head_pending == 0`, so build it directly.
+    let mut args = post_root_for(&w.victim, next, acc);
+    args.prev_batch = 0;
+    let ix = sclient::post_root_ix(
+        &w.victim.settlement_program,
+        &w.victim.authority.pubkey(),
+        &w.inbox,
+        &w.victim.treasury,
+        args,
+    )
+    .expect("reserved chain");
+    send(&mut w.ctx, &[ix], &w.victim.authority, &[])
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "settlement refused batch {next} from the real chain's cursor (it only posts batch 1 first): {e:?} (custom {:?})",
+                custom_error(&e)
+            )
+        });
+}
+
+/// Defence in depth. The attacker's deployment opens AND finalizes the victim's batch 1 with his own data.
+/// The inbox batch account records the attacker's settlement program and authority. SAFE behaviour:
+/// settlement refuses to post a root over a batch that its own chain's authority and program did not open.
+#[tokio::test]
+async fn post_root_refuses_a_batch_opened_through_another_settlement_program() {
+    let mut w = two_deployments().await;
+    let init = zk_inbox_client::init_batch_cursor_ix(
+        &w.inbox,
+        &w.victim.authority.pubkey(),
+        w.victim.chain_id,
+        1,
+        &w.victim.settlement_program,
+    );
+    send(&mut w.ctx, &[init], &w.victim.authority, &[])
+        .await
+        .expect("victim InitBatchCursor");
+
+    let (inbox, chain_id) = (w.inbox, w.victim.chain_id);
+    let a = clone_chain(&w.attacker);
+    let _ = open_and_finalize_one_chunk_batch(&mut w.ctx, &inbox, &a, 1).await;
+    let foreign_acc = inbox_batch_acc(&mut w.ctx, &inbox, &a.settlement_program, chain_id, 1)
+        .await
+        .unwrap_or([0x99u8; 32]);
+
+    let err = victim_post_root(&mut w, 1, foreign_acc).await.expect_err(
+        "settlement posted a root over inbox batch 1 that was opened and finalized \
+         through another settlement program by another authority",
+    );
+    // The victim's batch address holds nothing the attacker made (his batch lives at his own address), so
+    // the batch account at the address settlement derives is not a batch at all.
+    assert_eq!(
+        custom_error(&err),
+        Some(zk_settlement::errors::SettleError::WrongInboxAccount as u32),
+        "unexpected refusal: {err:?}"
+    );
+}
+
+fn clone_chain(c: &Chain) -> Chain {
+    Chain {
+        settlement_program: c.settlement_program,
+        inbox_program: c.inbox_program,
+        chain_id: c.chain_id,
+        authority: c.authority.insecure_clone(),
+        genesis_state_root: c.genesis_state_root,
+        challenge_window_slots: c.challenge_window_slots,
+        registry_authority: c.registry_authority.insecure_clone(),
+        treasury: c.treasury,
+        upgrade_authority: c.upgrade_authority.insecure_clone(),
+    }
+}
+
+/// Gives the attacker deployment's own root for the chain a `head_final_batch` high enough that a finality
+/// check alone would pass, so a refusal below can only come from the root belonging to another program.
+async fn make_attacker_root_final(w: &mut TwoDeployments) {
+    let key = sclient::root_pda(&w.attacker.settlement_program, w.attacker.chain_id).0;
+    let mut acct = w
+        .ctx
+        .banks_client
+        .get_account(key)
+        .await
+        .unwrap()
+        .expect("attacker root exists");
+    let o = rome_zk_layouts::root::OFF_HEAD_FINAL_BATCH;
+    acct.data[o..o + 8].copy_from_slice(&1_000u64.to_le_bytes());
+    w.ctx.set_account(&key, &acct.into());
+}
+
+/// The victim's batch 1 is open and finalized, with one chunk, under the victim's own settlement program.
+async fn victim_batch_one_finalized(w: &mut TwoDeployments) {
+    let init = zk_inbox_client::init_batch_cursor_ix(
+        &w.inbox,
+        &w.victim.authority.pubkey(),
+        w.victim.chain_id,
+        1,
+        &w.victim.settlement_program,
+    );
+    send(&mut w.ctx, &[init], &w.victim.authority, &[])
+        .await
+        .expect("victim InitBatchCursor");
+    let (inbox, v) = (w.inbox, clone_chain(&w.victim));
+    open_and_finalize_one_chunk_batch(&mut w.ctx, &inbox, &v, 1)
+        .await
+        .expect("victim opens and finalizes batch 1");
+}
+
+async fn account_is_live(w: &mut TwoDeployments, key: &Pubkey) -> bool {
+    w.ctx
+        .banks_client
+        .get_account(*key)
+        .await
+        .unwrap()
+        .map(|a| a.lamports > 0)
+        .unwrap_or(false)
+}
+
+/// `CloseBatch` against a root that belongs to another settlement program is refused, even when that root
+/// is "final" for the batch id: the batch only answers to the root of the program it was opened through.
+#[tokio::test]
+async fn close_batch_against_another_programs_root_is_refused() {
+    let mut w = two_deployments().await;
+    victim_batch_one_finalized(&mut w).await;
+    make_attacker_root_final(&mut w).await;
+
+    let mut ix = zk_inbox_client::close_batch_ix(
+        &w.inbox,
+        &w.victim.authority.pubkey(),
+        &w.victim.settlement_program,
+        w.victim.chain_id,
+        1,
+    );
+    ix.accounts[2] = AccountMeta::new_readonly(
+        sclient::root_pda(&w.attacker.settlement_program, w.attacker.chain_id).0,
+        false,
+    );
+    let err = send(&mut w.ctx, &[ix], &w.victim.authority, &[])
+        .await
+        .expect_err("CloseBatch accepted a root under another settlement program");
+    assert_eq!(
+        err,
+        TransactionError::InstructionError(0, InstructionError::IncorrectProgramId),
+        "CloseBatch against another program's root (the batch names its own settlement program, which does not own that root)"
+    );
+    let batch_key =
+        zk_inbox_client::batch_pda(&w.inbox, &w.victim.settlement_program, w.victim.chain_id, 1).0;
+    assert!(account_is_live(&mut w, &batch_key).await);
+}
+
+/// A chunk's `Close` against a root that belongs to another settlement program is refused, even when that
+/// root is "final" and the batch slot is the victim's live batch (or the address the batch would have under
+/// the other program); the victim's chunk survives. Under its own program's root it closes only once final.
+#[tokio::test]
+async fn chunk_close_against_another_programs_root_is_refused() {
+    let mut w = two_deployments().await;
+    victim_batch_one_finalized(&mut w).await;
+    make_attacker_root_final(&mut w).await;
+    let chunk_key = zk_inbox_client::chunk_pda(
+        &w.inbox,
+        &w.victim.settlement_program,
+        w.victim.chain_id,
+        1,
+        0,
+    )
+    .0;
+    assert!(account_is_live(&mut w, &chunk_key).await);
+    let attacker_root = sclient::root_pda(&w.attacker.settlement_program, w.attacker.chain_id).0;
+
+    for swap_batch_slot in [false, true] {
+        let mut ix = zk_inbox_client::close_chunk_ix(
+            &w.inbox,
+            &w.victim.authority.pubkey(),
+            &w.victim.settlement_program,
+            w.victim.chain_id,
+            1,
+            0,
+        );
+        if swap_batch_slot {
+            ix.accounts[2] = AccountMeta::new_readonly(
+                zk_inbox_client::batch_pda(
+                    &w.inbox,
+                    &w.attacker.settlement_program,
+                    w.victim.chain_id,
+                    1,
+                )
+                .0,
+                false,
+            );
+        }
+        ix.accounts[3] = AccountMeta::new_readonly(attacker_root, false);
+        let err = send(&mut w.ctx, &[ix], &w.victim.authority, &[])
+            .await
+            .expect_err("chunk Close accepted a root under another settlement program");
+        // The chunk address is derived from the settlement program that owns the root passed.
+        assert_eq!(
+            err,
+            TransactionError::InstructionError(0, InstructionError::InvalidSeeds),
+            "chunk Close against another program's root (batch slot swapped: {swap_batch_slot})"
+        );
+        assert!(account_is_live(&mut w, &chunk_key).await);
+    }
+
+    // Under its own program's root the victim's batch is not final yet (nothing was posted), so Close is
+    // still refused — the chunk is held until the real chain's own root says the batch is final.
+    let own = zk_inbox_client::close_chunk_ix(
+        &w.inbox,
+        &w.victim.authority.pubkey(),
+        &w.victim.settlement_program,
+        w.victim.chain_id,
+        1,
+        0,
+    );
+    let err = send(&mut w.ctx, &[own], &w.victim.authority, &[])
+        .await
+        .expect_err("a chunk of a batch whose root is not final yet must stay");
+    assert_eq!(
+        custom_error(&err),
+        Some(zk_inbox::batch::BatchError::RootNotFinal as u32),
+        "unexpected refusal: {err:?}"
+    );
+    assert!(account_is_live(&mut w, &chunk_key).await);
+}
+
+/// The explicit `f.settlement_program != program_id` check on its own. The batch is hand-built at the
+/// address settlement derives for the victim chain (so the address check passes) but records another
+/// settlement program in its own header: both post instructions refuse it with `WrongInboxAccount`.
+#[tokio::test]
+async fn post_root_and_post_root_proved_refuse_a_batch_at_the_right_address_recording_another_program(
+) {
+    let mut w = two_deployments().await;
+    victim_batch_one_finalized(&mut w).await;
+    let key =
+        zk_inbox_client::batch_pda(&w.inbox, &w.victim.settlement_program, w.victim.chain_id, 1).0;
+    let mut acct = w
+        .ctx
+        .banks_client
+        .get_account(key)
+        .await
+        .unwrap()
+        .expect("the victim's batch 1");
+    let acc = zk_inbox_client::decode_batch_account(&acct.data)
+        .unwrap()
+        .acc;
+    let o = rome_zk_layouts::batch::OFF_SETTLEMENT_PROGRAM;
+    acct.data[o..o + 32].copy_from_slice(&w.attacker.settlement_program.to_bytes());
+    w.ctx.set_account(&key, &acct.into());
+
+    let wrong = zk_settlement::errors::SettleError::WrongInboxAccount as u32;
+
+    let err = victim_post_root(&mut w, 1, acc)
+        .await
+        .expect_err("PostRoot accepted a batch recording another settlement program");
+    assert_eq!(custom_error(&err), Some(wrong), "PostRoot: {err:?}");
+
+    let args = post_root_for(&w.victim, 1, acc);
+    let header = build_synthetic_header(1, args.parent_hash, args.state_root);
+    let ix = sclient::post_root_proved_ix(
+        &w.victim.settlement_program,
+        &w.victim.authority.pubkey(),
+        &w.inbox,
+        &w.victim.treasury,
+        args,
+        synthetic_layout2_proof_abi(&header),
+        header,
+    );
+    let err = send(&mut w.ctx, &[ix], &w.victim.authority, &[])
+        .await
+        .expect_err("PostRootProved accepted a batch recording another settlement program");
+    assert_eq!(custom_error(&err), Some(wrong), "PostRootProved: {err:?}");
 }

@@ -214,12 +214,16 @@ pub fn anchor(
     let (registry_pda, _) = zk_settlement_client::registry_pda(settlement_program, chain_id);
     let (chain_config_pda, _) =
         zk_settlement_client::chain_config_pda(settlement_program, chain_id);
-    let (cursor_pda, _) = zk_inbox_client::cursor_pda(inbox_program, chain_id);
+    let (cursor_pda, _) = zk_inbox_client::cursor_pda(inbox_program, settlement_program, chain_id);
     let predecessor_batch = candidate_batch.saturating_sub(1);
     let (pred_pda, _) =
         zk_settlement_client::pending_pda(settlement_program, chain_id, predecessor_batch);
-    let inbox_batch_pda =
-        zk_settlement_client::inbox_batch_pda(inbox_program, chain_id, candidate_batch);
+    let inbox_batch_pda = zk_settlement_client::inbox_batch_pda(
+        inbox_program,
+        settlement_program,
+        chain_id,
+        candidate_batch,
+    );
     let (global_config_pda, _) = zk_settlement_client::global_config_pda(settlement_program);
     let programdata_pda = zk_settlement_client::program_data_pda(settlement_program);
 
@@ -627,13 +631,18 @@ mod tests {
             fetch
                 .accounts
                 .insert(cc_pda, encode_chain_config_v2(chain_id, 60));
-            let (cursor_pda, _) = zk_inbox_client::cursor_pda(&inbox_program, chain_id);
+            let (cursor_pda, _) =
+                zk_inbox_client::cursor_pda(&inbox_program, &settlement_program, chain_id);
             fetch.accounts.insert(
                 cursor_pda,
                 rome_zk_testkit::cursor_account(inbox_program, chain_id, 2).data,
             );
-            let inbox_batch_pda =
-                zk_settlement_client::inbox_batch_pda(&inbox_program, chain_id, candidate_batch);
+            let inbox_batch_pda = zk_settlement_client::inbox_batch_pda(
+                &inbox_program,
+                &settlement_program,
+                chain_id,
+                candidate_batch,
+            );
             fetch.accounts.insert(
                 inbox_batch_pda,
                 encode_inbox_batch(chain_id, candidate_batch, 1, true),
@@ -780,8 +789,12 @@ mod tests {
     #[test]
     fn inbox_not_finalized_yet_when_the_batch_pda_exists_but_is_not_finalized() {
         let mut f = Fixture::happy_path();
-        let inbox_batch_pda =
-            zk_settlement_client::inbox_batch_pda(&f.inbox_program, f.chain_id, f.candidate_batch);
+        let inbox_batch_pda = zk_settlement_client::inbox_batch_pda(
+            &f.inbox_program,
+            &f.settlement_program,
+            f.chain_id,
+            f.candidate_batch,
+        );
         f.fetch.accounts.insert(
             inbox_batch_pda,
             encode_inbox_batch(f.chain_id, f.candidate_batch, 1, false),
@@ -796,10 +809,15 @@ mod tests {
     #[test]
     fn inbox_not_finalized_yet_when_the_batch_pda_is_absent_and_the_cursor_has_not_passed_it() {
         let mut f = Fixture::happy_path();
-        let inbox_batch_pda =
-            zk_settlement_client::inbox_batch_pda(&f.inbox_program, f.chain_id, f.candidate_batch);
+        let inbox_batch_pda = zk_settlement_client::inbox_batch_pda(
+            &f.inbox_program,
+            &f.settlement_program,
+            f.chain_id,
+            f.candidate_batch,
+        );
         f.fetch.accounts.remove(&inbox_batch_pda);
-        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&f.inbox_program, f.chain_id);
+        let (cursor_pda, _) =
+            zk_inbox_client::cursor_pda(&f.inbox_program, &f.settlement_program, f.chain_id);
         f.fetch.accounts.insert(
             cursor_pda,
             rome_zk_testkit::cursor_account(f.inbox_program, f.chain_id, 1).data, // cursor still at 1, not past batch 1
@@ -816,8 +834,12 @@ mod tests {
     #[test]
     fn abandoned_inbox_batch_when_the_pda_is_absent_and_the_cursor_has_passed_it() {
         let mut f = Fixture::happy_path();
-        let inbox_batch_pda =
-            zk_settlement_client::inbox_batch_pda(&f.inbox_program, f.chain_id, f.candidate_batch);
+        let inbox_batch_pda = zk_settlement_client::inbox_batch_pda(
+            &f.inbox_program,
+            &f.settlement_program,
+            f.chain_id,
+            f.candidate_batch,
+        );
         f.fetch.accounts.remove(&inbox_batch_pda);
         // cursor is already at 2 (> candidate_batch 1) in the happy-path fixture.
         let err = f.anchor().unwrap_err();
@@ -865,7 +887,8 @@ mod tests {
         fetch
             .accounts
             .insert(cc_pda, encode_chain_config_v2(chain_id, 60));
-        let (cursor_pda, _) = zk_inbox_client::cursor_pda(&inbox_program, chain_id);
+        let (cursor_pda, _) =
+            zk_inbox_client::cursor_pda(&inbox_program, &settlement_program, chain_id);
         fetch.accounts.insert(
             cursor_pda,
             rome_zk_testkit::cursor_account(inbox_program, chain_id, 3).data,
@@ -875,7 +898,8 @@ mod tests {
             pred_pda,
             encode_pending(1, 60, [3u8; 32], rome_zk_layouts::pending::STATUS_FINAL),
         );
-        let inbox_batch_pda = zk_settlement_client::inbox_batch_pda(&inbox_program, chain_id, 2);
+        let inbox_batch_pda =
+            zk_settlement_client::inbox_batch_pda(&inbox_program, &settlement_program, chain_id, 2);
         fetch
             .accounts
             .insert(inbox_batch_pda, encode_inbox_batch(chain_id, 2, 1, true));
