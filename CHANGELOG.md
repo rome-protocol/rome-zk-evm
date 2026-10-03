@@ -6,6 +6,10 @@ and how they fit together.
 
 ## Inbox accounts keyed by the settlement program
 
+- Node image `v0.1.2` carries this change; the devnet inbox and settlement programs run it. A node on an
+  earlier image derives the old addresses and stops posting against them, so move to `v0.1.2` (set `ROME_ZK_TAG`,
+  run `./rollup init` and `./rollup up`), and initialize the cursor at the new address at
+  `root.head_pending_batch + 1` (`./rollup register --confirm` does it for a registered chain).
 - A chain's inbox accounts are keyed by its settlement program, so they can only be created through it.
   The batch cursor is now `["batch_cursor", settlement_program, chain_id]`, a batch is
   `["batch", settlement_program, chain_id, batch]` and a chunk is

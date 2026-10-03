@@ -216,9 +216,9 @@ To keep the manifest somewhere else, set `PROVER_KEYS_MANIFEST` in `.env` to its
 
 ## The node image
 
-The compose file runs the published node image `ghcr.io/rome-protocol/rome-zk-evm:v0.1.1`. Public tags are
+The compose file runs the published node image `ghcr.io/rome-protocol/rome-zk-evm:v0.1.2`. Public tags are
 pinned to the commit of the source export they were built from, so a tag names exactly one tree and never
-moves. Set `ROME_ZK_TAG=v0.1.1` in `.env`. `./rollup up` stops with `ImageTagNotSet` until you do. To run an
+moves. Set `ROME_ZK_TAG=v0.1.2` in `.env`. `./rollup up` stops with `ImageTagNotSet` until you do. To run an
 image you built from this tree yourself, set `ROME_ZK_IMAGE` to its full reference instead.
 
 ## Exits
