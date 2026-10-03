@@ -343,3 +343,152 @@ async fn log_shorter_than_persisted_head_is_a_named_fatal_error() {
         "expected LogShorterThanPersistedHead{{persisted_block: 2, ..}}, got {err:?}"
     );
 }
+
+/// Seals four blocks on a real `RethExecutor` the way the sealer will once it reads the deposit queue: blocks 2 and 4
+/// credit deposits (queue indices 0..3 and 3..4), the others none. Each block's records go to the ordered log, and
+/// the index-0 record of a block that credits deposits carries that block's withdrawals and its `deposits_end`.
+/// Returns the executor's head after block 4.
+async fn seal_four_blocks_into_a_log(
+    reth_dir: &std::path::Path,
+    log_dir: &std::path::Path,
+    signer: &PrivateKeySigner,
+    sequencer_key: &PrivateKeySigner,
+    withdrawals_for: impl Fn(u64) -> Vec<alloy_eips::eip4895::Withdrawal>,
+) -> Head {
+    use rome_zk_sequencer::header::SubBlockHeader;
+    use rome_zk_sequencer::signing::sign_header;
+
+    let genesis_path = write_genesis(reth_dir, signer.address());
+    let mut ex = RethExecutor::new(RethConfig {
+        datadir: reth_dir.join("db"),
+        genesis_path,
+        block_gas_limit: u64::from_str_radix(GAS_LIMIT_HEX.trim_start_matches("0x"), 16).unwrap(),
+    })
+    .unwrap();
+    let mut writer = rome_zk_sequencer::log::LogWriter::open(log_dir, 1_000).unwrap();
+    let mut prev_hash = alloy::primitives::B256::ZERO;
+    let mut nonce = 0u64;
+    for number in 1..=4u64 {
+        let first_ts_us = (1_757_000_000 + number) * 1_000_000;
+        let withdrawals = withdrawals_for(number);
+        let env = BlockEnv {
+            number,
+            timestamp_secs: first_ts_us / 1_000_000,
+            gas_limit: DEFAULT_BLOCK_GAS_LIMIT,
+            coinbase: Address::ZERO,
+            prev_randao: rome_zk_executor_api::prev_randao(CHAIN_ID, number),
+            base_fee: None,
+            withdrawals: withdrawals.clone(),
+        };
+        ex.open_block(env.clone()).await.unwrap();
+        let mut hashes = Vec::new();
+        let mut gas_in_block = 0u64;
+        for index in 0..SUB_BLOCKS_PER_BLOCK {
+            let txs = if index == 0 {
+                nonce += 1;
+                vec![signed_raw_tx(signer, CHAIN_ID, nonce - 1)]
+            } else {
+                vec![]
+            };
+            let outcome = ex.execute_sub_block(&txs, unbounded()).await.unwrap();
+            let credited = index == 0 && !withdrawals.is_empty();
+            let header = SubBlockHeader {
+                chain_id: CHAIN_ID,
+                block: number,
+                index,
+                timestamp_us: first_ts_us + index as u64 * 50_000,
+                tx_root: rome_zk_sequencer::merkle::root(&outcome.included),
+                receipts_root: outcome.receipts_root,
+                gas_used: outcome.gas_used,
+                prev_hash,
+                deposits_end: credited.then(|| withdrawals.last().unwrap().index + 1),
+            };
+            let signature = sign_header(sequencer_key, &header);
+            let list: &[alloy_eips::eip4895::Withdrawal] =
+                if credited { &withdrawals } else { &[] };
+            writer
+                .append_with_withdrawals(&header, &signature, &txs, list)
+                .unwrap();
+            prev_hash = header.hash();
+            hashes.push(prev_hash);
+            gas_in_block += outcome.gas_used;
+        }
+        ex.seal_block(BlockSealInputs {
+            block: number,
+            timestamp_secs: env.timestamp_secs,
+            sub_block_header_hashes: hashes,
+            total_gas_used: gas_in_block,
+        })
+        .await
+        .unwrap();
+    }
+    ex.head()
+}
+
+/// Recovery replays the logged withdrawals: a fresh executor replaying a log whose blocks credit deposits reaches the
+/// very head the live run reached (the credits are in the state root and so in the block hash), and the same chain
+/// without the withdrawals has a different head, so the equality is not an accident of nothing being credited.
+#[tokio::test(flavor = "multi_thread")]
+async fn recovery_replays_the_logged_withdrawals_and_reproduces_the_head() {
+    use rome_zk_executor_api::deposit_withdrawal;
+    let signer = PrivateKeySigner::random();
+    let sequencer_key = PrivateKeySigner::random();
+    let withdrawals_for = |number: u64| match number {
+        2 => (0..3u64)
+            .map(|i| deposit_withdrawal(i, Address::repeat_byte(0xD0 + i as u8), 1_000 * (i + 1)))
+            .collect(),
+        4 => vec![deposit_withdrawal(3, Address::repeat_byte(0xD3), 77)],
+        _ => vec![],
+    };
+
+    let live_log = tempdir().unwrap();
+    let live_reth = tempdir().unwrap();
+    let live_head = seal_four_blocks_into_a_log(
+        live_reth.path(),
+        live_log.path(),
+        &signer,
+        &sequencer_key,
+        withdrawals_for,
+    )
+    .await;
+
+    // The same four blocks with no deposits: a different chain.
+    let plain_log = tempdir().unwrap();
+    let plain_reth = tempdir().unwrap();
+    let plain_head = seal_four_blocks_into_a_log(
+        plain_reth.path(),
+        plain_log.path(),
+        &signer,
+        &sequencer_key,
+        |_| vec![],
+    )
+    .await;
+    assert_ne!(live_head.state_root, plain_head.state_root);
+    assert_ne!(live_head.block_hash, plain_head.block_hash);
+
+    // A fresh executor replays the log with withdrawals.
+    let fresh_reth = tempdir().unwrap();
+    let genesis_path = write_genesis(fresh_reth.path(), signer.address());
+    let mut fresh = RethExecutor::new(RethConfig {
+        datadir: fresh_reth.path().join("db"),
+        genesis_path,
+        block_gas_limit: u64::from_str_radix(GAS_LIMIT_HEX.trim_start_matches("0x"), 16).unwrap(),
+    })
+    .unwrap();
+    replay_into_executor(
+        live_log.path(),
+        &mut fresh,
+        sequencer_key.address(),
+        false,
+        DEFAULT_BLOCK_GAS_LIMIT,
+        Address::ZERO,
+        SUB_BLOCKS_PER_BLOCK,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fresh.head(),
+        live_head,
+        "replay must credit the logged withdrawals and reach the live head"
+    );
+}

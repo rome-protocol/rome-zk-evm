@@ -4,6 +4,37 @@ This changelog describes the system as built on `main`, grouped by component. It
 release-tag cadence yet — see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for what each component does
 and how they fit together.
 
+## Operator CLI
+
+- New crate `rome-zk-ops` with the binary `rome-zk-ops`: `chain-id`, `register`, `refund-deposit`,
+  `exit-config propose|activate|show`, `migrate` and `init-cursor`. A command is a dry run unless `--confirm`
+  is given; the dry run prints the signed transaction and sends nothing. Every transaction goes out as a V1
+  transaction through `rome-zk-solana-sender`, and keys are read from file paths and never printed. Each
+  refusal has a name and an exit code. `refund-deposit` is the first caller of `refund_deposit_ix`: it gives a
+  chain's registration deposit back to its authority once a batch has finalized or ten have been posted.
+- The bridge commands: `vault init`, `vault fund`, `vault show` and `release-exit`. They reuse
+  `zk_bridge_client::vault_tool` and the release-exit logic, send one V1 transaction through
+  `rome-zk-solana-sender` (`release-exit` carries the recipient's token-account creation in the same
+  transaction), and are a dry run unless `--confirm` is given. The `vault` and `release-exit` examples of
+  `zk-bridge-client` are thin wrappers over them with the same flags and the same dry-run default, and its
+  `devnet-driver` feature is now empty (it pulled in an RPC client, `base64` and `bincode` that nothing uses).
+- The devnet driver examples of `zk-inbox-client` and `zk-settlement-client`, and `find_max_batch_id`, send
+  through the V1 sender. The inbox `devnet_driver` no longer probes the deployed program with a legacy
+  simulation; it deploys a throwaway program only when given `--throwaway`. The settlement `devnet_driver`
+  no longer runs a separate `RootView` simulation before sending it.
+- A shell test, `scripts/tests/no_legacy_tx.sh` (run by the shell-tests job), refuses a legacy transaction or
+  message constructor in client code under `crates/` and `programs/`, and proves it fails on a planted line.
+- The root `Dockerfile` ships `rome-zk-ops` beside the sequencer, batcher and derive binaries, and pins the
+  runtime user to uid and gid 999.
+- `rome-zk-solana-sender` can sign with co-signers beside the fee payer, for a transaction with a second
+  required signer.
+- `zk-settlement-client` gains `ops_plan`: the registration nonce lookup, the recorded nonce and chain id pair,
+  and the exit-config `pending_mask`, shared by the CLI and the tests.
+- The `register_chain`, `migrate_chain` and `init_cursor` examples, and the three exit-config subcommands of
+  `governance`, are now thin wrappers over the CLI with the same flags; they still send unless `--dry-run`
+  is given. The other `governance` subcommands send through the V1 sender instead of building a legacy
+  transaction. The `devnet-driver` feature no longer pulls in `reqwest`, `serde_json`, `base64` or `bincode`.
+
 ## Withdrawals rule
 
 - `rome-zk-executor-api` gains `deposit_withdrawal(index, recipient, amount_gwei)`, `withdrawals_root(&[Withdrawal])`

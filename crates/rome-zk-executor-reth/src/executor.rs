@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use alloy_consensus::transaction::SignerRecoverable;
 use alloy_consensus::{BlockHeader, Header, Transaction};
 use alloy_eips::eip2718::Decodable2718;
+use alloy_eips::eip4895::Withdrawals;
 use alloy_primitives::{Address, Bytes, TxHash, B256};
 use reth_chain_state::{ExecutedBlock, MemoryOverlayStateProviderRef};
 use reth_chainspec::ChainSpec;
@@ -26,8 +27,9 @@ use reth_trie_common::{ComputedTrieData, HashedPostState};
 use revm::database::{CacheState, State};
 
 use rome_zk_executor_api::{
-    canonical_header_rule, BlockEnv, BlockOutcome, BlockSealInputs, Executor as ZkExecutor,
-    ExecutorError, Head, Reason, RejectedTx, SubBlockLimits, SubBlockOutcome,
+    canonical_header_rule_with_withdrawals, BlockEnv, BlockOutcome, BlockSealInputs,
+    Executor as ZkExecutor, ExecutorError, Head, Reason, RejectedTx, SubBlockLimits,
+    SubBlockOutcome,
 };
 
 use crate::chain::{genesis_from_path, open_provider_factory, RethTypes};
@@ -58,6 +60,10 @@ struct PendingBlock {
     /// second time).
     included: Vec<Recovered<TransactionSigned>>,
     attrs: NextBlockEnvAttributes,
+    /// The `withdrawals_root` the shared header rule fixes for this block
+    /// ([`canonical_header_rule_with_withdrawals`] over the env's withdrawals). `seal_block` checks the header reth
+    /// built against it.
+    withdrawals_root: B256,
 }
 
 /// One sealed-but-not-yet-CONFIRMED-durable block, kept in the shape reth's own
@@ -597,18 +603,27 @@ impl RethExecutor {
     /// is reth's own input for computing the withdrawals-trie root; the guest asserts the RESULT equals
     /// `rule.withdrawals_root` directly rather than this executor passing a root in (reth computes that
     /// root itself from the withdrawals list, it does not accept one).
+    ///
+    /// The block's own withdrawals (the deposits it credits, empty for a block without any) go to reth unchanged, and
+    /// reth credits them after the block's transactions. The rule is the one that carries them
+    /// ([`canonical_header_rule_with_withdrawals`]); with an empty list it is exactly the rule every block had before.
     fn attrs_from_env(env: &BlockEnv, chain_id: u64) -> NextBlockEnvAttributes {
-        let rule = canonical_header_rule(chain_id, env.number, env.coinbase);
+        let rule = Self::rule_from_env(env, chain_id);
         NextBlockEnvAttributes {
             timestamp: env.timestamp_secs,
             suggested_fee_recipient: rule.beneficiary,
             prev_randao: rule.prev_randao,
             gas_limit: env.gas_limit,
             parent_beacon_block_root: Some(rule.parent_beacon_block_root),
-            withdrawals: Some(Default::default()),
+            withdrawals: Some(Withdrawals::new(env.withdrawals.clone())),
             extra_data: rule.extra_data,
             slot_number: None,
         }
+    }
+
+    /// The shared header rule for the block this env opens, carrying the env's withdrawals.
+    fn rule_from_env(env: &BlockEnv, chain_id: u64) -> rome_zk_executor_api::HeaderRule {
+        canonical_header_rule_with_withdrawals(chain_id, env.number, env.coinbase, &env.withdrawals)
     }
 }
 
@@ -739,6 +754,8 @@ impl ZkExecutor for RethExecutor {
             state,
             included: Vec::new(),
             attrs: Self::attrs_from_env(&env, self.chain_spec.chain.id()),
+            withdrawals_root: Self::rule_from_env(&env, self.chain_spec.chain.id())
+                .withdrawals_root,
         });
         Ok(())
     }
@@ -847,6 +864,7 @@ impl ZkExecutor for RethExecutor {
             )));
         }
         let attrs = pending.attrs;
+        let expected_withdrawals_root = pending.withdrawals_root;
 
         // The sanctioned re-execution at seal time (module doc): a fresh preview-shaped State over
         // the same canonical parent (now read straight off MDBX — see `open_block`'s comment),
@@ -912,6 +930,15 @@ impl ZkExecutor for RethExecutor {
         let block_hash = header.hash();
         let receipts_root = header.receipts_root();
         let block_number = header.number();
+        // The header reth built must carry the withdrawals root the shared rule fixes for this block: the same root
+        // derive and the guest compute from the same list, so a block the executor seals can never disagree with
+        // them about it.
+        if header.withdrawals_root() != Some(expected_withdrawals_root) {
+            return Err(ExecutorError::EnvMismatch(format!(
+                "seal_block: block {block_number} header withdrawals_root {:?} but the header rule says {expected_withdrawals_root:#x}",
+                header.withdrawals_root()
+            )));
+        }
         // The block this executor just
         // built (from the env `open_block` committed) must carry the exact number the caller says it
         // sealed (`BlockSealInputs::block`) — `open_block`'s own check above already ties `env.number`
@@ -1128,6 +1155,7 @@ mod tests {
             coinbase: Address::ZERO,
             prev_randao: rome_zk_executor_api::prev_randao(CHAIN_ID, 11),
             base_fee: None,
+            withdrawals: vec![],
         };
         let attrs = RethExecutor::attrs_from_env(&env, CHAIN_ID);
         assert_eq!(
@@ -1167,6 +1195,7 @@ mod tests {
             coinbase: fee_recipient,
             prev_randao: rome_zk_executor_api::prev_randao(CHAIN_ID, 11),
             base_fee: None,
+            withdrawals: vec![],
         };
         let attrs = RethExecutor::attrs_from_env(&env, CHAIN_ID);
         assert_eq!(attrs.suggested_fee_recipient, fee_recipient);
@@ -1387,6 +1416,7 @@ mod tests {
             coinbase: Address::ZERO,
             prev_randao: rome_zk_executor_api::prev_randao(CHAIN_ID, number),
             base_fee: None,
+            withdrawals: vec![],
         }
     }
 
@@ -1501,7 +1531,7 @@ mod tests {
         let config1 = test_config(dir1.path(), &funded);
         let mut ex1 = RethExecutor::new(config1).unwrap();
         let env1 = block_env(&ex1, 1);
-        ex1.open_block(env1).await.unwrap();
+        ex1.open_block(env1.clone()).await.unwrap();
         let outcome1 = ex1
             .execute_sub_block(&[tx_a.clone(), tx_bad, tx_c.clone()], unbounded_limits())
             .await
@@ -1523,7 +1553,7 @@ mod tests {
         let config2 = test_config(dir2.path(), &funded);
         let mut ex2 = RethExecutor::new(config2).unwrap();
         let env2 = block_env(&ex2, 1);
-        ex2.open_block(env2).await.unwrap();
+        ex2.open_block(env2.clone()).await.unwrap();
         let outcome2 = ex2
             .execute_sub_block(&[tx_a, tx_c], unbounded_limits())
             .await
@@ -1607,7 +1637,7 @@ mod tests {
         let mut ex = RethExecutor::new(config).unwrap();
 
         let block0_env = block_env(&ex, 1);
-        ex.open_block(block0_env).await.unwrap();
+        ex.open_block(block0_env.clone()).await.unwrap();
         let mut nonce = 0u64;
         for i in 0..20u16 {
             let txs = if i % 4 == 0 {
@@ -1641,7 +1671,7 @@ mod tests {
 
         // A second, empty block must produce a DIFFERENT hash/root (proves this isn't a constant).
         let block1_env = block_env(&ex, 2);
-        ex.open_block(block1_env).await.unwrap();
+        ex.open_block(block1_env.clone()).await.unwrap();
         for _ in 0..20u16 {
             ex.execute_sub_block(&[], unbounded_limits()).await.unwrap();
         }
@@ -1716,8 +1746,9 @@ mod tests {
             coinbase: Address::ZERO,
             prev_randao: rome_zk_executor_api::prev_randao(CHAIN_ID, 1),
             base_fee: None,
+            withdrawals: vec![],
         };
-        ex.open_block(env).await.unwrap();
+        ex.open_block(env.clone()).await.unwrap();
 
         let mut sub_block_receipts_root = None;
         for i in 0..20u16 {
@@ -1779,7 +1810,7 @@ mod tests {
             // A fresh chain's first sealed block is design 1.
             for b in 1..=blocks {
                 let env = block_env(ex, b);
-                ex.open_block(env).await.unwrap();
+                ex.open_block(env.clone()).await.unwrap();
                 for i in 0..20u16 {
                     let txs = if i == 0 {
                         let tx = signed_transfer(signer, nonce);
@@ -1861,7 +1892,7 @@ mod tests {
             // BlockEnv.number == the resulting header.number for every block.
             for b in 1..=2u64 {
                 let env = block_env(&ex, b);
-                ex.open_block(env).await.unwrap();
+                ex.open_block(env.clone()).await.unwrap();
                 for i in 0..20u16 {
                     let txs = if i == 0 {
                         let tx = signed_transfer(&signer, nonce);
@@ -2009,7 +2040,7 @@ mod tests {
         let mut ex = RethExecutor::new(config).unwrap();
 
         let block1_env = block_env(&ex, 1);
-        ex.open_block(block1_env).await.unwrap();
+        ex.open_block(block1_env.clone()).await.unwrap();
         for _ in 0..20u16 {
             ex.execute_sub_block(&[], unbounded_limits()).await.unwrap();
         }
@@ -2267,7 +2298,7 @@ mod tests {
         );
         let mut ex = RethExecutor::new(config).unwrap();
         let env = block_env(&ex, 1); // gas_limit = genesis gasLimit, 0x2540be400 = 10_000_000_000
-        ex.open_block(env).await.unwrap();
+        ex.open_block(env.clone()).await.unwrap();
 
         let tx = TxEip1559 {
             chain_id: CHAIN_ID,
@@ -2528,7 +2559,7 @@ mod tests {
         // A fresh chain's first sealed block is design 1.
         for b in 1..=BLOCKS {
             let env = block_env(&ex, b);
-            ex.open_block(env).await.unwrap();
+            ex.open_block(env.clone()).await.unwrap();
             for _ in 0..20u16 {
                 let txs: Vec<Bytes> = (0..(TRANSFERS_PER_BLOCK / 20))
                     .map(|_| {
@@ -2591,7 +2622,7 @@ mod tests {
         ex.set_persist_delay_for_test(Duration::from_millis(300));
 
         let block0_env = block_env(&ex, 1);
-        ex.open_block(block0_env).await.unwrap();
+        ex.open_block(block0_env.clone()).await.unwrap();
         for _ in 0..20u16 {
             ex.execute_sub_block(&[], unbounded_limits()).await.unwrap();
         }
@@ -2642,7 +2673,7 @@ mod tests {
 
         // Block 0: sender funds the recipient, and pays its own gas.
         let block0_env = block_env(&ex, 1);
-        ex.open_block(block0_env).await.unwrap();
+        ex.open_block(block0_env.clone()).await.unwrap();
         let fund_amount = U256::from(10u128).pow(U256::from(19u8));
         let fund_tx = signed_transfer_value(&sender, 0, recipient.address(), fund_amount);
         for i in 0..20u16 {
@@ -2715,7 +2746,7 @@ mod tests {
 
         // A fresh chain's first sealed block is design 1.
         let block1_env = block_env(&ex, 1);
-        ex.open_block(block1_env).await.unwrap();
+        ex.open_block(block1_env.clone()).await.unwrap();
         let tx = signed_transfer(&signer, 0);
         for i in 0..20u16 {
             let txs = if i == 0 { vec![tx.clone()] } else { vec![] };
@@ -2799,7 +2830,7 @@ mod tests {
             nonce: u64,
         ) {
             let env = block_env(ex, block);
-            ex.open_block(env).await.unwrap();
+            ex.open_block(env.clone()).await.unwrap();
             for i in 0..20u16 {
                 let txs = if i == 0 {
                     vec![signed_transfer(signer, nonce)]
@@ -2927,7 +2958,7 @@ mod tests {
         );
         let mut ex = RethExecutor::new(config).unwrap();
         let env = block_env(&ex, 1);
-        ex.open_block(env).await.unwrap();
+        ex.open_block(env.clone()).await.unwrap();
         for _ in 0..20u16 {
             ex.execute_sub_block(&[], unbounded_limits()).await.unwrap();
         }
@@ -2951,7 +2982,7 @@ mod tests {
     async fn seal_blocks_for_torn_tests(ex: &mut RethExecutor, from: u64, to: u64) {
         for b in from..=to {
             let env = block_env(ex, b);
-            ex.open_block(env).await.unwrap();
+            ex.open_block(env.clone()).await.unwrap();
             for _ in 0..20u16 {
                 ex.execute_sub_block(&[], unbounded_limits()).await.unwrap();
             }
@@ -3433,7 +3464,7 @@ mod tests {
             // seals empty sub-blocks) does not have — giving B's block 4 a different header (and
             // hash) than A's, while its parent hash (block 3) still matches A's real block 3 exactly.
             let env = block_env(&ex_b, 4);
-            ex_b.open_block(env).await.unwrap();
+            ex_b.open_block(env.clone()).await.unwrap();
             let tx = alloy_consensus::TxEip1559 {
                 chain_id: CHAIN_ID,
                 nonce: 0,
@@ -3709,5 +3740,143 @@ mod tests {
             .expect("the inverse torn shape must also self-heal at open, not refuse to start");
         assert_eq!(healed.last_persisted_block(), Some(3));
         assert_eq!(healed.head().block, 3);
+    }
+
+    // ---- blocks that carry withdrawals (deposits) --------------------------------------------------------------------
+
+    /// `attrs_from_env` hands reth the env's withdrawals unchanged, and the rule it checks against carries the same
+    /// list: with an empty list the root is the shared `EMPTY_WITHDRAWALS`, as every block had before deposits.
+    #[test]
+    fn attrs_from_env_passes_the_withdrawals_list_and_the_rule_carries_it() {
+        let list = vec![
+            rome_zk_executor_api::deposit_withdrawal(4, Address::repeat_byte(0xE1), 7_000),
+            rome_zk_executor_api::deposit_withdrawal(5, Address::repeat_byte(0xE2), 9_000),
+        ];
+        let env = BlockEnv {
+            number: 3,
+            timestamp_secs: 1_000,
+            gas_limit: 10_000_000_000,
+            coinbase: Address::ZERO,
+            prev_randao: B256::ZERO,
+            base_fee: None,
+            withdrawals: list.clone(),
+        };
+        let attrs = RethExecutor::attrs_from_env(&env, CHAIN_ID);
+        assert_eq!(attrs.withdrawals, Some(Withdrawals::new(list.clone())));
+        assert_eq!(
+            RethExecutor::rule_from_env(&env, CHAIN_ID).withdrawals_root,
+            rome_zk_executor_api::withdrawals_root(&list)
+        );
+
+        let empty = BlockEnv {
+            withdrawals: vec![],
+            ..env
+        };
+        let attrs = RethExecutor::attrs_from_env(&empty, CHAIN_ID);
+        assert_eq!(attrs.withdrawals, Some(Withdrawals::default()));
+        assert_eq!(
+            RethExecutor::rule_from_env(&empty, CHAIN_ID).withdrawals_root,
+            rome_zk_executor_api::EMPTY_WITHDRAWALS
+        );
+    }
+
+    fn balance_of(ex: &RethExecutor, addr: Address) -> U256 {
+        ex.overlay_state_provider()
+            .unwrap()
+            .account_balance(&addr)
+            .unwrap()
+            .unwrap_or_default()
+    }
+
+    /// Seals block 1 of a fresh chain with one transfer from `signer` and `withdrawals`; returns the executor so the
+    /// caller can read the sealed header and the balances.
+    async fn seal_one_block(
+        dir: &std::path::Path,
+        signer: &PrivateKeySigner,
+        withdrawals: Vec<alloy_eips::eip4895::Withdrawal>,
+    ) -> RethExecutor {
+        let config = test_config(
+            dir,
+            &[(signer.address(), U256::from(10u128).pow(U256::from(20u8)))],
+        );
+        let mut ex = RethExecutor::new(config).unwrap();
+        let env = BlockEnv {
+            withdrawals,
+            ..block_env(&ex, 1)
+        };
+        let timestamp_secs = env.timestamp_secs;
+        ex.open_block(env).await.unwrap();
+        for i in 0..20u16 {
+            let txs = if i == 0 {
+                vec![signed_transfer(signer, 0)]
+            } else {
+                vec![]
+            };
+            ex.execute_sub_block(&txs, unbounded_limits())
+                .await
+                .unwrap();
+        }
+        ex.seal_block(BlockSealInputs {
+            block: 1,
+            timestamp_secs,
+            sub_block_header_hashes: vec![B256::repeat_byte(1); 20],
+            total_gas_used: 21_000,
+        })
+        .await
+        .unwrap();
+        ex
+    }
+
+    /// A block with withdrawals credits them (amount in gwei, so `amount * 1e9` wei) after its transactions, and its
+    /// header carries the shared withdrawals_root over exactly that list. Compared with the same block sealed without them: the
+    /// transaction's effects are identical, only the credits differ, and the block hash changes with them.
+    #[tokio::test]
+    async fn a_block_with_withdrawals_credits_them_after_its_transactions_with_the_shared_root() {
+        let _serial = serial_mdbx().await;
+        let signer = PrivateKeySigner::random();
+        let to_sender = rome_zk_executor_api::deposit_withdrawal(20, signer.address(), 5_000_000);
+        let fresh_a = rome_zk_executor_api::deposit_withdrawal(21, Address::repeat_byte(0xE1), 1);
+        let fresh_b =
+            rome_zk_executor_api::deposit_withdrawal(22, Address::repeat_byte(0xE2), 123_456_789);
+        let list = vec![fresh_a, to_sender, fresh_b];
+
+        let plain_dir = tempdir().unwrap();
+        let plain = seal_one_block(plain_dir.path(), &signer, vec![]).await;
+        let with_dir = tempdir().unwrap();
+        let with = seal_one_block(with_dir.path(), &signer, list.clone()).await;
+
+        // The empty list gives the shared constant; the list gives withdrawals_root over it.
+        assert_eq!(
+            plain.canonical_parent.withdrawals_root(),
+            Some(rome_zk_executor_api::EMPTY_WITHDRAWALS)
+        );
+        assert_eq!(
+            with.canonical_parent.withdrawals_root(),
+            Some(rome_zk_executor_api::withdrawals_root(&list))
+        );
+        assert_ne!(plain.canonical_parent.hash(), with.canonical_parent.hash());
+        assert_ne!(
+            plain.canonical_parent.state_root(),
+            with.canonical_parent.state_root()
+        );
+
+        // Credits: `amount_gwei * 1e9` wei each, after the transaction ran (the sender paid for gas, then was credited).
+        let wei = |w: &alloy_eips::eip4895::Withdrawal| {
+            U256::from(w.amount) * U256::from(1_000_000_000u64)
+        };
+        assert_eq!(balance_of(&plain, fresh_a.address), U256::ZERO);
+        assert_eq!(balance_of(&with, fresh_a.address), wei(&fresh_a));
+        assert_eq!(balance_of(&with, fresh_b.address), wei(&fresh_b));
+        assert_eq!(
+            balance_of(&with, signer.address()),
+            balance_of(&plain, signer.address()) + wei(&to_sender),
+            "the sender's own transaction ran as it always did; the credit lands on top of it"
+        );
+        // A withdrawal uses no gas and runs no transaction.
+        assert_eq!(with.nonce(signer.address()), plain.nonce(signer.address()));
+        assert_eq!(
+            with.canonical_parent.gas_used(),
+            plain.canonical_parent.gas_used()
+        );
     }
 }

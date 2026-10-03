@@ -26,10 +26,7 @@ use solana_program::pubkey::Pubkey;
 // `commitment_config` moved out of `solana_sdk`'s root re-export in the Agave 4.x line (API fallout) — now its own
 // crate.
 use solana_commitment_config::CommitmentConfig;
-use solana_sdk::{
-    signature::{read_keypair_file, Signer},
-    transaction::Transaction,
-};
+use solana_sdk::signature::{read_keypair_file, Signer};
 use std::{path::PathBuf, str::FromStr};
 use zk_inbox_client::{cursor_proposal, scan};
 
@@ -347,19 +344,14 @@ async fn main() {
         next_batch,
         &settlement_program,
     );
-    let blockhash = rpc
-        .get_latest_blockhash()
-        .await
-        .expect("get_latest_blockhash");
-    let tx = Transaction::new_signed_with_payer(
-        &[ix],
-        Some(&authority.pubkey()),
-        &[&authority],
-        blockhash,
-    );
-    let sig = rpc
-        .send_and_confirm_transaction(&tx)
-        .await
-        .expect("InitBatchCursor send_and_confirm_transaction");
+    // One V1 transaction through `rome-zk-solana-sender`, via the operator CLI's chain seam.
+    let sig = {
+        use rome_zk_ops::chain::{Chain, RpcChain};
+        let signers = rome_zk_ops::keys::Signers::new(rome_zk_ops::keys::copy(&authority), vec![]);
+        RpcChain::new(rpc.url())
+            .send(&[ix], &signers)
+            .await
+            .expect("InitBatchCursor send")
+    };
     println!("InitBatchCursor sent: {sig}");
 }

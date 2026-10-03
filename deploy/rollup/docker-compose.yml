@@ -24,8 +24,9 @@
 
 x-node: &node
   # Public tags match the source tree used to build the image.
-  # Set ROME_ZK_TAG in .env to the tag your release notes give, or ROME_ZK_IMAGE to a full reference (an image you
-  # built from this tree). `./rollup up` refuses to start while neither is set.
+  # Set ROME_ZK_TAG in .env to the tag of the source you checked out (the published tags are listed at
+  # https://github.com/rome-protocol/rome-zk-evm/tags), or ROME_ZK_IMAGE to a full reference (an image you built from
+  # this tree). `./rollup up` refuses to start while neither is set.
   image: ${ROME_ZK_IMAGE:-ghcr.io/rome-protocol/rome-zk-evm:${ROME_ZK_TAG:-unset}}
   restart: unless-stopped
   environment: ["RUST_LOG=info"]
@@ -119,8 +120,8 @@ services:
         condition: service_healthy
 
   prover:
-    # Built from this tree (deploy/rollup/prover/Dockerfile) the first time the prover starts; the published prover image
-    # comes with the public release. Set ROME_ZK_PROVER_IMAGE to use an image you pushed somewhere else.
+    # Built from this tree (deploy/rollup/prover/Dockerfile) the first time the prover starts. No prover image is
+    # published yet. Set ROME_ZK_PROVER_IMAGE to use an image you pushed yourself.
     image: ${ROME_ZK_PROVER_IMAGE:-rome-zk-prover:local}
     build:
       context: ../..

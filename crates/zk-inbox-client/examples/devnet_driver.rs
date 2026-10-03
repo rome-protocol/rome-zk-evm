@@ -4,22 +4,18 @@
 //!
 //! Usage:
 //!   cargo run --features devnet-driver -p zk-inbox-client --example devnet_driver -- \
-//!     [--keypair PATH] [--rpc-url URL] [--program-id ID] [--settlement-program ID]
+//!     [--keypair PATH] [--rpc-url URL] [--program-id ID] [--settlement-program ID] [--throwaway]
 //!
 //! Defaults: `--keypair ~/.config/solana/id.json`, `--rpc-url https://api.devnet.solana.com`, `--program-id` /
 //! `--settlement-program` = the dev deployment's program ids. The keypair is never read from or written into
-//! the repo; a throwaway program keypair (only generated if the deployed dev program doesn't yet recognize the
-//! new instructions) is written under `/tmp` and its id is printed so it can be recorded and later closed.
+//! the repo; a throwaway program keypair (only generated with `--throwaway`) is written under `/tmp` and its id is printed so it can be recorded and later closed.
 
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_program::{instruction::Instruction, pubkey::Pubkey};
 // `commitment_config` moved out of `solana_sdk`'s root re-export in the Agave 4.x line (API fallout) — now its own
 // crate.
 use solana_commitment_config::CommitmentConfig;
-use solana_sdk::{
-    signature::{read_keypair_file, write_keypair_file, Keypair, Signature, Signer},
-    transaction::Transaction,
-};
+use solana_sdk::signature::{read_keypair_file, write_keypair_file, Keypair, Signature, Signer};
 use solana_transaction_status_client_types::UiTransactionEncoding;
 use std::{path::PathBuf, str::FromStr, time::Duration};
 
@@ -32,6 +28,7 @@ struct Args {
     rpc_url: String,
     program_id: Pubkey,
     settlement_program: Pubkey,
+    throwaway: bool,
 }
 
 fn parse_args() -> Args {
@@ -39,6 +36,7 @@ fn parse_args() -> Args {
     let mut rpc_url = "https://api.devnet.solana.com".to_string();
     let mut program_id = Pubkey::from_str(DEVNET_PROGRAM_ID).unwrap();
     let mut settlement_program = Pubkey::from_str(DEVNET_SETTLEMENT_PROGRAM_ID).unwrap();
+    let mut throwaway = false;
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < argv.len() {
@@ -48,6 +46,11 @@ fn parse_args() -> Args {
                 .unwrap_or_else(|| panic!("{flag} needs a value"))
                 .clone()
         };
+        if flag == "--throwaway" {
+            throwaway = true;
+            i += 1;
+            continue;
+        }
         match flag {
             "--keypair" => keypair = PathBuf::from(val()),
             "--rpc-url" => rpc_url = val(),
@@ -64,6 +67,7 @@ fn parse_args() -> Args {
         rpc_url,
         program_id,
         settlement_program,
+        throwaway,
     }
 }
 
@@ -78,15 +82,16 @@ fn sbf_so_path() -> PathBuf {
     ))
 }
 
+/// Sends `ixs` as one V1 transaction through `rome-zk-solana-sender` (via the operator CLI's chain seam) and waits
+/// for it to confirm. There is no legacy transaction anywhere in this driver.
 async fn send(rpc: &RpcClient, payer: &Keypair, ixs: &[Instruction]) -> Signature {
-    let blockhash = rpc
-        .get_latest_blockhash()
+    use rome_zk_ops::chain::{Chain, RpcChain};
+    let signers = rome_zk_ops::keys::Signers::new(rome_zk_ops::keys::copy(payer), vec![]);
+    let sig = RpcChain::new(rpc.url())
+        .send(ixs, &signers)
         .await
-        .expect("get_latest_blockhash");
-    let tx = Transaction::new_signed_with_payer(ixs, Some(&payer.pubkey()), &[payer], blockhash);
-    rpc.send_and_confirm_transaction(&tx)
-        .await
-        .expect("send_and_confirm_transaction")
+        .expect("transaction");
+    Signature::from_str(&sig).expect("the sender returns a signature")
 }
 
 /// `getTransaction` can return a null result for a signature moments after
@@ -110,50 +115,6 @@ async fn print_cu(rpc: &RpcClient, label: &str, sig: &Signature) {
                 return;
             }
         }
-    }
-}
-
-/// Probes whether the deployed program at `program_id` recognizes `OpenBatch` by simulating it — the
-/// original measurement program (discriminants 0-3 only) fails borsh deserialization on discriminant 4 with a native
-/// `InvalidInstructionData` error, distinct from any *our* program's own error paths (which are all
-/// `Custom(_)`).
-async fn supports_accumulator(rpc: &RpcClient, program_id: &Pubkey, payer: &Pubkey) -> bool {
-    let probe = zk_inbox_client::open_batch_ix(
-        program_id,
-        payer,
-        u64::MAX,
-        u64::MAX,
-        1,
-        &Pubkey::new_unique(),
-    );
-    let blockhash = rpc
-        .get_latest_blockhash()
-        .await
-        .expect("get_latest_blockhash");
-    let tx = Transaction::new_unsigned(solana_sdk::message::Message::new_with_blockhash(
-        &[probe],
-        Some(payer),
-        &blockhash,
-    ));
-    match rpc.simulate_transaction(&tx).await {
-        Ok(res) => {
-            let Some(err) = res.value.err else {
-                return true;
-            };
-            // `simulateTransaction`'s `.value.err` is now `UiTransactionError`, a thin wrapper around the same
-            // `TransactionError` this match always expected (API fallout) — convert back via its own `From` impl
-            // rather than rewriting the match pattern.
-            let err: solana_sdk::transaction::TransactionError = err.into();
-            let is_native_invalid_ix_data = matches!(
-                err,
-                solana_sdk::transaction::TransactionError::InstructionError(
-                    _,
-                    solana_sdk::instruction::InstructionError::InvalidInstructionData
-                )
-            );
-            !is_native_invalid_ix_data
-        }
-        Err(_) => false,
     }
 }
 
@@ -205,14 +166,11 @@ async fn main() {
     );
 
     let mut program_id = args.program_id;
-    if !supports_accumulator(&rpc, &program_id, &payer.pubkey()).await {
-        println!(
-            "devnet program {program_id} does not yet recognize OpenBatch (the deployed program predates this branch) \
-             — deploying a throwaway program instead"
-        );
+    if args.throwaway {
+        println!("--throwaway: deploying a throwaway program instead of using {program_id}");
         program_id = deploy_throwaway(&args.rpc_url, &args.keypair);
     } else {
-        println!("program {program_id} already recognizes the accumulator instructions");
+        println!("using program {program_id}");
     }
 
     let chain_id = DEVNET_CHAIN_ID;

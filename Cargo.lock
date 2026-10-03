@@ -11362,6 +11362,7 @@ dependencies = [
  "alloy-rlp",
  "crc32fast",
  "hex",
+ "rome-zk-executor-api",
  "tempfile",
  "thiserror 2.0.21",
 ]
@@ -11390,6 +11391,32 @@ dependencies = [
  "rome-zk-merkle",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "rome-zk-ops"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "clap",
+ "hex",
+ "reqwest 0.12.28",
+ "rome-zk-layouts",
+ "rome-zk-solana-sender",
+ "serde_json",
+ "solana-client",
+ "solana-commitment-config",
+ "solana-hash",
+ "solana-keypair",
+ "solana-program",
+ "solana-signer",
+ "thiserror 2.0.21",
+ "tokio",
+ "wincode",
+ "zk-bridge",
+ "zk-bridge-client",
+ "zk-inbox-client",
+ "zk-settlement-client",
 ]
 
 [[package]]
@@ -18107,14 +18134,10 @@ dependencies = [
 name = "zk-bridge-client"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
- "bincode",
  "borsh",
- "hex",
  "rome-zk-layouts",
+ "rome-zk-ops",
  "rome-zk-testkit",
- "solana-client",
- "solana-commitment-config",
  "solana-program",
  "solana-program-test",
  "solana-sdk",
@@ -18122,7 +18145,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "zk-bridge",
- "zk-settlement-client",
 ]
 
 [[package]]
@@ -18149,6 +18171,7 @@ dependencies = [
  "borsh",
  "rome-zk-layouts",
  "rome-zk-merkle",
+ "rome-zk-ops",
  "solana-account-decoder-client-types",
  "solana-client",
  "solana-commitment-config",
@@ -18201,15 +18224,12 @@ dependencies = [
 name = "zk-settlement-client"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
- "bincode",
  "borsh",
  "hex",
- "reqwest 0.12.28",
  "rome-zk-layouts",
  "rome-zk-merkle",
  "rome-zk-mpt",
- "serde_json",
+ "rome-zk-ops",
  "solana-client",
  "solana-commitment-config",
  "solana-loader-v3-interface",

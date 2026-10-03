@@ -23,7 +23,17 @@
 //! ```text
 //! frame := total_len:u32(LE)  payload  crc32:u32(LE)
 //! payload := header:RLP(SubBlockHeader)  signature:[u8;65]  tx_count:u32(LE)  (tx_len:u32(LE) tx_bytes)*
+//!            [ withdrawal_count:u32(LE)  (index:u64(LE) recipient:[u8;20] amount_gwei:u64(LE))* ]
 //! ```
+//!
+//! The bracketed tail is present only on the index-0 record of a block that credits deposits: the block's EIP-4895
+//! withdrawals, in order, after its transactions. A record without deposits has no tail, so it is byte for byte the
+//! record this format always wrote (the golden test below pins that). A tail is never written for zero withdrawals,
+//! and a reader refuses one: there is exactly one encoding of "no withdrawals". The tail goes with the header's
+//! `deposits_end` (the header says the queue index after the block, the tail says which deposits make it up): either
+//! both are present or neither, and `deposits_end` is one past the last withdrawal's index. Both the writer and the
+//! reader enforce that. Each withdrawal is rebuilt on read through `rome_zk_executor_api::deposit_withdrawal`, the one
+//! constructor of a deposit's withdrawal, so a logged withdrawal can only ever be a deposit credit.
 //!
 //! `total_len` covers everything after itself (`payload` + the trailing `crc32`), so a reader knows
 //! exactly how many bytes to pull off the file before validating. `header` is decoded with
@@ -44,7 +54,9 @@
 
 #![forbid(unsafe_code)]
 
-use alloy::primitives::{Bytes, Signature};
+use alloy::primitives::{Address, Bytes, Signature};
+use alloy_eips::eip4895::Withdrawal;
+use rome_zk_executor_api::deposit_withdrawal;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -84,9 +96,47 @@ pub struct SubBlockRecord {
     pub header: SubBlockHeader,
     pub signature: Signature,
     pub txs: Vec<Bytes>,
+    /// The block's EIP-4895 withdrawals (the deposits it credits), credited after its transactions. Only ever
+    /// non-empty on an index-0 record; empty for every block without deposits. Recovery replays them.
+    pub withdrawals: Vec<Withdrawal>,
 }
 
-fn encode_payload(header: &SubBlockHeader, signature: &Signature, txs: &[Bytes]) -> Vec<u8> {
+/// The rule that ties a record's withdrawals to its header, shared by the writer and the reader: withdrawals only on
+/// an index-0 record; the header's `deposits_end` is present exactly when there are withdrawals, and is one past the
+/// last withdrawal's index.
+fn check_withdrawals(header: &SubBlockHeader, withdrawals: &[Withdrawal]) -> Result<(), String> {
+    match (withdrawals.last(), header.deposits_end) {
+        (None, None) => Ok(()),
+        (None, Some(end)) => Err(format!(
+            "header carries deposits_end {end} but the record has no withdrawals"
+        )),
+        (Some(_), None) => {
+            Err("record has withdrawals but the header carries no deposits_end".into())
+        }
+        (Some(last), Some(end)) => {
+            if header.index != 0 {
+                return Err(format!(
+                    "withdrawals on sub-block index {} (only index 0 carries a block's withdrawals)",
+                    header.index
+                ));
+            }
+            if last.index.checked_add(1) != Some(end) {
+                return Err(format!(
+                    "deposits_end {end} is not one past the last withdrawal's index {}",
+                    last.index
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn encode_payload(
+    header: &SubBlockHeader,
+    signature: &Signature,
+    txs: &[Bytes],
+    withdrawals: &[Withdrawal],
+) -> Vec<u8> {
     let mut payload = header.encode_canonical();
     payload.extend_from_slice(&signature.as_bytes());
     payload.extend_from_slice(&(txs.len() as u32).to_le_bytes());
@@ -94,8 +144,19 @@ fn encode_payload(header: &SubBlockHeader, signature: &Signature, txs: &[Bytes])
         payload.extend_from_slice(&(tx.len() as u32).to_le_bytes());
         payload.extend_from_slice(tx);
     }
+    if !withdrawals.is_empty() {
+        payload.extend_from_slice(&(withdrawals.len() as u32).to_le_bytes());
+        for w in withdrawals {
+            payload.extend_from_slice(&w.index.to_le_bytes());
+            payload.extend_from_slice(w.address.as_slice());
+            payload.extend_from_slice(&w.amount.to_le_bytes());
+        }
+    }
     payload
 }
+
+/// Bytes one withdrawal takes in a record's tail: `index u64 | recipient [20] | amount_gwei u64`.
+const WITHDRAWAL_LEN: usize = 8 + 20 + 8;
 
 fn decode_payload(mut payload: &[u8]) -> io::Result<SubBlockRecord> {
     let header: SubBlockHeader = alloy_rlp::Decodable::decode(&mut payload)
@@ -140,16 +201,51 @@ fn decode_payload(mut payload: &[u8]) -> io::Result<SubBlockRecord> {
         txs.push(Bytes::copy_from_slice(&payload[..tx_len]));
         payload = &payload[tx_len..];
     }
+    let mut withdrawals = Vec::new();
+    if !payload.is_empty() {
+        if payload.len() < 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "payload too short for withdrawal_count",
+            ));
+        }
+        let count = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
+        payload = &payload[4..];
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "withdrawal_count 0 (a block without withdrawals has no tail)",
+            ));
+        }
+        // Checked against the bytes actually present before anything is allocated for it.
+        if payload.len() != count.saturating_mul(WITHDRAWAL_LEN) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "withdrawal tail length does not match withdrawal_count",
+            ));
+        }
+        withdrawals.reserve(count);
+        for chunk in payload.chunks_exact(WITHDRAWAL_LEN) {
+            let index = u64::from_le_bytes(chunk[..8].try_into().unwrap());
+            let recipient = Address::from_slice(&chunk[8..28]);
+            let amount = u64::from_le_bytes(chunk[28..36].try_into().unwrap());
+            withdrawals.push(deposit_withdrawal(index, recipient, amount));
+        }
+        payload = &[];
+    }
     if !payload.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "trailing bytes after last tx",
         ));
     }
+    check_withdrawals(&header, &withdrawals)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(SubBlockRecord {
         header,
         signature,
         txs,
+        withdrawals,
     })
 }
 
@@ -216,8 +312,24 @@ impl LogWriter {
         signature: &Signature,
         txs: &[Bytes],
     ) -> io::Result<()> {
+        self.append_with_withdrawals(header, signature, txs, &[])
+    }
+
+    /// [`Self::append`] for the index-0 record of a block that credits deposits: `withdrawals` are the block's
+    /// EIP-4895 withdrawals, written after its transactions. With an empty list this writes exactly the bytes
+    /// [`Self::append`] writes. Refuses (`InvalidInput`, nothing written) a list that does not agree with the
+    /// header's `deposits_end`, or one on a record that is not index 0 (see the module doc).
+    pub fn append_with_withdrawals(
+        &mut self,
+        header: &SubBlockHeader,
+        signature: &Signature,
+        txs: &[Bytes],
+        withdrawals: &[Withdrawal],
+    ) -> io::Result<()> {
+        check_withdrawals(header, withdrawals)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         self.roll_if_needed(header.block)?;
-        let payload = encode_payload(header, signature, txs);
+        let payload = encode_payload(header, signature, txs, withdrawals);
         let crc = crc32fast::hash(&payload);
         let total_len = (payload.len() + 4) as u32;
 
@@ -701,6 +813,7 @@ mod tests {
             receipts_root: B256::repeat_byte(index as u8 + 2),
             gas_used: 21_000,
             prev_hash: B256::ZERO,
+            deposits_end: None,
         };
         let sequencer_key = PrivateKeySigner::random();
         let signature = sign_header(&sequencer_key, &header);
@@ -709,6 +822,7 @@ mod tests {
             header,
             signature,
             txs: vec![tx],
+            withdrawals: vec![],
         }
     }
 
@@ -836,12 +950,13 @@ mod tests {
             receipts_root: B256::ZERO,
             gas_used: 21_000,
             prev_hash: B256::ZERO,
+            deposits_end: None,
         };
         let signature = sign_header(&sequencer_key, &header);
         // The log layer treats a tx as an opaque length-prefixed byte blob — it never parses tx contents
         // — so this huge blob makes an otherwise perfectly valid record that just happens to be oversized.
         let huge_tx = Bytes::from(vec![0u8; MAX_FRAME_LEN as usize + 1_000_000]);
-        let payload = encode_payload(&header, &signature, std::slice::from_ref(&huge_tx));
+        let payload = encode_payload(&header, &signature, std::slice::from_ref(&huge_tx), &[]);
         assert!(
             (payload.len() as u32).checked_add(4).unwrap() > MAX_FRAME_LEN,
             "fixture must actually exceed the cap"
@@ -1055,6 +1170,7 @@ mod tests {
             receipts_root: B256::repeat_byte(2),
             gas_used: 21_000,
             prev_hash: B256::ZERO,
+            deposits_end: None,
         };
         let signature = sign_header(&sequencer_key, &header);
         let tx = signed_raw_tx(&sender, 1, 0);
@@ -1154,7 +1270,7 @@ mod tests {
     /// [`LogWriter`] — the corruption tests below need full control over what sits *around* a record on
     /// disk, not just the record itself.
     fn frame_bytes(header: &SubBlockHeader, signature: &Signature, txs: &[Bytes]) -> Vec<u8> {
-        let payload = encode_payload(header, signature, txs);
+        let payload = encode_payload(header, signature, txs, &[]);
         let crc = crc32fast::hash(&payload);
         let total_len = (payload.len() + 4) as u32;
         let mut frame = Vec::with_capacity(4 + payload.len() + 4);
@@ -1442,5 +1558,247 @@ mod tests {
                 "stray={stray}: must be reported as InvalidData: {err:?}"
             );
         }
+    }
+
+    // ---- blocks that carry withdrawals (deposits) --------------------------------------------------------------------
+
+    /// A fixed sequencer key, so the signature (RFC 6979, deterministic) and so the whole frame are reproducible.
+    fn fixed_signer() -> PrivateKeySigner {
+        PrivateKeySigner::from_bytes(&B256::repeat_byte(0x42)).expect("fixed key")
+    }
+
+    fn index0_header(deposits_end: Option<u64>) -> SubBlockHeader {
+        SubBlockHeader {
+            chain_id: 200_101,
+            block: 9,
+            index: 0,
+            timestamp_us: 1_757_000_000_000_000,
+            tx_root: B256::repeat_byte(0x11),
+            receipts_root: B256::repeat_byte(0x22),
+            gas_used: 21_000,
+            prev_hash: B256::repeat_byte(0x33),
+            deposits_end,
+        }
+    }
+
+    fn three_withdrawals() -> Vec<Withdrawal> {
+        (5u64..8)
+            .map(|i| deposit_withdrawal(i, Address::repeat_byte(0xA0 + i as u8), 1_000 * (i + 1)))
+            .collect()
+    }
+
+    /// The record format as it was before deposits, assembled here by hand from the module doc and nothing else:
+    /// `header RLP ‖ signature ‖ tx_count ‖ (tx_len ‖ tx)*`.
+    fn old_format_payload(
+        header: &SubBlockHeader,
+        signature: &Signature,
+        txs: &[Bytes],
+    ) -> Vec<u8> {
+        let mut out = header.encode_canonical();
+        out.extend_from_slice(&signature.as_bytes());
+        out.extend_from_slice(&(txs.len() as u32).to_le_bytes());
+        for tx in txs {
+            out.extend_from_slice(&(tx.len() as u32).to_le_bytes());
+            out.extend_from_slice(tx);
+        }
+        out
+    }
+
+    /// A block without deposits is byte for byte what the log always wrote: the frame on disk equals the old format
+    /// assembled by hand, whichever append the writer was called through; the header's own golden bytes are pinned in
+    /// `header.rs`.
+    #[test]
+    fn a_record_without_deposits_is_byte_identical_to_the_old_format() {
+        let signer = fixed_signer();
+        let header = index0_header(None);
+        let signature = sign_header(&signer, &header);
+        let txs = vec![Bytes::from_static(&[1, 2, 3]), Bytes::from_static(&[9; 40])];
+
+        let payload = old_format_payload(&header, &signature, &txs);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&((payload.len() + 4) as u32).to_le_bytes());
+        expected.extend_from_slice(&payload);
+        expected.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+
+        let via_append = tempdir().unwrap();
+        LogWriter::open(via_append.path(), 1_000)
+            .unwrap()
+            .append(&header, &signature, &txs)
+            .unwrap();
+        let via_withdrawals = tempdir().unwrap();
+        LogWriter::open(via_withdrawals.path(), 1_000)
+            .unwrap()
+            .append_with_withdrawals(&header, &signature, &txs, &[])
+            .unwrap();
+        for dir in [via_append.path(), via_withdrawals.path()] {
+            let on_disk = fs::read(segment_path(dir, 0)).unwrap();
+            assert_eq!(on_disk, expected);
+        }
+        // The header's own bytes are the eight-item list, counted by hand: chain id 4 + block 1 + index 1 +
+        // timestamp 8 + tx_root 33 + receipts_root 33 + gas_used 3 + prev_hash 33 = 116 = 0x74 bytes of items.
+        assert_eq!(payload[0], 0xf8);
+        assert_eq!(payload[1], 0x74);
+
+        // And the old frame decodes to a record with no withdrawals.
+        let mut seen = Vec::new();
+        replay(via_append.path(), false, |r| seen.push(r.clone())).unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].header, header);
+        assert_eq!(seen[0].txs, txs);
+        assert!(seen[0].withdrawals.is_empty());
+    }
+
+    /// An index-0 record with withdrawals: the tail is the old payload plus `count ‖ (index ‖ recipient ‖ amount)*`,
+    /// it reads back (through `replay` and `LogReader`) with the same withdrawals, and the header's hash and the
+    /// signature over it commit to `deposits_end`.
+    #[test]
+    fn a_record_with_withdrawals_round_trips_and_the_header_commits_to_the_range() {
+        let signer = fixed_signer();
+        let withdrawals = three_withdrawals();
+        let header = index0_header(Some(8));
+        let signature = sign_header(&signer, &header);
+        let txs = vec![Bytes::from_static(&[7, 7, 7])];
+
+        let dir = tempdir().unwrap();
+        LogWriter::open(dir.path(), 1_000)
+            .unwrap()
+            .append_with_withdrawals(&header, &signature, &txs, &withdrawals)
+            .unwrap();
+
+        let mut expected_payload = old_format_payload(&header, &signature, &txs);
+        expected_payload.extend_from_slice(&3u32.to_le_bytes());
+        for (i, a) in [(5u64, 0xA5u8), (6, 0xA6), (7, 0xA7)] {
+            expected_payload.extend_from_slice(&i.to_le_bytes());
+            expected_payload.extend_from_slice(&[a; 20]);
+            expected_payload.extend_from_slice(&(1_000 * (i + 1)).to_le_bytes());
+        }
+        let on_disk = fs::read(segment_path(dir.path(), 0)).unwrap();
+        assert_eq!(&on_disk[4..on_disk.len() - 4], expected_payload.as_slice());
+
+        let mut seen = Vec::new();
+        replay(dir.path(), false, |r| seen.push(r.clone())).unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].withdrawals, withdrawals);
+        assert_eq!(seen[0].header, header);
+        assert_eq!(seen[0].txs, txs);
+        // Every logged withdrawal is a deposit credit: validator index 0.
+        assert!(seen[0].withdrawals.iter().all(|w| w.validator_index == 0));
+
+        let mut reader = LogReader::open(dir.path(), 0, 0).unwrap();
+        let first = reader.read_next().unwrap().unwrap();
+        assert_eq!(first.withdrawals, withdrawals);
+        assert!(reader.read_next().unwrap().is_none());
+
+        // The signed pre-confirmation commits to the range: the same header without it has a different signing hash.
+        assert_ne!(header.signing_hash(), index0_header(None).signing_hash());
+    }
+
+    /// The writer refuses a record whose withdrawals and `deposits_end` disagree, and writes nothing for it.
+    #[test]
+    fn the_writer_refuses_withdrawals_that_disagree_with_the_header() {
+        let signer = fixed_signer();
+        let withdrawals = three_withdrawals(); // indices 5, 6, 7: the range ends at 8
+        let cases: Vec<(&str, SubBlockHeader, Vec<Withdrawal>)> = vec![
+            (
+                "withdrawals, no deposits_end",
+                index0_header(None),
+                withdrawals.clone(),
+            ),
+            (
+                "deposits_end, no withdrawals",
+                index0_header(Some(8)),
+                vec![],
+            ),
+            ("wrong end", index0_header(Some(9)), withdrawals.clone()),
+            (
+                "not index 0",
+                SubBlockHeader {
+                    index: 1,
+                    ..index0_header(Some(8))
+                },
+                withdrawals.clone(),
+            ),
+        ];
+        for (name, header, list) in cases {
+            let dir = tempdir().unwrap();
+            let mut writer = LogWriter::open(dir.path(), 1_000).unwrap();
+            let signature = sign_header(&signer, &header);
+            let err = writer
+                .append_with_withdrawals(&header, &signature, &[], &list)
+                .expect_err(name);
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{name}: {err:?}");
+            let len = fs::metadata(segment_path(dir.path(), 0)).unwrap().len();
+            assert_eq!(len, 0, "{name}: nothing may be written");
+        }
+    }
+
+    /// The reader refuses every malformed tail: a zero count (a second encoding of "none"), a short or long tail, a
+    /// tail on a header without `deposits_end`, and a `deposits_end` that is not one past the last withdrawal.
+    #[test]
+    fn the_reader_refuses_a_malformed_withdrawal_tail() {
+        let signer = fixed_signer();
+        let header = index0_header(Some(8));
+        let signature = sign_header(&signer, &header);
+        let base = old_format_payload(&header, &signature, &[]);
+        let one = |index: u64| {
+            let mut w = index.to_le_bytes().to_vec();
+            w.extend_from_slice(&[0xA5; 20]);
+            w.extend_from_slice(&1_000u64.to_le_bytes());
+            w
+        };
+        let tail = |count: u32, body: &[u8]| {
+            let mut p = base.clone();
+            p.extend_from_slice(&count.to_le_bytes());
+            p.extend_from_slice(body);
+            p
+        };
+
+        // Well formed: one withdrawal at index 7, range end 8.
+        let ok = decode_payload(&tail(1, &one(7))).expect("well-formed tail decodes");
+        assert_eq!(ok.withdrawals.len(), 1);
+        assert_eq!(
+            ok.withdrawals[0],
+            deposit_withdrawal(7, Address::repeat_byte(0xA5), 1_000)
+        );
+
+        assert!(decode_payload(&tail(0, &[])).is_err(), "zero count");
+        assert!(
+            decode_payload(&tail(1, &one(7)[..35])).is_err(),
+            "short tail"
+        );
+        let mut long = one(7);
+        long.push(0);
+        assert!(decode_payload(&tail(1, &long)).is_err(), "long tail");
+        assert!(
+            decode_payload(&tail(2, &one(7))).is_err(),
+            "count above the bytes present"
+        );
+        assert!(
+            decode_payload(&tail(1, &one(3))).is_err(),
+            "deposits_end not one past the last index"
+        );
+        assert!(
+            decode_payload(&tail(u32::MAX, &one(7))).is_err(),
+            "huge count"
+        );
+        let mut stray = base.clone();
+        stray.push(1);
+        assert!(
+            decode_payload(&stray).is_err(),
+            "a stray byte is not a tail"
+        );
+
+        // A tail under a header with no deposits_end.
+        let bare = index0_header(None);
+        let bare_sig = sign_header(&signer, &bare);
+        let mut p = old_format_payload(&bare, &bare_sig, &[]);
+        p.extend_from_slice(&1u32.to_le_bytes());
+        p.extend_from_slice(&one(7));
+        assert!(decode_payload(&p).is_err(), "tail without deposits_end");
+        // deposits_end with no tail.
+        assert!(
+            decode_payload(&base).is_err(),
+            "deposits_end without a tail"
+        );
     }
 }

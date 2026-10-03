@@ -443,6 +443,7 @@ impl<E: Executor, S: SubBlockSink> SealerState<E, S> {
                 // cadence).
                 prev_randao: prev_randao(self.chain_id, block),
                 base_fee: None,
+                withdrawals: vec![],
             };
             self.executor.open_block(env).await?;
         }
@@ -459,6 +460,7 @@ impl<E: Executor, S: SubBlockSink> SealerState<E, S> {
             receipts_root: outcome.receipts_root,
             gas_used: outcome.gas_used,
             prev_hash: self.prev_header_hash,
+            deposits_end: None,
         };
         let signature = sign_header(&self.signer, &header);
         let header_hash = header.hash();

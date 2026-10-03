@@ -15,55 +15,10 @@ rome-zk-layouts = { path = "../rome-zk-layouts" }
 thiserror = "1"
 
 [features]
-# Pulls in a Solana RPC client + Tokio for the `release-exit` example binary — off by default so plain library
-# consumers (the exit-prover, program tests) never need an async runtime transitively. Mirrors
-# zk-settlement-client's own `devnet-driver` feature shape.
-devnet-driver = [
-  "dep:solana-client",
-  "dep:solana-sdk",
-  "dep:solana-commitment-config",
-  "dep:tokio",
-  "dep:zk-settlement-client",
-  "dep:hex",
-  "dep:base64",
-  "dep:bincode",
-]
-
-[dependencies.solana-client]
-workspace = true
-optional = true
-
-[dependencies.solana-sdk]
-workspace = true
-optional = true
-
-[dependencies.solana-commitment-config]
-workspace = true
-optional = true
-
-[dependencies.tokio]
-version = "1"
-features = ["macros", "rt-multi-thread"]
-optional = true
-
-[dependencies.zk-settlement-client]
-path = "../zk-settlement-client"
-optional = true
-
-[dependencies.hex]
-version = "0.4"
-optional = true
-
-# `release-exit.rs`'s `--dry-run` (the default): base64-encodes the bincode-serialized `Transaction` —
-# the same wire encoding a real `sendTransaction` RPC call receives — so a dry-run tx is inspectable
-# without ever touching a cluster. Mirrors `zk-settlement-client/examples/governance.rs`'s own shape.
-[dependencies.base64]
-version = "0.22"
-optional = true
-
-[dependencies.bincode]
-version = "1"
-optional = true
+# The two examples (`release-exit`, `vault`) are thin wrappers over the `rome-zk-ops` operator CLI. The feature is
+# kept, empty, so the commands that pass `--features devnet-driver` keep working; plain library consumers (the
+# exit-prover, program tests) pull in no RPC client or async runtime either way.
+devnet-driver = []
 
 [[example]]
 name = "release-exit"
@@ -85,3 +40,5 @@ solana-program-test.workspace = true
 solana-sdk.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 rome-zk-testkit = { path = "../rome-zk-testkit" }
+# The release-exit and vault examples are thin wrappers over the operator CLI.
+rome-zk-ops = { path = "../rome-zk-ops" }

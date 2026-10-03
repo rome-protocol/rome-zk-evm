@@ -58,8 +58,8 @@ fn release_exit_example_refuses_without_confirm() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("exit_record") && stderr.contains("not found"),
-        "the failure must be named (exit_record not found), reached before the payer keypair is ever \
+        stderr.contains("ExitRecordLookupFailed") && stderr.contains("not a missing account"),
+        "the failure must be named (ExitRecordLookupFailed, a failed read and not a missing record), reached before the payer keypair is ever \
          read (that path is untouched here) and before any --dry-run/--confirm branch: {stderr}"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);

@@ -446,7 +446,7 @@ cmd_up() {
   seq_key="$(rz_env_get "$OUT/compose.env" SEQUENCER_KEY_PATH)"
   payer_key="$(rz_env_get "$OUT/compose.env" PAYER_KEYPAIR_PATH)"
   if [[ -z "$(rz_env_get "$OUT/compose.env" ROME_ZK_IMAGE)" && -z "$(rz_env_get "$OUT/compose.env" ROME_ZK_TAG)" ]]; then
-    die ImageTagNotSet "set ROME_ZK_TAG in $ENV_FILE to the image tag from your release notes (or ROME_ZK_IMAGE to an image you built), then run ./rollup init again"
+    die ImageTagNotSet "set ROME_ZK_TAG in $ENV_FILE to the tag of the source you checked out (published tags: https://github.com/rome-protocol/rome-zk-evm/tags), or ROME_ZK_IMAGE to an image you built, then run ./rollup init again"
   fi
   [[ -f "$seq_key" ]] || die SequencerKeyMissing "$seq_key does not exist (64 hex characters, readable by uid 999)"
   if [[ $# -eq 0 ]] || printf '%s\n' "$@" | grep -qxE 'batcher|prover'; then

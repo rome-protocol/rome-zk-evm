@@ -43,6 +43,7 @@ The steps below start the node without a prover. A full settlement setup also ne
 with more than 30 GB of memory and the ZisK proving keys on the host: about 26 GB to download, which grows to
 about 81 GB once installed (measured on a CPU host; a GPU host generates its own files, not measured yet). The final proof step needs
 about 30 GB of GPU memory; a 24 GB card is not enough. You also need a guest built for your chain's genesis.
+[Setting up a prover host](PROVER-HOST.md) covers the GPU machine.
 
 ## From clone to a running node
 
@@ -67,6 +68,9 @@ openssl rand -hex 32 > keys/sequencer.key
 sudo chgrp 999 keys/payer.json keys/sequencer.key && chmod 640 keys/payer.json keys/sequencer.key
 ```
 
+`solana-keygen` asks for an optional passphrase (press Enter for none) and prints the new public key and a recovery
+phrase. Keep the phrase private.
+
 Fund `keys/payer.json` with about 6 devnet SOL. You can use a devnet faucet such as
 [Solana's faucet](https://faucet.solana.com). The containers run as uid 999, and `init` and `register`
 also read the payer key on the host. `deploy/rollup/.gitignore` excludes `keys/` from Git.
@@ -79,11 +83,10 @@ Edit `.env`:
 - Set `ROME_ZK_TAG=v0.1.3` to use the node image above.
 - Keep `RPC_BIND=127.0.0.1` for local access and leave `PROVER` unset for this first run.
 
-A new chain's genesis has no balances, and you do not need to set anything for that. The older
-`genesis.funded_address` key is gone: it minted coins to one address, and a genesis that mints coins can never take
-deposits safely, because its holder could exit coins that other people's deposits paid for. The genesis cannot
-change after you register, so a chain starts with zero balances. `init` refuses a `chain.toml` that still has
-`funded_address`. L2 gas comes from deposits once they ship. Until then your chain has no gas and cannot send a
+A new chain's genesis has no balances, and you do not need to set anything for that. A genesis that mints coins could
+never take deposits safely, because its holder could exit coins that other people's deposits paid for, and the genesis
+cannot change after you register. So a chain starts with zero balances, and `init` refuses a `chain.toml` that sets
+`genesis.funded_address`. L2 gas comes from deposits once they ship. Until then your chain has no gas and cannot send a
 transaction, so there is nothing for it to carry yet. You can still register it and start the services.
 
 If you need gas before deposits are available, you can declare one backed balance, with two keys under `[genesis]`:
@@ -92,7 +95,8 @@ If you need gas before deposits are available, you can declare one backed balanc
 amount in your chain's vault with the bridge program's `Fund`, and Rome checks the vault before it registers your
 verification key. `init` prints the exact amount to lock. The shared zk-bridge program is deployed on devnet (see the
 table above). After `register`, your chain authority creates the chain's vault for wrapped SOL with the bridge client's
-`vault` example (`init-vault`), then locks the amount with `fund`. The exits item under Known limits has more on the vault.
+`vault` example (`init-vault`), then locks the amount with `fund`. The deployment guide's
+[Your chain's vault](../deploy/rollup/README.md#your-chains-vault) gives both commands.
 
 Set `genesis.fee_recipient` to an address you control as well. It receives the priority fees (tips) of the chain's
 transactions; the base fee is burned, as on Ethereum. Like the rest of the genesis, it cannot be changed after you
@@ -100,9 +104,10 @@ register. `init` refuses it if it is missing, malformed, zero, a precompile addr
 Do not add a chain id. The settlement program derives it from your payer key and that key's
 registration count; `init` reads it from Solana. The id is a number between 2^32 and 2^53 - 1, and MetaMask cannot add
 a chain whose id is above 4503599627370476, which is about half of them. If yours is above it, `init` stops with
-`ChainIdNotWalletSafe` before anything is sent. Create a new payer key with `solana-keygen new -o keys/payer.json`,
-give it the same `chgrp 999` and `chmod 640` as before, and run `./rollup init` again. `init` only reads from Solana,
-so you can check the id before you fund the key.
+`ChainIdNotWalletSafe` before anything is sent. Create another payer key in a new file, for example
+`solana-keygen new -o keys/payer2.json`, give it the same `chgrp 999` and `chmod 640` as before, set
+`PAYER_KEYPAIR_PATH` to it and run `./rollup init` again. A different key gets a different id. `init` only reads from
+Solana, so you can check the id before you fund the key.
 
 ### 2. Read the chain id and render the configs
 

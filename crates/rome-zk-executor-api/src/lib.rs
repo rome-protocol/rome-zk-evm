@@ -134,7 +134,7 @@ pub struct Head {
 /// never re-derived, never overridden at seal time. Every sub-block's preview execution and the seal-time
 /// block-building both run under exactly this env, so a signed pre-confirmation can never diverge from the sealed block
 /// it pre-confirmed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockEnv {
     pub number: u64,
     pub timestamp_secs: u64,
@@ -149,6 +149,11 @@ pub struct BlockEnv {
     /// (baseFee = EIP-1559 from the parent header) — reserved for an executor/chain that needs to
     /// override it explicitly.
     pub base_fee: Option<u64>,
+    /// This block's EIP-4895 withdrawals, credited to balances after the block's transactions: the deposits this
+    /// block includes, each built with [`deposit_withdrawal`]. Empty for a block with no deposits, which then builds
+    /// exactly the block it always built. The header's `withdrawals_root` is [`withdrawals_root`] of this list
+    /// (see [`canonical_header_rule_with_withdrawals`]).
+    pub withdrawals: Vec<Withdrawal>,
 }
 
 /// `prevRandao`'s epoch length is a **fixed constant**, never a

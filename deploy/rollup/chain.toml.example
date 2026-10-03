@@ -9,7 +9,7 @@
 [genesis]
 # A new chain starts with no balances: nobody is minted any coins in the genesis. L2 gas comes from deposits once they
 # ship. A genesis cannot change after you register, and one that mints coins could never take deposits safely, because its
-# holder could exit coins that other people's deposits paid for. So there is no funded address any more; init refuses
+# holder could exit coins that other people's deposits paid for. So there is no funded address, and init refuses
 # funded_address by name.
 #
 # If you need gas before deposits are available, you can declare ONE backed balance. You lock the same amount in your

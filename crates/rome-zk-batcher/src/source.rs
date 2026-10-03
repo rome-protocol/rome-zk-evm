@@ -304,6 +304,7 @@ mod tests {
                 receipts_root: B256::repeat_byte(index as u8 + 1),
                 gas_used: 21_000,
                 prev_hash,
+                deposits_end: None,
             };
             let signature = sign_header(&PrivateKeySigner::random(), &header);
             let tx = signed_raw_tx(sender, CHAIN_ID, block * 1_000 + index as u64);
@@ -425,6 +426,7 @@ mod tests {
                 receipts_root: B256::ZERO,
                 gas_used: 21_000,
                 prev_hash: B256::ZERO,
+                deposits_end: None,
             };
             let signature = sign_header(&PrivateKeySigner::random(), &header);
             let tx = signed_raw_tx(&sender, CHAIN_ID, index as u64);
@@ -460,6 +462,7 @@ mod tests {
             receipts_root: B256::ZERO,
             gas_used: 21_000,
             prev_hash: B256::ZERO,
+            deposits_end: None,
         };
         let signature = sign_header(&PrivateKeySigner::random(), &header);
         let tx = signed_raw_tx(&sender, 999_999, 0);
@@ -496,6 +499,7 @@ mod tests {
                 receipts_root: B256::ZERO,
                 gas_used: 21_000,
                 prev_hash: B256::ZERO,
+                deposits_end: None,
             };
             let signature = sign_header(&PrivateKeySigner::random(), &header);
             let tx = signed_raw_tx(&sender, CHAIN_ID, index as u64);
@@ -523,6 +527,7 @@ mod tests {
                 receipts_root: B256::ZERO,
                 gas_used: 21_000,
                 prev_hash: B256::ZERO,
+                deposits_end: None,
             };
             let signature = sign_header(&PrivateKeySigner::random(), &header);
             let tx = signed_raw_tx(&sender, CHAIN_ID, 100 + index as u64);
@@ -660,6 +665,7 @@ mod tests {
                 receipts_root: B256::ZERO,
                 gas_used: 21_000,
                 prev_hash: B256::ZERO,
+                deposits_end: None,
             };
             let signature = sign_header(&PrivateKeySigner::random(), &header);
             let tx = signed_raw_tx(&sender, CHAIN_ID, index as u64);
@@ -683,6 +689,7 @@ mod tests {
                 receipts_root: B256::ZERO,
                 gas_used: 21_000,
                 prev_hash: B256::ZERO,
+                deposits_end: None,
             };
             // Re-signing here (a fresh random sequencer key) does not reproduce the *exact* first-record
             // bytes written above (the signature differs) — only its byte *length*, which is all this
@@ -748,6 +755,7 @@ mod tests {
                 receipts_root: B256::ZERO,
                 gas_used: 21_000,
                 prev_hash: B256::ZERO,
+                deposits_end: None,
             };
             let signature = sign_header(&PrivateKeySigner::random(), &header);
             let tx = signed_raw_tx(&sender, CHAIN_ID, index as u64);
@@ -766,6 +774,7 @@ mod tests {
             receipts_root: B256::ZERO,
             gas_used: 21_000,
             prev_hash: B256::ZERO,
+            deposits_end: None,
         };
         let signature2 = sign_header(&PrivateKeySigner::random(), &header2);
         let tx2 = signed_raw_tx(&sender, CHAIN_ID, 2);

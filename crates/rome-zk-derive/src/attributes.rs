@@ -44,6 +44,7 @@ pub fn attributes_for_block(chain_id: u64, fee_recipient: Address, block: &Block
             coinbase: fee_recipient,
             prev_randao: rome_zk_executor_api::prev_randao(chain_id, block.number),
             base_fee: None,
+            withdrawals: vec![],
         },
         txs: block.txs.clone(),
     }

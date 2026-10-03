@@ -201,6 +201,8 @@ pub enum SenderError {
     },
     #[error("v1 message compile error: {0}")]
     Compile(#[from] solana_message::CompileError),
+    #[error("the transaction requires a signature from {key}, which is not in the signer set")]
+    MissingSigner { key: String },
     #[error("v1 priority-fee overflow: cu={cu} price={price}")]
     PriorityFeeOverflow { cu: u32, price: u64 },
     #[error("gave up after {resubmits} resubmits over {elapsed:?} without confirmation")]
@@ -592,6 +594,57 @@ pub trait RpcOps: Send + Sync {
     ) -> impl std::future::Future<Output = Result<u64, SenderError>> + Send;
 }
 
+/// What signs a V1 transaction this crate builds: the fee payer plus, optionally, further required signers.
+/// [`Keypair`] is the one-signer case every service uses.
+pub trait TxSigner: Send + Sync {
+    /// The fee payer, the first account of the message.
+    fn fee_payer(&self) -> solana_pubkey::Pubkey;
+    /// Signs `message`, which has already been compiled with [`TxSigner::fee_payer`] as its payer.
+    fn sign_v1(&self, message: v1::Message) -> Result<VersionedTransaction, SenderError>;
+}
+
+impl TxSigner for Keypair {
+    fn fee_payer(&self) -> solana_pubkey::Pubkey {
+        self.pubkey()
+    }
+    fn sign_v1(&self, message: v1::Message) -> Result<VersionedTransaction, SenderError> {
+        Ok(
+            VersionedTransaction::try_new(VersionedMessage::V1(message), &[self])
+                .expect("signing with the sender's own keypair for its own fee payer cannot fail"),
+        )
+    }
+}
+
+/// A fee payer and the extra keys that sign beside it. Signs with every key whose public key the message
+/// lists as a required signer, in the message's own order, and leaves the rest of the set out. A required
+/// signer that is not in the set fails the build with [`SenderError::MissingSigner`], before anything is sent.
+pub struct PayerAndCosigners<'a> {
+    pub payer: &'a Keypair,
+    pub cosigners: &'a [Keypair],
+}
+
+impl TxSigner for PayerAndCosigners<'_> {
+    fn fee_payer(&self) -> solana_pubkey::Pubkey {
+        self.payer.pubkey()
+    }
+    fn sign_v1(&self, message: v1::Message) -> Result<VersionedTransaction, SenderError> {
+        let mut keys: Vec<&Keypair> = vec![self.payer];
+        keys.extend(self.cosigners.iter());
+        let required = usize::from(message.header.num_required_signatures);
+        let mut wanted: Vec<&Keypair> = Vec::with_capacity(required);
+        for k in &message.account_keys[..required] {
+            match keys.iter().find(|kp| kp.pubkey() == *k) {
+                Some(kp) => wanted.push(kp),
+                None => return Err(SenderError::MissingSigner { key: k.to_string() }),
+            }
+        }
+        Ok(
+            VersionedTransaction::try_new(VersionedMessage::V1(message), &wanted)
+                .expect("every required signer was found above"),
+        )
+    }
+}
+
 pub struct RpcSender {
     rpc: RpcClient,
     /// The signing key (`solana-keypair`). [`RpcSender::pubkey`] hands back the `solana_program`
@@ -599,6 +652,10 @@ pub struct RpcSender {
     /// second `Keypair` anywhere; it is never needed (only the pubkey bytes are, for instruction
     /// building, and the private key, for signing the V1 tx this struct itself builds).
     payer: Keypair,
+    /// Extra signing keys, for a transaction whose instructions name more required signers than the fee
+    /// payer (the registry authority beside the chain authority, say). Empty for every long-running
+    /// service; set only by the operator CLI through [`RpcSender::with_cosigners`].
+    cosigners: Vec<Keypair>,
     /// Every retry `with_retry` performs across this sender's four `RpcOps` methods —
     /// reset at the start of each [`RpcSender::send_and_confirm_many`] call and
     /// read back into [`BatchSendOutcome::rpc_retries`]; also accumulates across the single-shot
@@ -676,7 +733,23 @@ impl RpcSender {
                 CommitmentConfig::confirmed(),
             ),
             payer,
+            cosigners: Vec::new(),
             retries: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Adds signing keys beside the fee payer. Every transaction this sender builds is then signed by the
+    /// payer first and these keys after it; the message compiler decides which of them the instructions
+    /// actually require, and building fails by name when a required signer is missing from the set.
+    pub fn with_cosigners(mut self, cosigners: Vec<Keypair>) -> Self {
+        self.cosigners = cosigners;
+        self
+    }
+
+    fn signing(&self) -> PayerAndCosigners<'_> {
+        PayerAndCosigners {
+            payer: &self.payer,
+            cosigners: &self.cosigners,
         }
     }
 
@@ -693,8 +766,8 @@ impl RpcSender {
 /// — the prover's poster measures its own gate instruction's V1 size this way, never a second, hand-rolled
 /// V1-message builder. Returns whatever this crate's own `wincode::serialize` would produce (the caller
 /// never needs to name the return type; see the module's own size-measurement tests for the pattern).
-pub fn build_v1_tx(
-    payer: &Keypair,
+pub fn build_v1_tx<S: TxSigner + ?Sized>(
+    payer: &S,
     instructions: &[Instruction],
     compute_unit_limit: u32,
     loaded_accounts_data_size_limit: u32,
@@ -717,8 +790,8 @@ pub fn build_v1_tx(
 /// [`RpcSender::send_and_confirm_many`], and this module's own fake-transport tests, none of which need a
 /// live RPC to build or sign). `instructions` is the list `zk-inbox-client`/
 /// `zk-settlement-client` build; [`compat::to_v1_instruction`] is the one conversion point (module doc).
-fn build_tx(
-    payer: &Keypair,
+fn build_tx<S: TxSigner + ?Sized>(
+    payer: &S,
     instructions: &[Instruction],
     compute_unit_limit: u32,
     loaded_accounts_data_size_limit: u32,
@@ -737,10 +810,8 @@ fn build_tx(
         )?);
     }
     let message =
-        v1::Message::try_compile_with_config(&payer.pubkey(), &v1_ixs, blockhash, config)?;
-    let tx = VersionedTransaction::try_new(VersionedMessage::V1(message), &[payer])
-        .expect("signing with the sender's own keypair for its own fee payer cannot fail");
-    Ok(tx)
+        v1::Message::try_compile_with_config(&payer.fee_payer(), &v1_ixs, blockhash, config)?;
+    payer.sign_v1(message)
 }
 
 /// One frame's outcome from [`RpcSender::send_and_confirm_many`]: the signature of its *last* step (with
@@ -891,7 +962,7 @@ impl RpcSender {
         self.retries.store(0, std::sync::atomic::Ordering::Relaxed);
         let mut outcome = run_send_and_confirm_many_with_compute_retry(
             self,
-            &self.payer,
+            &self.signing(),
             frames,
             tuning,
             retry_compute_unit_limit,
@@ -911,9 +982,9 @@ impl RpcSender {
 /// The real send/resubmit/confirm loop, generic over [`RpcOps`] so this module's own tests can drive it
 /// against a scripted fake — see the module doc. [`RpcSender::send_and_confirm_many`] is the production
 /// entry point (`ops = &self.rpc`, a real V1-generation [`RpcClient`]).
-async fn run_send_and_confirm_many<O: RpcOps>(
+async fn run_send_and_confirm_many<O: RpcOps, S: TxSigner + ?Sized>(
     ops: &O,
-    payer: &Keypair,
+    payer: &S,
     frames: &[FramePlan],
     tuning: SendTuning,
     in_flight: usize,
@@ -936,9 +1007,9 @@ async fn run_send_and_confirm_many<O: RpcOps>(
 /// [`run_send_and_confirm_many`] with the one-shot compute retry of
 /// [`RpcSender::send_and_confirm_many_with_compute_retry`].
 #[allow(clippy::too_many_arguments)]
-async fn run_send_and_confirm_many_with_compute_retry<O: RpcOps>(
+async fn run_send_and_confirm_many_with_compute_retry<O: RpcOps, S: TxSigner + ?Sized>(
     ops: &O,
-    payer: &Keypair,
+    payer: &S,
     frames: &[FramePlan],
     tuning: SendTuning,
     retry_compute_unit_limit: Option<u32>,
@@ -1365,9 +1436,9 @@ async fn run_send_and_confirm_many_with_compute_retry<O: RpcOps>(
 /// attempt's own `last_valid_block_height` to pass rather than a wall-clock guess. The two error shapes
 /// the single-shot callers match on are kept: a wall-clock give-up is [`SenderError::ConfirmTimeout`], and
 /// an on-chain failure is [`SenderError::StepFailed`] at `(0, 0, 0)`.
-async fn run_send_and_confirm_one<O: RpcOps>(
+async fn run_send_and_confirm_one<O: RpcOps, S: TxSigner + ?Sized>(
     ops: &O,
-    payer: &Keypair,
+    payer: &S,
     instructions: &[Instruction],
     tuning: SendTuning,
 ) -> Result<Signature, SenderError> {
@@ -1402,9 +1473,9 @@ async fn run_send_and_confirm_one<O: RpcOps>(
 /// Builds, signs, and submits (no confirmation wait) one step against a caller-supplied blockhash —
 /// shared by every submit/resubmit path in [`run_send_and_confirm_many`].
 #[allow(clippy::too_many_arguments)]
-async fn submit<O: RpcOps>(
+async fn submit<O: RpcOps, S: TxSigner + ?Sized>(
     ops: &O,
-    payer: &Keypair,
+    payer: &S,
     instructions: &[Instruction],
     compute_unit_limit: u32,
     loaded_accounts_data_size_limit: u32,
@@ -1562,7 +1633,7 @@ impl Sender for RpcSender {
         instructions: &[Instruction],
         tuning: SendTuning,
     ) -> Result<Signature, SenderError> {
-        run_send_and_confirm_one(self, &self.payer, instructions, tuning).await
+        run_send_and_confirm_one(self, &self.signing(), instructions, tuning).await
     }
 }
 

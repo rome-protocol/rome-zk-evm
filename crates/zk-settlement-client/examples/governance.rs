@@ -1,6 +1,8 @@
-//! Governance CLI for a deployed zk-settlement program (registration-and-revenue proposal). Every
-//! subcommand wraps one instruction builder from this crate; keys are always read from FILE PATHS and
-//! never printed (only pubkeys are).
+//! Governance CLI for a deployed zk-settlement program (registration-and-revenue proposal). The registry
+//! subcommands wrap one instruction builder from this crate each; the three exit-config subcommands are served
+//! by `rome-zk-ops` (`rome-zk-ops exit-config propose|activate|show`), and this example only forwards to it.
+//! Every transaction goes out as a V1 transaction through `rome-zk-solana-sender`. Keys are always read from
+//! FILE PATHS and never printed (only pubkeys are).
 //!
 //! Subcommands:
 //!   init-global-config   — one-time bring-up (idempotent: skips if global_config already exists).
@@ -24,7 +26,7 @@
 //!   show-exit-config       — read-only: print a chain's current + pending exit config, and whether the
 //!                            pending proposal (if any) is activatable yet.
 //!
-//! `--dry-run` (propose-exit-config / activate-exit-config only): build and sign the transaction against
+//! `--dry-run` (propose-exit-config / activate-exit-config only; handled by rome-zk-ops): build and sign the transaction against
 //! an all-zero placeholder blockhash and print it (base64, decoded instruction fields, discriminant)
 //! instead of sending — no RPC call of any kind is made, so this needs no live cluster.
 //!
@@ -97,14 +99,11 @@
 //!   cargo run -p zk-settlement-client --features devnet-driver --example governance -- \
 //!     show-exit-config --settlement <PROGRAM_ID> --chain-id 200101 [--rpc-url URL]
 
-use base64::Engine as _;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::{
-    hash::Hash,
     pubkey::Pubkey,
-    signature::{read_keypair_file, Signer},
-    transaction::Transaction,
+    signature::{read_keypair_file, Keypair, Signer},
 };
 use std::str::FromStr;
 
@@ -153,25 +152,12 @@ fn bool_arg(name: &str) -> bool {
         other => panic!("{name}: expected true|false, got {other}"),
     }
 }
-fn opt_pubkey_arg(name: &str) -> Option<Pubkey> {
-    arg(name).map(|s| Pubkey::from_str(&s).unwrap_or_else(|_| panic!("{name}: bad pubkey")))
-}
-fn opt_u64_arg(name: &str) -> Option<u64> {
-    arg(name).map(|s| s.parse().unwrap_or_else(|_| panic!("{name}: bad u64")))
-}
-fn opt_hex20_arg(name: &str) -> Option<[u8; 20]> {
-    arg(name).map(|s| {
-        let bytes = hex::decode(s.trim_start_matches("0x"))
-            .unwrap_or_else(|_| panic!("{name}: not valid hex"));
-        bytes
-            .try_into()
-            .unwrap_or_else(|_| panic!("{name}: expected 20 bytes"))
-    })
-}
-/// Bare boolean flag (no value) — `--dry-run` never takes an argument.
-fn dry_run() -> bool {
-    std::env::args().any(|a| a == "--dry-run")
-}
+const EXIT_CONFIG_FORWARDS: &[(&str, &[&str])] = &[
+    ("propose-exit-config", &["exit-config", "propose"]),
+    ("activate-exit-config", &["exit-config", "activate"]),
+    ("show-exit-config", &["exit-config", "show"]),
+];
+
 fn rpc_url() -> String {
     arg("--rpc-url").unwrap_or_else(|| "https://api.devnet.solana.com".to_string())
 }
@@ -179,126 +165,26 @@ fn settlement_id() -> Pubkey {
     pubkey_arg("--settlement")
 }
 
+/// Sends one instruction as one V1 transaction through `rome-zk-solana-sender`, via the operator CLI's chain
+/// seam, and waits for it to confirm.
 async fn send_ix(
-    rpc: &RpcClient,
+    rpc_url: &str,
     ix: solana_program::instruction::Instruction,
-    payer: &solana_sdk::signature::Keypair,
-    extra_signers: &[&solana_sdk::signature::Keypair],
-) -> solana_sdk::signature::Signature {
-    let bh = rpc.get_latest_blockhash().await.unwrap();
-    let mut signers = vec![payer];
-    signers.extend_from_slice(extra_signers);
-    let tx = Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &signers, bh);
-    rpc.send_and_confirm_transaction(&tx)
+    payer: &Keypair,
+    extra_signers: &[&Keypair],
+) -> String {
+    use rome_zk_ops::chain::{Chain, RpcChain};
+    let signers = rome_zk_ops::keys::Signers::new(
+        rome_zk_ops::keys::copy(payer),
+        extra_signers
+            .iter()
+            .map(|k| rome_zk_ops::keys::copy(k))
+            .collect(),
+    );
+    RpcChain::new(rpc_url.to_string())
+        .send(&[ix], &signers)
         .await
         .expect("transaction")
-}
-
-/// Signs `ix` for byte-level inspection only — an all-zero placeholder blockhash, never a real one and
-/// never fetched from any RPC, so `--dry-run` needs no cluster access whatsoever. The signatures are
-/// real (the given keypairs sign these exact bytes) but the transaction can never land: Solana refuses an
-/// all-zero blockhash as not-yet-seen. Used only to prove the instruction's shape/discriminant before a
-/// real send.
-fn build_dry_run_tx(
-    ix: &solana_program::instruction::Instruction,
-    payer: &solana_sdk::signature::Keypair,
-    extra_signers: &[&solana_sdk::signature::Keypair],
-) -> Transaction {
-    let mut signers = vec![payer];
-    signers.extend_from_slice(extra_signers);
-    Transaction::new_signed_with_payer(
-        std::slice::from_ref(ix),
-        Some(&payer.pubkey()),
-        &signers,
-        Hash::default(),
-    )
-}
-
-/// Prints what `--dry-run` promises: nothing sent anywhere, the built instruction decoded back (name +
-/// fields, from this crate's own `decode_instruction` — the inverse of every `*_ix` builder), its raw
-/// discriminant byte, and the fully-signed transaction as the same base64 bytes a real `sendTransaction`
-/// RPC call would receive.
-fn print_dry_run(label: &str, ix: &solana_program::instruction::Instruction, tx: &Transaction) {
-    let decoded =
-        zk_settlement_client::decode_instruction(&ix.data).expect("decode built instruction");
-    println!("-- dry run: {label} built and signed, nothing sent to any cluster --");
-    println!("  program        {}", ix.program_id);
-    println!("  discriminant   {}", ix.data[0]);
-    println!("  decoded        {decoded:?}");
-    // The Debug-derived print above renders `[u8; 20]`/`Pubkey` fields as raw byte arrays — readable for
-    // a diff, not for a human. Print the hex/base58 forms explicitly for the one variant this CLI builds
-    // with byte-array fields, so what was typed on the command line is visibly what got encoded.
-    if let zk_settlement_client::SettleIx::ProposeExitConfig {
-        exit_portal,
-        bridge_program,
-        ..
-    } = &decoded
-    {
-        if let Some(p) = exit_portal {
-            println!("  exit_portal    0x{}", hex::encode(p));
-        }
-        if let Some(b) = bridge_program {
-            println!("  bridge_program {b}");
-        }
-    }
-    let bytes = bincode::serialize(tx).expect("serialize tx");
-    println!(
-        "  tx (base64)    {}",
-        base64::engine::general_purpose::STANDARD.encode(bytes)
-    );
-}
-
-/// The `pending_mask` a `ProposeExitConfig` with these four optional fields will write — the same bits
-/// `programs/zk-settlement`'s `governance::propose_exit_config` computes, so `propose-exit-config` can
-/// print the resulting mask without a round trip to read it back.
-fn pending_mask(
-    exit_portal: Option<[u8; 20]>,
-    bridge_program: Option<Pubkey>,
-    exit_cap: Option<u64>,
-    poster_bond: Option<u64>,
-) -> u8 {
-    use rome_zk_layouts::exit::exit_config::{
-        PENDING_MASK_BOND, PENDING_MASK_BRIDGE, PENDING_MASK_CAP, PENDING_MASK_PORTAL,
-    };
-    let mut mask = 0u8;
-    if exit_portal.is_some() {
-        mask |= PENDING_MASK_PORTAL;
-    }
-    if bridge_program.is_some() {
-        mask |= PENDING_MASK_BRIDGE;
-    }
-    if exit_cap.is_some() {
-        mask |= PENDING_MASK_CAP;
-    }
-    if poster_bond.is_some() {
-        mask |= PENDING_MASK_BOND;
-    }
-    mask
-}
-
-/// Which `pending_mask` bits are set, by name (empty mask -> "none") — `show-exit-config`'s own
-/// human-readable rendering of the bitmask `rome_zk_layouts::exit::exit_config` defines.
-fn pending_mask_names(mask: u8) -> String {
-    use rome_zk_layouts::exit::exit_config::{
-        PENDING_MASK_BOND, PENDING_MASK_BRIDGE, PENDING_MASK_CAP, PENDING_MASK_PORTAL,
-    };
-    if mask == 0 {
-        return "none".to_string();
-    }
-    let mut names = Vec::new();
-    if mask & PENDING_MASK_PORTAL != 0 {
-        names.push("portal");
-    }
-    if mask & PENDING_MASK_BRIDGE != 0 {
-        names.push("bridge");
-    }
-    if mask & PENDING_MASK_CAP != 0 {
-        names.push("cap");
-    }
-    if mask & PENDING_MASK_BOND != 0 {
-        names.push("bond");
-    }
-    names.join(",")
 }
 
 async fn print_global_config(rpc: &RpcClient, settlement: &Pubkey) {
@@ -363,6 +249,15 @@ async fn print_chain_config(rpc: &RpcClient, settlement: &Pubkey, chain_id: u64)
 
 #[tokio::main]
 async fn main() {
+    // The exit-config subcommands live in rome-zk-ops. Forwarded, they keep this example's old behaviour: a
+    // send unless `--dry-run` is given.
+    if let Some(argv) = rome_zk_ops::cli::example_argv(
+        &[],
+        EXIT_CONFIG_FORWARDS,
+        std::env::args().skip(1).collect(),
+    ) {
+        std::process::exit(rome_zk_ops::cli::run(argv).await);
+    }
     let sub = std::env::args()
         .nth(1)
         .expect("usage: governance <subcommand> [flags]");
@@ -395,7 +290,7 @@ async fn main() {
                 &authority.pubkey(),
                 fields,
             );
-            let sig = send_ix(&rpc, ix, &payer, &[&authority]).await;
+            let sig = send_ix(&rpc_url(), ix, &payer, &[&authority]).await;
             println!("InitGlobalConfig: global_config {global_pda}, sig {sig}");
         }
         "allow-reserved-id" => {
@@ -415,7 +310,7 @@ async fn main() {
                 &registry_authority.pubkey(),
                 chain_id,
             );
-            let sig = send_ix(&rpc, ix, &payer, &[&registry_authority]).await;
+            let sig = send_ix(&rpc_url(), ix, &payer, &[&registry_authority]).await;
             println!("AllowReservedId: chain {chain_id} allowed, marker {allow_pda}, sig {sig}");
         }
         "revoke-reserved-id" => {
@@ -427,7 +322,7 @@ async fn main() {
                 &registry_authority.pubkey(),
                 chain_id,
             );
-            let sig = send_ix(&rpc, ix, &registry_authority, &[]).await;
+            let sig = send_ix(&rpc_url(), ix, &registry_authority, &[]).await;
             println!("RevokeReservedId: chain {chain_id} revoked, sig {sig}");
         }
         "set-global-config" => {
@@ -445,7 +340,7 @@ async fn main() {
                 &registry_authority.pubkey(),
                 update,
             );
-            let sig = send_ix(&rpc, ix, &registry_authority, &[]).await;
+            let sig = send_ix(&rpc_url(), ix, &registry_authority, &[]).await;
             println!("SetGlobalConfig applied, sig {sig}");
         }
         "propose-registry-authority" => {
@@ -457,7 +352,7 @@ async fn main() {
                 &registry_authority.pubkey(),
                 new,
             );
-            let sig = send_ix(&rpc, ix, &registry_authority, &[]).await;
+            let sig = send_ix(&rpc_url(), ix, &registry_authority, &[]).await;
             println!("ProposeRegistryAuthority: proposed {new}, sig {sig}");
         }
         "accept-registry-authority" => {
@@ -465,7 +360,7 @@ async fn main() {
                 .expect("read the PROPOSED registry authority keypair");
             let ix =
                 zk_settlement_client::accept_registry_authority_ix(&settlement, &pending.pubkey());
-            let sig = send_ix(&rpc, ix, &pending, &[]).await;
+            let sig = send_ix(&rpc_url(), ix, &pending, &[]).await;
             println!(
                 "AcceptRegistryAuthority: {} is now the registry authority, sig {sig}",
                 pending.pubkey()
@@ -482,7 +377,7 @@ async fn main() {
                 chain_id,
                 max_drift_secs,
             );
-            let sig = send_ix(&rpc, ix, &registry_authority, &[]).await;
+            let sig = send_ix(&rpc_url(), ix, &registry_authority, &[]).await;
             println!("SetDriftBound: chain {chain_id} max_drift_secs {max_drift_secs}, sig {sig}");
         }
         "set-registry-entry" => {
@@ -515,7 +410,7 @@ async fn main() {
                 entry,
                 activation_slot,
             );
-            let sig = send_ix(&rpc, ix, &payer, &[&registry_authority]).await;
+            let sig = send_ix(&rpc_url(), ix, &payer, &[&registry_authority]).await;
             if activation_slot == rome_zk_layouts::registry::RETIRED_SLOT {
                 println!(
                     "SetRegistryEntry: chain {chain_id} curve {} scheme {} layout {} RETIRED, sig {sig}",
@@ -532,212 +427,6 @@ async fn main() {
             print_global_config(&rpc, &settlement).await;
             if let Some(id) = arg("--chain-id") {
                 print_chain_config(&rpc, &settlement, id.parse().expect("bad --chain-id")).await;
-            }
-        }
-        "propose-exit-config" => {
-            let chain_id = u64_arg("--chain-id");
-            let chain_authority = read_keypair_file(required_arg("--chain-authority-keypair"))
-                .expect("read chain authority keypair — must equal root.authority");
-            let payer =
-                read_keypair_file(required_arg("--payer-keypair")).expect("read payer keypair");
-            let exit_portal = opt_hex20_arg("--exit-portal");
-            let bridge_program = opt_pubkey_arg("--bridge-program");
-            let exit_cap = opt_u64_arg("--exit-cap");
-            let poster_bond = opt_u64_arg("--poster-bond");
-            // Mirror the program's own `InvalidArgument` refusal (governance::propose_exit_config)
-            // locally, before ever building a transaction: an all-None proposal writes an inert
-            // exit_config (pending_mask == 0) that ActivateExitConfig can only ever refuse
-            // (NoPendingExitConfig) — no reason to spend the chain authority's rent getting there.
-            if exit_portal.is_none()
-                && bridge_program.is_none()
-                && exit_cap.is_none()
-                && poster_bond.is_none()
-            {
-                eprintln!(
-                    "refusing: propose-exit-config needs at least one of --exit-portal / \
-                     --bridge-program / --exit-cap / --poster-bond"
-                );
-                std::process::exit(1);
-            }
-            let dry = dry_run();
-            let activation_slot = match (arg("--activation-slot"), arg("--activation-delay-slots"))
-            {
-                (Some(s), None) => s
-                    .parse()
-                    .unwrap_or_else(|_| panic!("--activation-slot: bad u64")),
-                (None, Some(d)) => {
-                    let delay: u64 = d
-                        .parse()
-                        .unwrap_or_else(|_| panic!("--activation-delay-slots: bad u64"));
-                    // No cluster to read the current slot from in --dry-run — the delay is added to an
-                    // assumed current_slot of 0 and the assumption is printed, never silently applied.
-                    let current_slot = if dry {
-                        println!("(dry-run: current_slot assumed 0 — no live cluster to read)");
-                        0
-                    } else {
-                        rpc.get_slot().await.expect("get current slot")
-                    };
-                    current_slot + delay
-                }
-                (Some(_), Some(_)) => {
-                    panic!("pass exactly one of --activation-slot or --activation-delay-slots")
-                }
-                (None, None) => {
-                    panic!(
-                        "propose-exit-config needs --activation-slot or --activation-delay-slots"
-                    )
-                }
-            };
-            let ix = zk_settlement_client::propose_exit_config_ix(
-                &settlement,
-                &chain_authority.pubkey(),
-                &payer.pubkey(),
-                chain_id,
-                exit_portal,
-                bridge_program,
-                exit_cap,
-                poster_bond,
-                activation_slot,
-            );
-            let mask = pending_mask(exit_portal, bridge_program, exit_cap, poster_bond);
-            if dry {
-                let tx = build_dry_run_tx(&ix, &payer, &[&chain_authority]);
-                print_dry_run("ProposeExitConfig", &ix, &tx);
-                println!(
-                    "  pending_mask on activation  {mask} ({})  activation_slot {activation_slot}",
-                    pending_mask_names(mask)
-                );
-            } else {
-                let (exit_config, _) = zk_settlement_client::exit_config_pda(&settlement, chain_id);
-                let sig = send_ix(&rpc, ix, &payer, &[&chain_authority]).await;
-                println!(
-                    "ProposeExitConfig: chain {chain_id} exit_config {exit_config} pending_mask \
-                     {mask} ({}) activation_slot {activation_slot}, sig {sig}",
-                    pending_mask_names(mask)
-                );
-            }
-        }
-        "activate-exit-config" => {
-            let chain_id = u64_arg("--chain-id");
-            let payer =
-                read_keypair_file(required_arg("--payer-keypair")).expect("read payer keypair");
-            let ix = zk_settlement_client::activate_exit_config_ix(&settlement, chain_id);
-            if dry_run() {
-                let tx = build_dry_run_tx(&ix, &payer, &[]);
-                print_dry_run("ActivateExitConfig", &ix, &tx);
-            } else {
-                let (exit_config, _) = zk_settlement_client::exit_config_pda(&settlement, chain_id);
-                match rpc.get_account(&exit_config).await {
-                    Ok(acc) => {
-                        let cfg = zk_settlement_client::decode_exit_config_account(&acc.data)
-                            .expect("decode exit_config");
-                        if cfg.pending_mask == 0 {
-                            eprintln!(
-                                "no pending exit config for chain {chain_id}: nothing to activate"
-                            );
-                            std::process::exit(1);
-                        }
-                        let now = rpc.get_slot().await.expect("get current slot");
-                        if now < cfg.activation_slot {
-                            println!(
-                                "not yet — {} slots to go (current slot {now}, activation_slot {})",
-                                cfg.activation_slot - now,
-                                cfg.activation_slot
-                            );
-                            return;
-                        }
-                    }
-                    Err(_) => {
-                        eprintln!(
-                            "no exit config proposed for chain {chain_id}: nothing to activate"
-                        );
-                        std::process::exit(1);
-                    }
-                }
-                let sig = send_ix(&rpc, ix, &payer, &[]).await;
-                println!("ActivateExitConfig: chain {chain_id}, sig {sig}");
-            }
-        }
-        "show-exit-config" => {
-            let chain_id = u64_arg("--chain-id");
-            let (root_pda, _) = zk_settlement_client::root_pda(&settlement, chain_id);
-            let root = match rpc.get_account(&root_pda).await {
-                Ok(acc) => {
-                    Some(zk_settlement_client::decode_root_account(&acc.data).expect("decode root"))
-                }
-                Err(_) => None,
-            };
-            let (exit_config_pda, _) = zk_settlement_client::exit_config_pda(&settlement, chain_id);
-            let cfg = match rpc.get_account(&exit_config_pda).await {
-                Ok(acc) => zk_settlement_client::decode_exit_config_account(&acc.data)
-                    .expect("decode exit_config"),
-                Err(_) => {
-                    println!(
-                        "exit_config {exit_config_pda} (chain {chain_id}): no exit config (exits disabled)"
-                    );
-                    return;
-                }
-            };
-            let now = rpc.get_slot().await.expect("get current slot");
-            println!("exit_config {exit_config_pda} (chain {chain_id}):");
-            println!(
-                "  exit_portal (current)      0x{}",
-                hex::encode(cfg.exit_portal)
-            );
-            println!("  bridge_program (current)   {}", cfg.bridge_program);
-            match &root {
-                Some(r) => {
-                    println!(
-                        "  exit_cap_per_window (current, from root)  {}",
-                        r.exit_cap_per_window
-                    );
-                    println!(
-                        "  poster_bond (current, from root)          {}",
-                        r.poster_bond
-                    );
-                    println!(
-                        "  challenge_window_slots (from root)        {}",
-                        r.challenge_window_slots
-                    );
-                }
-                None => println!("  root {root_pda} not found — cannot read current cap/bond"),
-            }
-            println!(
-                "  pending_mask                {} ({})",
-                cfg.pending_mask,
-                pending_mask_names(cfg.pending_mask)
-            );
-            if cfg.pending_mask & rome_zk_layouts::exit::exit_config::PENDING_MASK_PORTAL != 0 {
-                println!(
-                    "  pending_exit_portal         0x{}",
-                    hex::encode(cfg.pending_exit_portal)
-                );
-            }
-            if cfg.pending_mask & rome_zk_layouts::exit::exit_config::PENDING_MASK_BRIDGE != 0 {
-                println!(
-                    "  pending_bridge_program      {}",
-                    cfg.pending_bridge_program
-                );
-            }
-            if cfg.pending_mask & rome_zk_layouts::exit::exit_config::PENDING_MASK_CAP != 0 {
-                println!("  pending_exit_cap            {}", cfg.pending_exit_cap);
-            }
-            if cfg.pending_mask & rome_zk_layouts::exit::exit_config::PENDING_MASK_BOND != 0 {
-                println!("  pending_poster_bond         {}", cfg.pending_poster_bond);
-            }
-            if cfg.pending_mask == 0 {
-                println!("  activation_slot             n/a (nothing pending)");
-            } else if now >= cfg.activation_slot {
-                println!(
-                    "  activation_slot             {} — reached (current slot {now}); activatable now",
-                    cfg.activation_slot
-                );
-            } else {
-                println!(
-                    "  activation_slot             {} — not yet (current slot {now}, {} slots to go)",
-                    cfg.activation_slot,
-                    cfg.activation_slot - now
-                );
             }
         }
         other => panic!(

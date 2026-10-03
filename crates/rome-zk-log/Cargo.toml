@@ -7,17 +7,18 @@ publish = false
 description = "sub-block header + the sequencer's append-only ordered log: record format, segments, torn-tail recovery, tail-follow reader"
 
 [dependencies]
-# Production code uses only `alloy::primitives::{Bytes, Signature, B256, keccak256}` — `signer-local`/
+# Production code uses only `alloy::primitives::{Address, Bytes, Signature, B256, keccak256}` — `signer-local`/
 # `k256`/`rand` are test-only (the fixture signing key), see [dev-dependencies] below.
 alloy = { version = "2.4", default-features = false, features = ["rlp"] }
 alloy-rlp = { version = "0.3", features = ["derive"] }
+alloy-eips = { version = "2", default-features = false }
 crc32fast = "1"
+rome-zk-executor-api = { path = "../rome-zk-executor-api" }
 thiserror = "2"
 
 [dev-dependencies]
 tempfile = "3"
 hex = "0.4"
-alloy-eips = { version = "2", default-features = false }
 alloy = { version = "2.4", default-features = false, features = ["consensus", "rlp", "signer-local", "k256", "rand"] }
 
 [lints]

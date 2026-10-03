@@ -15,10 +15,7 @@
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
 use solana_program::{instruction::Instruction, keccak, pubkey::Pubkey};
-use solana_sdk::{
-    signature::{read_keypair_file, write_keypair_file, Keypair, Signature, Signer},
-    transaction::Transaction,
-};
+use solana_sdk::signature::{read_keypair_file, write_keypair_file, Keypair, Signature, Signer};
 use solana_transaction_status_client_types::UiTransactionEncoding;
 use std::{path::PathBuf, str::FromStr, time::Duration};
 
@@ -70,15 +67,10 @@ fn sbf_so_path() -> PathBuf {
     ))
 }
 
+/// Sends `ixs` as one V1 transaction through `rome-zk-solana-sender` (via the operator CLI's chain seam) and waits
+/// for it to confirm. There is no legacy transaction anywhere in this driver.
 async fn send(rpc: &RpcClient, payer: &Keypair, ixs: &[Instruction]) -> Signature {
-    let blockhash = rpc
-        .get_latest_blockhash()
-        .await
-        .expect("get_latest_blockhash");
-    let tx = Transaction::new_signed_with_payer(ixs, Some(&payer.pubkey()), &[payer], blockhash);
-    rpc.send_and_confirm_transaction(&tx)
-        .await
-        .expect("send_and_confirm_transaction")
+    try_send(rpc, payer, ixs).await.expect("transaction")
 }
 
 /// Like `send`, but returns the error instead of panicking — for a call this driver expects might be
@@ -88,13 +80,11 @@ async fn try_send(
     rpc: &RpcClient,
     payer: &Keypair,
     ixs: &[Instruction],
-) -> Result<Signature, solana_client::client_error::ClientError> {
-    let blockhash = rpc
-        .get_latest_blockhash()
-        .await
-        .expect("get_latest_blockhash");
-    let tx = Transaction::new_signed_with_payer(ixs, Some(&payer.pubkey()), &[payer], blockhash);
-    rpc.send_and_confirm_transaction(&tx).await
+) -> Result<Signature, String> {
+    use rome_zk_ops::chain::{Chain, RpcChain};
+    let signers = rome_zk_ops::keys::Signers::new(rome_zk_ops::keys::copy(payer), vec![]);
+    let sig = RpcChain::new(rpc.url()).send(ixs, &signers).await?;
+    Signature::from_str(&sig).map_err(|e| e.to_string())
 }
 
 /// See `zk-inbox-client`'s driver for why this retries: `getTransaction` can lag `send_and_confirm`.
@@ -462,25 +452,6 @@ async fn main() {
     print_cu(&rpc, "settlement FinalizeBatch", &finalize_settlement_sig).await;
 
     // --- RootView ---
-    let root_view_ix = zk_settlement_client::root_view_ix(&program_id, chain_id, batch);
-    let blockhash = rpc
-        .get_latest_blockhash()
-        .await
-        .expect("get_latest_blockhash");
-    let tx = Transaction::new_signed_with_payer(
-        &[root_view_ix],
-        Some(&payer.pubkey()),
-        &[&payer],
-        blockhash,
-    );
-    let sim = rpc
-        .simulate_transaction(&tx)
-        .await
-        .expect("simulate_transaction(RootView)");
-    println!(
-        "RootView simulate: err={:?} return_data={:?}",
-        sim.value.err, sim.value.return_data
-    );
     let root_view_sig = send(
         &rpc,
         &payer,

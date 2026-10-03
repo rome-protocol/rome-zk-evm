@@ -306,6 +306,7 @@ fn write_blocks(dir: &Path, start_block: u64, count: u64) {
                 receipts_root: B256::repeat_byte(index as u8 + 1),
                 gas_used: 21_000,
                 prev_hash,
+                deposits_end: None,
             };
             let signature = sign_header(&PrivateKeySigner::random(), &header);
             let tx = signed_raw_tx(&sender, CHAIN_ID, block * 1_000 + index as u64);
@@ -691,6 +692,7 @@ fn write_log(dir: &Path, blocks: &[(u64, u16)]) {
                 receipts_root: B256::repeat_byte(index as u8 + 1),
                 gas_used: 21_000,
                 prev_hash,
+                deposits_end: None,
             };
             let signature = sign_header(&PrivateKeySigner::random(), &header);
             let txs: Vec<_> = if index < n_txs {

@@ -110,7 +110,9 @@ impl TestPg {
     }
 
     async fn wait_for_ready(url: &str) -> PgPool {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        // A busy shared test machine can take well over 30 s to start postgres:16 (initdb); 120 s keeps the test from failing
+        // on load alone.
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
         loop {
             match PgPoolOptions::new()
                 .max_connections(5)

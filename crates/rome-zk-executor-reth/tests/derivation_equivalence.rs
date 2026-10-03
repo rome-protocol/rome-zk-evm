@@ -12,6 +12,7 @@
 
 use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
 use alloy_eips::eip2718::Encodable2718;
+use alloy_eips::eip4895::Withdrawal;
 use alloy_eips::eip7685::RequestsOrHash;
 use alloy_genesis::Genesis;
 use alloy_primitives::{Address, Bytes, TxKind, B256, U256};
@@ -98,22 +99,59 @@ struct Recorded {
     prev_randao: B256,
     state_root: B256,
     block_hash: B256,
+    withdrawals: Vec<Withdrawal>,
 }
 
 #[ignore = "spins up a real in-process reth node; run explicitly: cargo test -p rome-zk-executor-reth --test derivation_equivalence -- --ignored --nocapture"]
 #[tokio::test(flavor = "multi_thread")]
 async fn twenty_blocks_with_real_transfers_derive_identically_on_a_stock_reth() {
+    // No block carries withdrawals: an empty list builds the very block a stock reth builds with an empty list, as
+    // every block did before deposits.
+    derive_identically_on_a_stock_reth(20, |_| vec![]).await;
+}
+
+/// Blocks that credit deposits derive identically on a stock reth: the same ordered transactions and the same
+/// withdrawals list give the same block hash and state root, so the withdrawals are credited after the transactions
+/// exactly as stock reth credits them. Some blocks carry none, as most will.
+#[ignore = "spins up a real in-process reth node; run explicitly: cargo test -p rome-zk-executor-reth --test derivation_equivalence -- --ignored --nocapture"]
+#[tokio::test(flavor = "multi_thread")]
+async fn blocks_with_withdrawals_derive_identically_on_a_stock_reth() {
+    // Queue indices 0..2 in block 2, 3 in block 4, 4..7 in block 5: each block's list starts where the previous
+    // one ended, as the deposit queue hands them out.
+    let list = |first: u64, n: u64| -> Vec<Withdrawal> {
+        (first..first + n)
+            .map(|i| {
+                rome_zk_executor_api::deposit_withdrawal(
+                    i,
+                    Address::repeat_byte(0xD0 + i as u8),
+                    1_000_000 * (i + 1),
+                )
+            })
+            .collect()
+    };
+    derive_identically_on_a_stock_reth(6, move |number| match number {
+        2 => list(0, 3),
+        4 => list(3, 1),
+        5 => list(4, 3),
+        _ => vec![],
+    })
+    .await;
+}
+
+async fn derive_identically_on_a_stock_reth(
+    blocks: u64,
+    withdrawals_for: impl Fn(u64) -> Vec<Withdrawal>,
+) {
     reth_tracing::init_test_tracing();
     // 20 blocks so the env.number == header.number equivalence check below (the numbering
     // invariant) runs over a real span, not just block 1.
-    const BLOCKS: u64 = 20;
     const TXS_PER_BLOCK: u64 = 3;
 
     let signer = PrivateKeySigner::random();
     let genesis: Genesis = serde_json::from_value(genesis_json(&[signer.address()])).unwrap();
     let chain_spec = Arc::new(ChainSpec::from_genesis(genesis));
 
-    // 1. This crate's own in-process executor seals BLOCKS blocks, remembering the exact ordered tx
+    // 1. This crate's own in-process executor seals `blocks` blocks, remembering the exact ordered tx
     //    list + timestamp it used for each — the inputs the second node gets fed below.
     let mine_dir = tempdir().unwrap();
     let genesis_path = mine_dir.path().join("genesis.json");
@@ -128,7 +166,7 @@ async fn twenty_blocks_with_real_transfers_derive_identically_on_a_stock_reth() 
     let mut recorded = Vec::new();
     let mut nonce = 0u64;
     let base_ts = chain_spec.genesis().timestamp;
-    for b in 0..BLOCKS {
+    for b in 0..blocks {
         // The sequencer numbers its first sealed block 1 — design
         // number 0 names only the EL's genesis, which is never sealed. `number` is what this test
         // feeds `RethExecutor` AND what it asserts the real reth header number equals below.
@@ -145,6 +183,7 @@ async fn twenty_blocks_with_real_transfers_derive_identically_on_a_stock_reth() 
             coinbase: Address::ZERO,
             prev_randao,
             base_fee: None,
+            withdrawals: withdrawals_for(number),
         })
         .await
         .unwrap();
@@ -183,6 +222,7 @@ async fn twenty_blocks_with_real_transfers_derive_identically_on_a_stock_reth() 
             prev_randao,
             state_root: outcome.state_root,
             block_hash: outcome.block_hash,
+            withdrawals: withdrawals_for(number),
         });
     }
 
@@ -244,7 +284,7 @@ async fn twenty_blocks_with_real_transfers_derive_identically_on_a_stock_reth() 
             // with interchangeability.
             prev_randao: rec.prev_randao,
             suggested_fee_recipient: Address::ZERO,
-            withdrawals: Some(vec![]),
+            withdrawals: Some(rec.withdrawals.clone()),
             parent_beacon_block_root: Some(B256::ZERO),
             slot_number: None,
             // This chain's genesis gas_limit is a fixed constant, not subject to Ethereum L1's
@@ -361,6 +401,7 @@ async fn a_block_one_hour_after_its_parent_executes_and_seals_on_a_stock_reth() 
             coinbase: Address::ZERO,
             prev_randao,
             base_fee: None,
+            withdrawals: vec![],
         })
         .await
         .unwrap();
@@ -395,6 +436,7 @@ async fn a_block_one_hour_after_its_parent_executes_and_seals_on_a_stock_reth() 
             prev_randao,
             state_root: outcome.state_root,
             block_hash: outcome.block_hash,
+            withdrawals: vec![],
         });
     }
 

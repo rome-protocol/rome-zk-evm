@@ -859,6 +859,7 @@ mod tests {
                 coinbase: Address::ZERO,
                 prev_randao: rome_zk_executor_api::prev_randao(200_101, number),
                 base_fee: None,
+                withdrawals: vec![],
             },
             txs,
         }

@@ -244,6 +244,7 @@ fn write_log(dir: &std::path::Path, chain_id: u64, blocks: &[Block]) {
                 receipts_root: B256::repeat_byte(index as u8 + 1),
                 gas_used: 21_000 * txs.len() as u64,
                 prev_hash,
+                deposits_end: None,
             };
             let signature = sign_header(&PrivateKeySigner::random(), &header);
             writer

@@ -22,6 +22,8 @@ pub use zk_settlement::governance::SetGlobalConfigArgs as GlobalConfigUpdate;
 pub use zk_settlement::settle::{PostRootArgs as PostRootFields, RootViewData};
 pub use zk_settlement::SettleIx;
 
+pub mod ops_plan;
+
 /// Decodes a raw top-level instruction's data back into a [`SettleIx`] — the inverse of every
 /// instruction builder above (instruction decoding lives
 /// here, next to the builders, never re-implemented by a consumer). Used by the settlement watcher and

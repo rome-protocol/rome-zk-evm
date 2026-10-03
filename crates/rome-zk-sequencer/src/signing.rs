@@ -63,6 +63,7 @@ mod tests {
             receipts_root: B256Type::repeat_byte(0x22),
             gas_used: 21_000,
             prev_hash: B256Type::ZERO,
+            deposits_end: None,
         }
     }
 

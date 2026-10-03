@@ -514,6 +514,9 @@ pub async fn replay_into_executor<E: Executor>(
                 // same note in `sealer.rs`.
                 prev_randao: crate::executor::prev_randao(record.header.chain_id, block),
                 base_fee: None,
+                // The deposits this block credited, as the live sealer logged them on its index-0 record: replay credits
+                // the same list, so the block rebuilds with the same withdrawals_root and state.
+                withdrawals: record.withdrawals.clone(),
             };
             executor
                 .open_block(env)
@@ -1214,6 +1217,7 @@ mod tests {
                 coinbase: alloy::primitives::Address::ZERO,
                 prev_randao: crate::executor::prev_randao(1, 1),
                 base_fee: None,
+                withdrawals: vec![],
             })
             .await
             .unwrap();
@@ -1238,6 +1242,7 @@ mod tests {
             receipts_root: probe_outcome.receipts_root,
             gas_used: probe_outcome.gas_used,
             prev_hash: B256::ZERO,
+            deposits_end: None,
         };
         let signature = sign_header(&sequencer_key, &header);
 

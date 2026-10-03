@@ -1310,6 +1310,7 @@ mod tests {
                 receipts_root: B256::ZERO,
                 gas_used: 21_000,
                 prev_hash,
+                deposits_end: None,
             };
             let signature = sign_header(&PrivateKeySigner::random(), &header);
             let tx = signed_raw_tx(&sender, CHAIN_ID, index as u64);
@@ -1327,6 +1328,7 @@ mod tests {
                 receipts_root: B256::ZERO,
                 gas_used: 21_000,
                 prev_hash,
+                deposits_end: None,
             };
             let signature = sign_header(&PrivateKeySigner::random(), &header);
             let tx = signed_raw_tx(&sender, CHAIN_ID, 100 + index as u64);
@@ -1530,6 +1532,7 @@ mod tests {
             receipts_root: B256::ZERO,
             gas_used: 21_000,
             prev_hash: B256::ZERO,
+            deposits_end: None,
         };
         let signature = sign_header(&PrivateKeySigner::random(), &header);
         let tx = signed_raw_tx(&sender, CHAIN_ID, 0);

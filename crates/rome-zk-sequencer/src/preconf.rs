@@ -79,6 +79,7 @@ mod tests {
             receipts_root: B256::ZERO,
             gas_used: 0,
             prev_hash: B256::ZERO,
+            deposits_end: None,
         };
         SealedSubBlock {
             header_hash: header.hash(),

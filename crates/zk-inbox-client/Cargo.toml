@@ -75,5 +75,9 @@ required-features = ["devnet-driver"]
 name = "init_cursor"
 required-features = ["devnet-driver"]
 
+# The init_cursor example is a thin wrapper over the operator CLI.
+[dev-dependencies]
+rome-zk-ops = { path = "../rome-zk-ops" }
+
 [lints]
 workspace = true

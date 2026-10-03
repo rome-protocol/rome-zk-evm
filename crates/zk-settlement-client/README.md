@@ -23,11 +23,12 @@ feature itself.
   requirements exist to enforce.
 - **No async runtime opinions in the library itself** — an RPC client and Tokio are pulled in only behind
   the `devnet-driver` feature, used by this crate's own example binaries
-  (`examples/devnet_driver.rs`, `examples/register_chain.rs`, `examples/migrate_chain.rs`,
-  `examples/governance.rs`).
+  (`examples/devnet_driver.rs`, `examples/governance.rs`) and by the thin example wrappers over
+  [`rome-zk-ops`](../rome-zk-ops) (`examples/register_chain.rs`, `examples/migrate_chain.rs`, and
+  `governance`'s exit-config subcommands). The operator commands themselves live in `rome-zk-ops`.
 - **`register_chain --permissionless` registers a chain with an empty registry.** The program refuses a
-  permissionless chain that brings its own verifier keys, so the example refuses `--layout1-vkey-json` and
-  `--zisk-vkey-json` on that path (`check_register_chain_flags`, error `VkeysNotAllowedOnPermissionless`)
+  permissionless chain that brings its own verifier keys, so `rome-zk-ops register` refuses `--layout1-vkey-json` and
+  `--zisk-vkey-json` on that path (error `VkeysNotAllowedOnPermissionless`)
   before it reads a key or calls an RPC, and prints that the chain cannot finalize a proved root until Rome
   registers its layout-1 verifier key. The flow is: run `register_chain`, ask Rome to register the key, and
   Rome adds it with `governance set-registry-entry`. `--reserved` still takes both vkey files.
@@ -38,11 +39,11 @@ feature itself.
 - **`propose_exit_config_ix`/`activate_exit_config_ix`/`decode_exit_config_account`** build and decode the
   exit-config governance pair — see
   [`programs/zk-settlement`](../../programs/zk-settlement)'s README for the delay rule and state machine
-  those two instructions enforce. Wired into `examples/governance.rs`'s `propose-exit-config` /
-  `activate-exit-config` / `show-exit-config` subcommands — the first ops-tooling path able
-  to send `ProposeExitConfig` at all. Both senders take `--dry-run`: build and sign against a placeholder
-  blockhash and print the decoded instruction, its discriminant, and the base64 transaction bytes instead
-  of sending — no RPC call of any kind, so it needs no live cluster. `show-exit-config` reads the
+  those two instructions enforce. Used by `rome-zk-ops exit-config propose|activate|show`, which
+  `examples/governance.rs`'s `propose-exit-config` / `activate-exit-config` / `show-exit-config` forward to.
+  Without `--confirm` the CLI builds and signs against a placeholder blockhash and prints the decoded
+  instruction, its discriminant and the base64 transaction bytes instead of sending (`--offline` makes no RPC
+  call at all). `show` reads the
   *current* portal/bridge from `exit_config` and the *current* cap/bond from `root` (the account that
   actually stores those two numbers), alongside every pending field and an activatable-now/not-yet
   reading against the live slot.

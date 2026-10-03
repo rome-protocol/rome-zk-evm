@@ -97,6 +97,7 @@ fn write_two_block_log(dir: &std::path::Path) {
                 receipts_root: B256::repeat_byte(index as u8 + 1),
                 gas_used: 21_000,
                 prev_hash,
+                deposits_end: None,
             };
             let signature = sign_header(&PrivateKeySigner::random(), &header);
             let tx = signed_raw_tx(&sender, CHAIN_ID, nonce);
@@ -130,6 +131,7 @@ fn write_blocks_from(
                 receipts_root: B256::repeat_byte(index as u8 + 1),
                 gas_used: 21_000,
                 prev_hash,
+                deposits_end: None,
             };
             let signature = sign_header(&PrivateKeySigner::random(), &header);
             let tx = signed_raw_tx(sender, CHAIN_ID, block * 1_000 + index as u64);

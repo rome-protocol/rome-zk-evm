@@ -17,7 +17,7 @@ You do not need a prover host to run the node itself, only to settle roots. See
 | GPU | One NVIDIA GPU with more than 30 GB of memory. The final proof step asks for about 30 GB, so a 24 GB card is not enough. |
 | NVIDIA driver | 525.60.13 or later, which is ZisK's own minimum. The prover image is built on CUDA 12.9, so a recent driver is the safer choice. |
 | Disk | About 26 GB is downloaded into the install directory and about 81 GB is installed once unpacked (provingKey 53.7 GB, provingKeySnark 27.0 GB). Plan for about 125 GB free at the install directory while the download is unpacked. |
-| Memory | The STARK step needed 37.5 GB of RAM and the PLONK step 88.4 GB when proved on a CPU host. Use a host with at least 128 GB of RAM until a GPU host has been measured. |
+| Memory | The STARK step needed 37.5 GB of RAM and the PLONK step 88.4 GB, for a batch of 10 empty blocks proved on a CPU host. A batch with transactions has not been measured. Use a host with at least 128 GB of RAM until a GPU host has been measured. |
 
 The disk figures were measured on a CPU host. A GPU host generates some files of its own, and those are not
 measured yet.
@@ -102,8 +102,8 @@ proofs were made with. The prover container checks it before every start, and yo
 ZISK_HOME=/opt/zisk bash deploy/rollup/prover/check-keys.sh
 ```
 
-It prints `OK` for each directory and exits 0. Any other exit code names the reason: 10 not populated, 12 mismatch,
-13 manifest missing.
+It prints `OK` for each directory and exits 0. Any other exit code names the reason: 10 not populated, 11 manifest
+not pinned, 12 mismatch, 13 manifest missing.
 
 If the keys on your host are a different set (a newer release, say), the check refuses with `KeysShaMismatch` and the
 prover does not start. Do not re-pin to make it pass. Install the release the manifest was made for. Pin your own

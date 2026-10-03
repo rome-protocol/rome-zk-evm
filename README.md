@@ -41,9 +41,8 @@ and runs it inside `PostRootProved`; the prover runs the same check off-chain be
 
 - Rust, pinned by [`rust-toolchain.toml`](rust-toolchain.toml) (`rustup` picks it up automatically).
 - The Agave (Solana) CLI, for `cargo build-sbf` — install via `sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"`.
-  The four on-chain programs pin `solana-program = "=4.1.0"` (the whole workspace's one Agave 4.3.0-line
-  crate set, `Cargo.toml`'s `[workspace.dependencies]`) and build
-  `--arch v3` — the CLI's bundled platform-tools (≥ v1.54) builds them independently of the host Rust
+  The four on-chain programs pin `solana-program = "=4.1.0"`, set once for the whole workspace in `Cargo.toml`, and
+  build with `--arch v3`. The CLI's bundled platform tools (v1.54 or newer) build them, independent of the host Rust
   toolchain above.
 - Docker, only if building the sequencer's container image (see [`Dockerfile`](Dockerfile)).
 

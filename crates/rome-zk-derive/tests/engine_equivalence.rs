@@ -131,6 +131,7 @@ async fn a_batch_derived_through_the_real_engine_api_matches_rome_zk_executor_re
             coinbase: Address::ZERO,
             prev_randao,
             base_fee: None,
+            withdrawals: vec![],
         })
         .await
         .unwrap();

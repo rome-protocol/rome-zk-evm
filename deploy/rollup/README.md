@@ -18,8 +18,8 @@ and a guest built for your chain's genesis. See
 [The prover is required for settlement](#the-prover-is-required-for-settlement).
 
 Rome's settlement programs are live on public Solana devnet. Their addresses are in
-[`programs.devnet.json`](programs.devnet.json), the default `PROGRAMS_JSON` in `.env.example`, so `init` and
-`check` now have the program-address file they need. The settlement program's global config enables
+[`programs.devnet.json`](programs.devnet.json), the default `PROGRAMS_JSON` in `.env.example`, and `init` and
+`check` read the program addresses from it. The settlement program's global config enables
 permissionless registration, with a 5 SOL registration deposit and a 0.001 SOL fee when a proved root is
 posted. The reclaim window is 6,480,000 slots, about 30 days at 400 ms per slot. After that, anyone
 can reclaim a chain that has never posted a root. Its root, registry and chain
@@ -74,11 +74,11 @@ Set both keys or neither. You lock the same amount in the vault with the bridge 
 checks that the vault holds it before it registers your verification key. `init` prints the exact lamport amount to
 lock. First create the vault with the bridge program's `InitVault`, signed by your chain authority, which works only
 after `register`; you also need that amount of wrapped SOL, on top of the SOL budget for registration and fees.
-The bridge program is not deployed on devnet yet, so on devnet there is no vault to lock a backed balance in today.
+On devnet the bridge program is the shared zk-bridge in `programs.devnet.json`. [Your chain's vault](#your-chains-vault)
+gives the commands.
 
-`init` stops with `FundedAddressRemoved` if `chain.toml` still sets `genesis.funded_address`, which older versions
-required and which minted 1e27 wei to that address. It also stops with `GenesisKeyUnknown` for any other key under
-`[genesis]` that it does not know (including `backed_balance`, which has to carry its unit), `BackedAddressMissing`
+`init` stops with `FundedAddressRemoved` if `chain.toml` sets `genesis.funded_address`. It also stops with
+`GenesisKeyUnknown` for any other key under `[genesis]` that it does not know (including `backed_balance`, which has to carry its unit), `BackedAddressMissing`
 or `BackedBalanceMissing` when only one of the two keys is set, `BackedAddressInvalid` for an address that is not `0x`
 and 40 hex characters, `BackedAddressReserved` for zero, the precompile addresses (`0x00..00` to `0x00..ff`) and the exit
 portal's address, and `BackedBalanceInvalid` for anything but a whole number of lamports in range. An existing
@@ -150,7 +150,7 @@ the port: add rules to the `DOCKER-USER` chain or use your cloud provider's fire
 | 8547 | reth-verifier | 127.0.0.1 only |
 | 8551 | reth-verifier engine API | not published |
 | 9001 to 9004 | metrics of sequencer, batcher, derive and prover | 127.0.0.1 only |
-| 5432 | the prover's postgres | 127.0.0.1 only, and only with the prover |
+| 5432 | the prover's postgres | not published; only the prover reaches it, over the compose network |
 
 The numbers in the table are the defaults. Each host port can be moved in `.env` (`RPC_PORT`, `WS_PORT`, `VERIFIER_RPC_PORT`,
 `SEQUENCER_METRICS_PORT`, `BATCHER_METRICS_PORT`, `DERIVE_METRICS_PORT`, `PROVER_METRICS_PORT`); run `./rollup init` again afterwards.
@@ -197,7 +197,9 @@ post a root.
 
 The prover needs one NVIDIA GPU with more than 30 GB of memory and the ZisK proving keys on the host: about 26 GB to
 download, about 81 GB once installed (measured on a CPU host; a GPU host generates its own files, not measured yet).
-The final proof step needs about 30 GB of GPU memory; a 24 GB card is not enough. To turn it on, set `PROVER=on`
+The final proof step needs about 30 GB of GPU memory; a 24 GB card is not enough.
+[Setting up a prover host](../../docs/PROVER-HOST.md) installs ZisK, its proving keys and the GPU runtime on such a
+machine. To turn the prover on, set `PROVER=on`
 in `.env` together with `VKEY_JSON`, `ELF_DIR` and `ZISK_HOME`, then run `./rollup init` and `./rollup up`. A local
 postgres container starts with it to hold the prover's history. Leave `PROVER` unset and none of this is rendered
 or started.
@@ -236,7 +238,43 @@ New chains start with no exit portal configured and an exit cap of zero, so exit
 can use the settlement client's `governance` example with `propose-exit-config` to set the portal,
 bridge program and cap.
 After at least one 172,800-slot challenge window, anyone can send `activate-exit-config`. A final root
-and a bridge program are also needed to release an exit. The devnet program set does not include a bridge yet.
+and a funded vault are also needed to release an exit. On devnet, exits are paid from the shared zk-bridge program
+listed in `programs.devnet.json`, out of your chain's own vault.
+
+## Your chain's vault
+
+Each chain has its own vault in the shared zk-bridge program, keyed by the settlement program and the chain id.
+Only the chain authority (your payer key) can create it, and only after `register`. A vault holds one token mint,
+chosen when it is created. A backed balance needs the wrapped SOL mint,
+`So11111111111111111111111111111111111111112`, which has 9 decimals.
+
+Run these from this directory, with your chain id from `rendered/chain-id.env` and your Solana RPC URL from `.env`.
+The first run compiles the client. `init-vault` and `fund` print what they would send and send nothing until you add
+`--confirm`.
+
+```sh
+cargo run -p zk-bridge-client --example vault --features devnet-driver -- init-vault \
+  --authority-keypair keys/payer.json \
+  --mint So11111111111111111111111111111111111111112 --mint-decimals 9 \
+  --settlement 8anSjJZu5vgfNbESPLoKudVBNEraDZASwKJnkDLTCaGo \
+  --bridge 27TbMDUyVynpFpqeKygpUMcDzWKHfW4k9aRN5yCysLEQ \
+  --chain-id <your chain id> --rpc-url <your Solana RPC URL>
+```
+
+`fund` moves the amount from the funding key's wrapped SOL token account (its associated token account for that
+mint), so wrap the SOL first, for example with `spl-token wrap`, which comes with the Solana CLI. For a backed
+balance, `--amount` is the lamport amount `init` printed. Anyone can fund a vault.
+
+```sh
+cargo run -p zk-bridge-client --example vault --features devnet-driver -- fund \
+  --payer-keypair keys/payer.json --amount <lamports> \
+  --settlement 8anSjJZu5vgfNbESPLoKudVBNEraDZASwKJnkDLTCaGo \
+  --bridge 27TbMDUyVynpFpqeKygpUMcDzWKHfW4k9aRN5yCysLEQ \
+  --chain-id <your chain id> --rpc-url <your Solana RPC URL>
+```
+
+`show-vault`, with the same `--settlement`, `--bridge`, `--chain-id` and `--rpc-url`, prints the vault and its
+balance.
 
 ## Key files
 
@@ -249,6 +287,10 @@ solana-keygen new -o keys/payer.json
 openssl rand -hex 32 > keys/sequencer.key
 sudo chgrp 999 keys/payer.json keys/sequencer.key && chmod 640 keys/payer.json keys/sequencer.key
 ```
+
+`solana-keygen` asks for an optional passphrase (press Enter for none; `--no-bip39-passphrase` skips the question),
+then prints the new public key and a recovery phrase. Keep the phrase private. It also refuses to overwrite an existing
+file.
 
 Fund the payer with about 6 devnet SOL, for example from [Solana's faucet](https://faucet.solana.com).
 The host also reads the payer key during `init` and `register`. `.gitignore` in this directory excludes `keys/`.
