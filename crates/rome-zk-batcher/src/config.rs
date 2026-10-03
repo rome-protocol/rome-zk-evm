@@ -195,17 +195,69 @@ fn default_compute_unit_limit() -> u32 {
 /// write-locks the fee payer, and Solana's cost accounting charges each writable account the tx's own *requested* limit
 /// plus its signature/write-lock/data/loaded-accounts terms (`tx_cost_units` above), capped at
 /// `MAX_WRITABLE_ACCOUNT_UNITS` CU per block (12,000,000 through agave 3.x, 24,000,000 on 4.x — see
-/// [`AgaveGeneration`]). Measured chunk-lane CU (combined 4-ix `Open`+`Write`+`Seal`+`SealLeaf`): 15.7k;
-/// `OpenBatch`+`GrowBatch(900)` 20.2k — 40,000 (≈2x the largest measured) at the design frame's own instruction-data
-/// size and write-lock count (`payer_cap_frames_per_sec(TARGET_AGAVE_GENERATION, 40_000,
-/// DESIGN_FRAME_WRITABLE_ACCOUNTS, design_frame_instruction_data_bytes(), 262_144, 1)`) clears **≈704 frames/s at
-/// [`AgaveGeneration::Pre4x`]'s 12,000,000 cap, ≈1,408 at [`AgaveGeneration::Agave4x`]'s 24,000,000** (corrected from
-/// an earlier ≈719/≈1,438 that charged the transaction's wire size instead of its instruction-data size) — this crate's
-/// own tests pin both numbers (see `payer_cap_frames_per_sec_pins_the_design_frames_cost_at_both_agave_generations`).
+/// [`AgaveGeneration`]).
+///
+/// **Why 100,000.** The program derives its addresses with a bump search, and every extra attempt costs compute
+/// units, fixed per address: 4,500 CU per extra attempt on the batch address in the open-and-grow transaction
+/// (`OpenBatch` and two `GrowBatch` derive it three times), and in a chunk transaction 1,500 CU per extra attempt
+/// on the batch address plus 3,000 CU per extra attempt on the chunk address. An attempt fails with probability one
+/// half, so the chance an address needs at least m extra attempts is 2^-m. The batch cursor cannot skip an id, so
+/// a transaction that cannot fit its limit stalls the chain at that id.
+/// Measured on the real compiled program under the devnet inbox and settlement program ids
+/// (`tests/bump_search_cu_limit.rs`): the open-and-grow transaction at 900 leaves costs 23,677 CU at best, 28,431 at
+/// the median, 41,958 at the 95th percentile and 55,431 at the worst of 256 batch ids; a chunk transaction with a
+/// full-size body costs 26,903 CU at the median and 50,903 at its worst of 900 slots. A chunk transaction costs about
+/// 16,400 CU before any extra attempt, so 100,000 holds it up to 83,600 CU of attempts: 27 extra chunk-address
+/// attempts on a batch address that needed none, 28 or more does not fit. About one frame in 270 million is that
+/// expensive at the cheapest batch address, and about one in 8 million when the batch address itself needed 10.
+/// Those frames do not stall: see `chunk_retry_compute_unit_limit`, which resends such a frame once at 400,000.
+///
+/// **Open-and-grow is not under this limit.** It is sent once per batch and has its own `open_compute_unit_limit`
+/// (default 400,000, room for 83 extra attempts). Two batch ids found by a wider scan cost 109,536 CU (274,100)
+/// and 132,063 CU (1,895,697), both over 100,000, which is why it cannot share the chunk limit.
+///
+/// **What is left.** An open-and-grow transaction stalls the chain only if the batch address needs 84 or more extra
+/// attempts, a chance of 2^-84 per batch id. A chunk frame fails after its one retry only if 1,500 CU times the
+/// batch-address attempts plus 3,000 CU times the chunk-address attempts exceeds 383,600 CU: 128 or more chunk
+/// attempts on a batch address that needed none, and still 87 or more on one that needed 83 (the most that
+/// can open). The chance is below 2^-86 per frame at every batch address that can open. These are very small
+/// numbers, not zero: this does not say no batch can ever stall, and the scans are the evidence for the measured
+/// figures, the 2^-m rule is the model for the rest. The tests fail if a rebuilt program moves the measured figures.
+///
+/// **What it costs.** The priority fee is the limit times the price per CU, charged on the limit rather than on what
+/// the transaction uses: 100,000 CU at the 1,000 micro-lamport starting price is 100 lamports a transaction, and at the
+/// 200,000 micro-lamport ceiling it is 20,000 lamports. The block cost cap also charges the limit, so at the design
+/// frame's own instruction-data size and write-lock count (`payer_cap_frames_per_sec(TARGET_AGAVE_GENERATION, 100_000,
+/// DESIGN_FRAME_WRITABLE_ACCOUNTS, design_frame_instruction_data_bytes(), 262_144, 1)`) the payer clears **about 292
+/// frames/s at [`AgaveGeneration::Pre4x`]'s 12,000,000 cap and about 585 at [`AgaveGeneration::Agave4x`]'s 24,000,000**
+/// — above the 90 frames/s that a 900-frame batch every 10 s needs. This crate's own tests pin both numbers (see
+/// `payer_cap_frames_per_sec_pins_the_design_frames_cost_at_both_agave_generations`). The earlier 40,000 allowed
+/// about 704 and 1,408.
+///
 /// `FinalizeBatch` keeps its own separate, much higher limit (`finalize_compute_unit_limit` below) — it is not part of
 /// the chunk lane and is sent once per batch, not once per frame.
 fn default_chunk_compute_unit_limit() -> u32 {
-    40_000
+    100_000
+}
+/// The open-and-grow transaction (`OpenBatch` plus the `GrowBatch` instructions a batch needs) has its own limit, one
+/// send per batch rather than one per frame, so a high limit costs almost nothing in block cost-cap terms (the payer
+/// cap is charged per frame on the chunk lane). Its cost is about 23,677 CU at best plus 4,500 CU for every extra bump
+/// attempt on the batch address (three derivations: `OpenBatch` and two `GrowBatch`), fixed per batch id. 400,000
+/// leaves room for 83 extra attempts; the chance an id needs at least m extra attempts is 2^-m, so a batch id fails
+/// to fit only at 84 or more attempts, a chance of 2^-84. The batch cursor cannot skip an id, so that id would stall
+/// the chain.
+fn default_open_compute_unit_limit() -> u32 {
+    400_000
+}
+/// A chunk-lane transaction that failed on chain for running out of compute units is resent once with this limit
+/// instead of failing the batch. A chunk transaction costs about 16,400 CU plus 1,500 per extra bump attempt on the
+/// batch address and 3,000 per extra attempt on the chunk address, fixed per slot, so the rare slot whose chunk
+/// address needs 28 or more extra attempts (on a batch address that needed none) does not fit the 100,000 base limit. The retry covers it without
+/// raising every frame's limit (the block cost cap charges each frame its limit). At 400,000 the retry fits about 127
+/// extra chunk-address attempts. Only that frame pays the higher limit, once; a frame that also fails at this limit
+/// fails the batch.
+fn default_chunk_retry_compute_unit_limit() -> u32 {
+    400_000
 }
 /// `FinalizeBatch` alone needs its own, much higher compute-unit limit than every other instruction this batcher sends
 /// (`OpenBatch`/`GrowBatch`/chunk `Open`+`Write`+`Seal`/`SealLeaf`, all cheap and covered by `compute_unit_limit`
@@ -321,6 +373,15 @@ pub struct Config {
     /// derivation.
     #[serde(default = "default_chunk_compute_unit_limit")]
     pub chunk_compute_unit_limit: u32,
+    /// The compute-unit limit of the open-and-grow transaction (`OpenBatch` plus `GrowBatch`), sent once per batch.
+    /// See `default_open_compute_unit_limit`'s own doc.
+    #[serde(default = "default_open_compute_unit_limit")]
+    pub open_compute_unit_limit: u32,
+    /// The limit a chunk-lane frame is resent with, once, when it ran out of compute units at
+    /// `chunk_compute_unit_limit`. A value not above `chunk_compute_unit_limit` turns the retry off. See
+    /// `default_chunk_retry_compute_unit_limit`'s own doc.
+    #[serde(default = "default_chunk_retry_compute_unit_limit")]
+    pub chunk_retry_compute_unit_limit: u32,
     #[serde(default = "default_finalize_compute_unit_limit")]
     pub finalize_compute_unit_limit: u32,
     /// The V1 header config mask's `loaded_accounts_data_size_limit`, shared by every tuning this binary
@@ -729,7 +790,9 @@ cluster = "devnet"
         assert_eq!(cfg.cluster, "devnet"); // the code default when the key is omitted — a label only
         assert_eq!(cfg.confirm_poll_interval_ms, 400);
         assert_eq!(cfg.compute_unit_limit, 200_000);
-        assert_eq!(cfg.chunk_compute_unit_limit, 40_000);
+        assert_eq!(cfg.chunk_compute_unit_limit, 100_000);
+        assert_eq!(cfg.open_compute_unit_limit, 400_000);
+        assert_eq!(cfg.chunk_retry_compute_unit_limit, 400_000);
         assert_eq!(cfg.finalize_compute_unit_limit, 600_000);
         assert_eq!(cfg.loaded_accounts_data_size_limit, 262_144);
         assert_eq!(cfg.batches_in_flight, 2);
@@ -882,9 +945,9 @@ cluster = "devnet"
     /// The payer-cap model must charge the transaction's real cost terms (signature, write-lock, instruction-data,
     /// loaded-accounts — `tx_cost_units`), parameterized by which `agave` generation's `MAX_WRITABLE_ACCOUNT_UNITS`
     /// applies, not just divide by `compute_unit_limit` alone — and the data term itself must be Σ instruction data ÷ 4
-    /// (agave's real divisor), never wire-size ÷ 140. Pinned against the design frame (40,000 CU, 3 write-locked
+    /// (agave's real divisor), never wire-size ÷ 140. Pinned against the design frame (100,000 CU, 3 write-locked
     /// accounts, its own real instruction-data byte sum from `plan_chunk`, the corrected 262,144-B loaded-accounts
-    /// limit): the re-derived figures are "≈704 frames/s at 12,000,000" (pre-4.x) and "≈1,408 at 24,000,000" (agave
+    /// limit): the re-derived figures are "≈292 frames/s at 12,000,000" (pre-4.x) and "≈585 at 24,000,000" (agave
     /// 4.x) — this test pins the formula's real output, not rounded prose (verify against the formula, never re-derive
     /// by eye).
     #[test]
@@ -902,8 +965,8 @@ cluster = "devnet"
             TXS_PER_FRAME,
         );
         assert!(
-            (700.0..710.0).contains(&pre4x_frames_per_sec),
-            "expected ≈704 frames/s at the pre-4.x 12,000,000 cap, got {pre4x_frames_per_sec}"
+            (290.0..295.0).contains(&pre4x_frames_per_sec),
+            "expected ≈292 frames/s at the pre-4.x 12,000,000 cap, got {pre4x_frames_per_sec}"
         );
 
         let agave4x_frames_per_sec = payer_cap_frames_per_sec(
@@ -915,8 +978,8 @@ cluster = "devnet"
             TXS_PER_FRAME,
         );
         assert!(
-            (1400.0..1415.0).contains(&agave4x_frames_per_sec),
-            "expected ≈1,408 frames/s at the agave-4.x 24,000,000 cap, got {agave4x_frames_per_sec}"
+            (582.0..588.0).contains(&agave4x_frames_per_sec),
+            "expected ≈585 frames/s at the agave-4.x 24,000,000 cap, got {agave4x_frames_per_sec}"
         );
         // Agave 4.x exactly doubles the cap, so the derived rate must double too (same per-tx cost either
         // way — only the block-wide budget changed).
@@ -925,11 +988,11 @@ cluster = "devnet"
     }
 
     /// Pins `tx_cost_units` itself against the design frame's own numbers (recomputed for
-    /// `Seal { len, body_hash }`): 40,000 (CU) +
+    /// `Seal { len, body_hash }`): 100,000 (CU) +
     /// 720 (one signature) + 300*3 (three write-locked accounts) + (3,776 instruction-data bytes / 4)
     /// (real Σ ix data from `plan_chunk` — Open 25 B + Write (9 + 3,700-B payload) + Seal 37 B (5 B
     /// `len` + 32 B `body_hash`) + SealLeaf 5 B = 3,776 B, 944 CU) + 8*ceil(262,144/32 KiB)
-    /// (loaded-accounts pages) = 42,628.
+    /// (loaded-accounts pages) = 102,628.
     #[test]
     fn tx_cost_units_pins_the_design_frames_terms() {
         let instruction_data_bytes = design_frame_instruction_data_bytes();
@@ -944,7 +1007,7 @@ cluster = "devnet"
             instruction_data_bytes,
             default_loaded_accounts_data_size_limit(),
         );
-        assert_eq!(cost, 42_628);
+        assert_eq!(cost, 102_628);
     }
 
     /// `FinalizeBatch` needs its own, higher CU limit than every

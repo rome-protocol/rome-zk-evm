@@ -185,8 +185,8 @@ layout 1 with `activation_slot <= slot` and not retired — covers a never-regis
 one, and one that activates in the future, each with its own reason string), `InboxNotFinalizedYet`
 (the batch PDA exists but is not yet finalized, or is absent while the cursor has not yet passed it —
 retry either way), `AbandonedInboxBatch` (the batch PDA is absent AND `cursor.next_batch >
-candidate_batch` in the SAME snapshot — the batcher's own `AbandonBatch` sweep already
-reclaimed it, this id will never be finalized; alarm and stop, never a chain write), and the
+candidate_batch` in the SAME snapshot — someone ran `AbandonBatch` for it (the batcher never does), this id
+will never be finalized; alarm and stop, never a chain write), and the
 settlement-program/`ProgramData`/`global_config` missing/mismatch refusals above.
 
 ## The poster (`poster` module)

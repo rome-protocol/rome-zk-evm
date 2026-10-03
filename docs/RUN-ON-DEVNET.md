@@ -37,7 +37,8 @@ Rome verified the program addresses and settlement settings on chain. The progra
 - An EVM address you control for the fee recipient (and, if you declare one, the backed balance).
 
 The steps below start the node without a prover. A full settlement setup also needs one NVIDIA GPU
-with more than 30 GB of memory and about 55 GB of proving keys on the host. The final proof step needs
+with more than 30 GB of memory and the ZisK proving keys on the host: about 41 GB to download, which grows to
+about 81 GB once installed (measured on a CPU host; a GPU host generates its own files, not measured yet). The final proof step needs
 about 30 GB of GPU memory; a 24 GB card is not enough. You also need a guest built for your chain's genesis.
 
 ## From clone to a running node
@@ -198,16 +199,24 @@ It covers `PROVER=on`, `VKEY_JSON`, `ELF_DIR`, `ZISK_HOME` and the proving-key h
 Budget about 6 SOL on the payer to start. The 5 SOL deposit is locked at registration. It is refundable
 to the chain authority once the chain has a final root or has posted ten roots. If the chain is reclaimed
 first, the deposit goes to the treasury. For your chain, the 0.001 SOL settlement fee is charged only
-when a proved root is posted, with 0 bps added. Without a prover, Solana transaction fees and rent still
-use the payer's SOL. Each batch the batcher posts creates inbox accounts, each locking at least about
-0.002 SOL in rent until a root covering the batch is final. Watch the payer balance on a busy chain.
+when a proved root is posted, with 0 bps added. The payer also covers Solana transaction fees and
+rent on inbox batch and chunk accounts. With a prover, it pays rent for each posted root's pending
+account too. For a posted batch, inbox rent can be reclaimed only after a root covering it is final.
+Nothing in `deploy/rollup` closes posted inbox accounts. The prover closes pending accounts only when
+`close_pending_after_batches` is set. Plan for rent to keep accumulating, with or without a prover.
+Watch the payer balance on a busy chain.
 Your node, RPC service and prover have their own running costs.
 
 ## Known limits
 
+- Never send `AbandonBatch` by hand for a batch that has not settled: it halts the chain. Settlement posts
+  exactly the next batch id and needs that id's batch finalized, and an abandoned id can be neither reopened
+  nor skipped. If the batcher stops mid-batch, just start it again: it finishes the open batch under the same
+  id. If it stops with `ResumeImpossible`, rerun it with the build and config that opened the batch.
 - Building a guest for your chain's genesis is not automated yet.
 - A new chain has no gas: its genesis has no balances, and deposits are not available yet. Until they are, it cannot send a transaction.
-- The prover needs one NVIDIA GPU with more than 30 GB of memory and about 55 GB of proving keys on the host.
+- The prover needs one NVIDIA GPU with more than 30 GB of memory and about 81 GB of disk for the installed ZisK
+  proving keys (about 41 GB downloaded; measured on a CPU host).
   The final proof step needs about 30 GB of GPU memory; a 24 GB card is not enough.
 - Exits are off on a new chain: it has no exit portal configured and its exit cap is zero. The chain
   authority can use the settlement client's `governance` example to send `propose-exit-config`.

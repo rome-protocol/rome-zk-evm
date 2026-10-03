@@ -4,6 +4,79 @@ This changelog describes the system as built on `main`, grouped by component. It
 release-tag cadence yet — see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for what each component does
 and how they fit together.
 
+## Withdrawals rule
+
+- `rome-zk-executor-api` gains `deposit_withdrawal(index, recipient, amount_gwei)`, `withdrawals_root(&[Withdrawal])`
+  and `canonical_header_rule_with_withdrawals(chain_id, number, fee_recipient, &[Withdrawal])`. They give the
+  sequencer, derive and the stateless validator one definition of a block's withdrawals and their root. The crate
+  now depends on `alloy-eips` and `alloy-trie` with default features off. `canonical_header_rule`,
+  `EMPTY_WITHDRAWALS` and `BlockEnv` are unchanged, and with an empty list the new rule is exactly the old one.
+
+## Batcher restart recovery
+
+- A restart no longer abandons a half-written batch. If the batcher stopped between `OpenBatch` and
+  `FinalizeBatch`, the old startup sent `AbandonBatch` for that id and posted the blocks again under a new
+  one. Settlement posts exactly the next batch id and needs that id's batch finalized, and an id the inbox
+  cursor has passed can never be opened again, so the chain stopped for good at the abandoned id. The startup
+  sweep and `ResumeAction::Abandon` are gone.
+- On start, the batcher now finishes each open, unfinalized batch in the pending window under its own id
+  (`recover.rs`, called from `pipeline::startup_recover`). It tries each possible last block, smallest first,
+  from the block after the previous batch up to `blocks_per_batch` blocks long, and keeps the first grouping
+  whose frames number exactly what the batch expects, whose frames already on chain match byte for byte, and
+  whose blocks pass derive's drift rule. It sends the missing frames, finalizes (continuing if finalize had
+  started), checks `acc` and hands the batch off. If every frame is already on chain it reads them back and
+  does not search. With a posting window deeper than one it resumes the batches in order.
+- If no grouping fits (the compressor version, frame size, `blocks_per_batch` or the log changed since the
+  crash), the batcher stops with the named error `ResumeImpossible { batch, leaves_present, expected_count }`,
+  sends nothing and leaves the batch open. Rerun with the build and config that opened it. The
+  `FinalizedAboveOpenBatch` refusal stays.
+- Running `AbandonBatch` by hand on a batch settlement still needs halts the chain. The batcher README and
+  the devnet guide now say so.
+- Tests: `tests/restart_mid_batch_keeps_settlement_live.rs` runs the real inbox and settlement programs
+  through a crash after one frame and a restart, and requires settlement's `PostRoot` for that id to succeed
+  with no `AbandonBatch` sent. The old tests that asserted the abandon behavior are removed.
+
+## reth-verifier: no peer discovery
+
+- The stock reth verifier in `deploy/rollup` now starts with `--disable-discovery --max-outbound-peers 0
+  --max-inbound-peers 0 --addr 127.0.0.1`. derive feeds it every block over the Engine API, so it never needs a peer; with discovery on
+  it joined the public Ethereum peer network and dialed hundreds of nodes, which cloud providers flag as cryptocurrency
+  activity. A test refuses a stock reth service without these flags or with a published devp2p port, and
+  `./rollup check` gains a `verifier peers` item that fails if the verifier has any peer.
+
+## Batcher compute-unit limits
+
+- The default `chunk_compute_unit_limit` is now 100,000 (it was 40,000), and the three shipped batcher
+  configs carry the same value. The inbox program derives addresses with a bump search, and every extra
+  attempt costs compute units, fixed per address: 4,500 CU per extra attempt on the batch address in the
+  open-and-grow transaction, and in a chunk transaction (about 16,400 CU before any extra attempt) 1,500 CU
+  per extra attempt on the batch address plus 3,000 CU per extra attempt on the chunk address. The chance
+  an address needs at least m extra attempts is 2^-m. The batch cursor cannot skip an id, so a transaction
+  that does not fit its limit stops the chain at that id. Measured on the compiled program with the devnet
+  program ids: open-and-grow at 900 leaves reached 55,431 CU over 256 batch ids (23,677 at best, 28,431 at
+  the median), and a full-body chunk transaction reached 50,903 CU over 900 slots (26,903 at the median).
+- New `open_compute_unit_limit` (default 400,000, set in the three shipped configs). The open-and-grow
+  transaction is sent once per batch, so it has its own limit instead of sharing the chunk limit: two batch
+  ids from a wider scan, 274,100 and 1,895,697, cost 109,536 and 132,063 CU, over 100,000. 400,000 leaves
+  room for 83 extra attempts on the batch address.
+- New `chunk_retry_compute_unit_limit` (default 400,000, set in the three shipped configs). A chunk-lane
+  frame that fails on chain for running out of compute units is resent once at this limit instead of failing
+  the batch (`Sender::send_and_confirm_many_retrying_compute`, with the retry inside `RpcSender`'s confirm
+  loop). Only that frame pays the higher limit. Setting it to the chunk limit or lower turns the retry off.
+- What is left: open-and-grow stops the chain only at 84 or more extra attempts on the batch address (2^-84 per
+  batch id); a frame fails after its retry only past 383,600 CU of attempts, which is 128 chunk-address attempts
+  on a batch address that needed none and 87 on one that needed 83 (below 2^-86 per frame). These are small
+  numbers, not zero.
+- Tests: `tests/bump_search_cu_limit.rs` scans those ids and slots, fails if the largest figure does not fit
+  its limit, measures open-and-grow at the two tail ids, and requires 40 extra attempts of headroom in the open
+  limit. `tests/chunk_compute_retry.rs` forces the retry on the real program. A batcher config test and the
+  deploy tests pin the limits the shipped configs carry.
+- Cost: the priority fee is the limit times the price, so a chunk transaction at the 1,000 micro-lamport
+  starting price pays 100 lamports. The block cost cap charges the limit too, and the payer's ceiling falls
+  from about 704 to about 292 frames per second at the 12,000,000 cap (1,408 to 585 at 24,000,000). A config
+  that sets `chunk_compute_unit_limit` itself keeps its value, and one that sets no `open_compute_unit_limit`
+  now sends open-and-grow at 400,000 instead of its chunk limit.
+
 ## Inbox accounts keyed by the settlement program
 
 - Node image `v0.1.2` carries this change; the devnet inbox and settlement programs run it. A node on an

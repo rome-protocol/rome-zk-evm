@@ -3,7 +3,7 @@
 //! pattern this crate's own `anchor.rs`/`resolve.rs` unit tests already use, applied here across BOTH
 //! seams together (a single fake models enough of the inbox program's own state machine — `OpenBatch`,
 //! chunk `Open`+`Write`+`Seal`+`SealLeaf`, `FinalizeBatch`, `AbandonBatch`, chunk `Close` — to drive
-//! `WindowedPoster` and `abandon_open_batches_in_pending_window` for real, decoding every instruction this
+//! `WindowedPoster` and the startup recovery for real, decoding every instruction this
 //! crate's own production code actually sends via `zk_inbox_client::decode_instruction`).
 
 use rome_zk_batcher::channel::Block;
@@ -181,10 +181,6 @@ impl FakeChain {
             .iter()
             .filter(|(b, _)| *b == batch)
             .count()
-    }
-
-    fn cursor_next_batch(&self) -> u64 {
-        self.0.lock().unwrap().next_batch
     }
 
     fn encode_batch_account(&self, batch: u64, b: &FakeBatchState) -> Vec<u8> {
@@ -497,6 +493,8 @@ fn window_config(batches_in_flight: usize) -> WindowConfig {
         chain_id: CHAIN_ID,
         max_frame_body_len: 3_200,
         chunk_tuning: tuning(),
+        open_tuning: tuning(),
+        chunk_retry_compute_unit_limit: 400_000,
         finalize_tuning: tuning(),
         finalize_poll_interval: Duration::from_millis(1),
         finalize_max_polls: 200,
@@ -674,62 +672,6 @@ async fn the_post_root_sink_receives_batch_n_before_batch_n_plus_1() {
     gate0.notify_one();
     poster.finish().await.expect("both batches must settle");
     assert_eq!(sink.order(), vec![0, 1]);
-}
-
-// ===================== startup sweep abandons every open batch in the pending window =====================
-
-/// Sweeping only `next_batch - 1` (as the sweep once did) makes this test fail —
-/// batch `k` sits at `next_batch - 2` here and would never be reached.
-#[tokio::test]
-async fn startup_sweep_abandons_every_open_batch_in_the_pending_window_not_only_the_last() {
-    let chain = FakeChain::default();
-    let k = 5u64;
-    chain.seed_finalized(k - 1); // head_final_batch's own batch — already settled, untouched.
-    chain.seed_open_not_finalized(k, 3);
-    chain.seed_open_not_finalized(k + 1, 2);
-    chain.set_cursor(k + 2);
-    chain.set_head_final_batch(k - 1);
-
-    let abandoned = pipeline::abandon_open_batches_in_pending_window(
-        &chain,
-        &chain,
-        &PROGRAM,
-        &SETTLEMENT_PROGRAM,
-        CHAIN_ID,
-        Pubkey::new_unique(),
-        tuning(),
-    )
-    .await
-    .expect("the sweep must succeed");
-
-    assert_eq!(
-        abandoned,
-        vec![k, k + 1],
-        "exactly batches k and k+1 must be abandoned, in ascending order"
-    );
-    assert!(!chain.batch_exists(k) && !chain.batch_exists(k + 1));
-    assert!(
-        !chain.any_chunk_pda_left_for(k) && !chain.any_chunk_pda_left_for(k + 1),
-        "every chunk PDA under both abandoned batches must be closed"
-    );
-    assert!(
-        chain.batch_exists(k - 1),
-        "the already-finalized batch at head_final_batch must be left alone"
-    );
-    assert_eq!(
-        chain.abandon_order(),
-        vec![k, k + 1],
-        "the fake's own recorded AbandonBatch order must match the sweep's own returned order"
-    );
-    assert_eq!(
-        chain.cursor_next_batch(),
-        k + 2,
-        "AbandonBatch must never touch the cursor — the next real post still lands at k+2"
-    );
-
-    // `resolve_anchor`'s own caller-ordering guard must now find a clean state — an OpenNotFinalized batch
-    // anywhere in the walk after the sweep ran would be this exact bug, caught by the existing regression
-    // test in `anchor.rs` (`an_open_not_finalized_batch_in_the_walk_is_a_named_caller_ordering_error`).
 }
 
 /// The pre-existing regression test in `anchor.rs` pins the OTHER half of this contract (an
@@ -1173,19 +1115,18 @@ async fn a_failed_batch_n_never_lets_batch_n_plus_1_finalize() {
     );
     assert!(
         chain.batch_exists(1),
-        "batch 1 stays open-not-finalized for the startup sweep to abandon"
+        "batch 1 stays open-not-finalized; the next start finishes it"
     );
 }
 
 /// Defense in depth: where `FinalizeBatch` is permissionless on chain (a program version from before the
 /// authority gate), a third party can finalize N+1 while our N is open-not-finalized — the normal steady
-/// state under the window. If the sweep then abandoned N, the anchor walk would anchor at N+1 and N's
-/// blocks would never be re-posted (a permanent DA hole derive halts on). The sweep must refuse by name and
+/// state under the window. Finishing N then could not keep the log contiguous, and abandoning it would
+/// strand its blocks (a permanent DA hole derive halts on). Startup must refuse by name and
 /// send NO `AbandonBatch`, leaving the state repairable (the authority can still finalize N once its
 /// leaves are complete). The core fix is the authority-gated `FinalizeBatch` program change.
 #[tokio::test]
-async fn startup_sweep_refuses_and_abandons_nothing_when_a_finalized_batch_sits_above_an_open_one()
-{
+async fn startup_refuses_and_sends_nothing_when_a_finalized_batch_sits_above_an_open_one() {
     let chain = FakeChain::default();
     let k = 5u64;
     chain.seed_finalized(k - 1);
@@ -1194,24 +1135,29 @@ async fn startup_sweep_refuses_and_abandons_nothing_when_a_finalized_batch_sits_
     chain.set_cursor(k + 2);
     chain.set_head_final_batch(k - 1);
 
-    let err = pipeline::abandon_open_batches_in_pending_window(
+    let log_dir = tempfile::tempdir().unwrap();
+    let cfg = window_config(2);
+    let err = pipeline::startup_recover(
         &chain,
         &chain,
-        &PROGRAM,
-        &SETTLEMENT_PROGRAM,
-        CHAIN_ID,
-        Pubkey::new_unique(),
-        tuning(),
+        &Metrics::new(),
+        &RecordingSink::default(),
+        &pipeline::StartupRecover {
+            window: &cfg,
+            log_dir: log_dir.path(),
+            sub_blocks_per_block: 1,
+            block_gas_limit: 1_000_000,
+            blocks_per_batch: 10,
+        },
     )
     .await
-    .expect_err(
-        "a finalized batch above an open one must be refused, never repaired by abandoning",
-    );
+    .expect_err("a finalized batch above an open one must be refused, never repaired");
     eprintln!("expected refusal: {err}");
     assert!(
         matches!(
-            err,
-            PipelineError::FinalizedAboveOpenBatch { open, finalized } if open == k && finalized == k + 1
+            &err,
+            pipeline::StartupError::Recover(PipelineError::FinalizedAboveOpenBatch { open, finalized })
+                if *open == k && *finalized == k + 1
         ),
         "the refusal must name both ids, got: {err}"
     );

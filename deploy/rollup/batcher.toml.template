@@ -16,7 +16,12 @@ signature_status_batch_size = 256
 priority_fee_micro_lamports = 1000
 max_priority_fee_micro_lamports = 200_000
 compute_unit_limit = 200_000
-chunk_compute_unit_limit = 40_000
+# 100,000 covers the worst bump search measured; the priority fee is this limit x the price.
+chunk_compute_unit_limit = 100_000
+# The open-and-grow transaction has its own limit (one per batch): 23,677 CU plus 4,500 per extra bump attempt on the batch address.
+open_compute_unit_limit = 400_000
+# A frame that runs out of compute units at the limit above is resent once at this one, instead of failing the batch.
+chunk_retry_compute_unit_limit = 400_000
 loaded_accounts_data_size_limit = 262_144
 finalize_compute_unit_limit = 600_000
 confirm_timeout_secs = 60

@@ -1,8 +1,9 @@
-//! Stateless resume (batch ids are never reused): on start, the batcher has no local
-//! durable state of its own — it decides where to continue purely from what the inbox program's on-chain
-//! batch accounts say. `batch` ids are a plain monotonically-increasing counter this process assigns
-//! (unrelated to block numbers); a given consecutive block range is retried under a fresh, never-reused
-//! id if its first attempt is abandoned.
+//! Stateless resume: on start, the batcher has no local durable state of its own — it decides where to
+//! continue purely from what the inbox program's on-chain batch accounts say. `batch` ids are a plain
+//! monotonically-increasing counter this process assigns (unrelated to block numbers). An id is never
+//! burned: a batch left half written by a crash is FINISHED under the same id by the next start
+//! (`recover.rs`), because settlement posts exactly `head_pending_batch + 1` and an id the inbox cursor
+//! has passed can never be opened again.
 //!
 //! This module is the pure decision table only — no RPC calls, no I/O. `pipeline.rs` supplies the
 //! on-chain state (via `zk_inbox_client::decode_batch_account`, or a fake in tests) and drives the loop
@@ -13,16 +14,12 @@
 /// [`zk_inbox_client::decode_batch_account`]'s output (or a fake state in tests).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchAccountState {
-    /// No account exists at this batch id's PDA yet — never opened, or previously `AbandonBatch`ed.
+    /// No account exists at this batch id's PDA yet — never opened (or abandoned by hand).
     Missing,
     /// The account exists, is not yet finalized: some (possibly zero) leaves sealed, but
-    /// `leaves_present < expected_count`. A stateless batcher restarting here cannot tell whether the
-    /// missing leaves are simply still in flight (a live process would just keep sending them) or the
-    /// process that opened this batch died before finishing — since it cannot distinguish the two safely,
-    /// it always treats a not-yet-finalized batch found at startup as abandoned (batch ids
-    /// are cheap, chunk rent is reclaimed by `Close`/`AbandonBatch`, so preferring safety over reusing a
-    /// possibly-still-live batch is the correct default for a *resume* — not for a *live* pipeline run,
-    /// which tracks its own in-flight state directly and never needs this decision at all).
+    /// `leaves_present < expected_count`. Either a live process is still sending the missing leaves, or the
+    /// process that opened this batch died; a stateless batcher restarting here treats it as the latter and
+    /// finishes it under the same id (`recover.rs`), never abandoning it.
     OpenNotFinalized {
         leaves_present: u32,
         expected_count: u32,
@@ -37,9 +34,9 @@ pub enum ResumeAction {
     /// Nothing exists here yet: this is the resume point — `OpenBatch` and post the next unposted block
     /// range under this id.
     PostFresh,
-    /// A previous attempt died mid-post: `AbandonBatch` this id (reclaiming its rent) and retry the same
-    /// block range under the next id, never reusing this one.
-    Abandon,
+    /// A previous attempt died mid-post: finish this same id (`recover.rs` searches for the grouping that
+    /// matches what is on chain, sends the missing frames and finalizes). The id is never abandoned.
+    ResumeOpen,
     /// Already finalized on chain, but this session has not yet handed it to the `PostRootSink` — verify
     /// `acc` against the client-side reference and publish, without resending any chunk transaction, then
     /// continue scanning at the next batch id.
@@ -59,7 +56,7 @@ pub enum ResumeAction {
 pub fn decide(state: BatchAccountState, already_handed_off: bool) -> ResumeAction {
     match state {
         BatchAccountState::Missing => ResumeAction::PostFresh,
-        BatchAccountState::OpenNotFinalized { .. } => ResumeAction::Abandon,
+        BatchAccountState::OpenNotFinalized { .. } => ResumeAction::ResumeOpen,
         BatchAccountState::Finalized => {
             if already_handed_off {
                 ResumeAction::Advance
@@ -71,7 +68,7 @@ pub fn decide(state: BatchAccountState, already_handed_off: bool) -> ResumeActio
 }
 
 /// Scans batch ids `starting_at, starting_at + 1, ...` (via `probe`, which returns this id's on-chain
-/// state) until it finds the first [`ResumeAction::PostFresh`] or [`ResumeAction::Abandon`] id — the
+/// state) until it finds the first [`ResumeAction::PostFresh`] or [`ResumeAction::ResumeOpen`] id — the
 /// point production should actually resume at. Every `Finalized` id walked past along the way is reported
 /// via `on_finalized` (so the caller can hand it off to the `PostRootSink`) before scanning continues.
 ///
@@ -93,10 +90,10 @@ pub fn find_resume_point(
                     action: ResumeAction::PostFresh,
                 }
             }
-            ResumeAction::Abandon => {
+            ResumeAction::ResumeOpen => {
                 return ResumePoint {
                     batch,
-                    action: ResumeAction::Abandon,
+                    action: ResumeAction::ResumeOpen,
                 }
             }
             ResumeAction::HandOffOnly => {
@@ -113,7 +110,7 @@ pub fn find_resume_point(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResumePoint {
     pub batch: u64,
-    /// Always [`ResumeAction::PostFresh`] or [`ResumeAction::Abandon`] — see [`find_resume_point`]'s doc.
+    /// Always [`ResumeAction::PostFresh`] or [`ResumeAction::ResumeOpen`] — see [`find_resume_point`]'s doc.
     pub action: ResumeAction,
 }
 
@@ -141,8 +138,8 @@ mod tests {
             leaves_present: 3,
             expected_count: 10,
         };
-        assert_eq!(decide(half, false), ResumeAction::Abandon);
-        assert_eq!(decide(half, true), ResumeAction::Abandon);
+        assert_eq!(decide(half, false), ResumeAction::ResumeOpen);
+        assert_eq!(decide(half, true), ResumeAction::ResumeOpen);
     }
 
     #[test]
@@ -204,7 +201,7 @@ mod tests {
         assert_eq!(handed_off, vec![0, 1, 2]);
     }
 
-    /// A half-written batch stops the scan immediately with `Abandon`, without walking past it (nothing
+    /// A half-written batch stops the scan immediately with `ResumeOpen`, without walking past it (nothing
     /// after an unfinished batch can be trusted, by construction — the scan never even probes batch+1).
     #[test]
     fn find_resume_point_stops_at_a_half_written_batch() {
@@ -228,7 +225,7 @@ mod tests {
             rp,
             ResumePoint {
                 batch: 5,
-                action: ResumeAction::Abandon
+                action: ResumeAction::ResumeOpen
             }
         );
         assert_eq!(probed, vec![5], "must not probe beyond the abandoned id");

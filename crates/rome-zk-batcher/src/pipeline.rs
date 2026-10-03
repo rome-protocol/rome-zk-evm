@@ -32,7 +32,6 @@ use crate::channel::{self, Block, Frame, FRAME_HEADER_LEN};
 use crate::grouping::{CloseReason, PushOutcome, SizeCappedGrouper};
 use crate::metrics::Metrics;
 use crate::resolve::{self, AccountOps, ResolveError, ResolveOutcome};
-use crate::resume::BatchAccountState;
 use crate::sender::{FramePlan, SendTuning, Sender, SenderError};
 use crate::sink::{FinalizedBatch, PostRootSink};
 
@@ -66,6 +65,23 @@ pub enum PipelineError {
         on_chain: [u8; 32],
         expected: [u8; 32],
     },
+    /// The startup resume found no way to finish batch `batch`: no grouping of the blocks in the log
+    /// reproduces its present leaves under the configured frame size and drift bound (the zstd version, the
+    /// frame size, `blocks_per_batch` or the log changed since the crash). Nothing was sent and nothing was
+    /// abandoned; the chain waits for this id, so rerun with the build and config that opened it.
+    #[error(
+        "cannot resume batch {batch}: no grouping of the blocks in the log matches its {leaves_present} \
+         present leaf(s) of {expected_count} under the configured frame size, blocks_per_batch and drift \
+         bound — sent nothing, abandoned nothing; rerun with the build and config that opened it"
+    )]
+    ResumeImpossible {
+        batch: u64,
+        leaves_present: u32,
+        expected_count: u32,
+    },
+    /// Reading what the startup resume needs (the batch's chunks, or the ordered log) failed.
+    #[error("startup resume of batch {batch}: {reason}")]
+    ResumeRead { batch: u64, reason: String },
     #[error("batch {batch}'s account is missing while polling it for finalize progress")]
     BatchVanished { batch: u64 },
     #[error("decoding the settlement root account: {0}")]
@@ -78,25 +94,22 @@ pub enum PipelineError {
     /// The batch immediately before this one in the window failed (or vanished)
     /// before it finalized and signalled — this batch must not `FinalizeBatch` either, or an abandoned N
     /// beside a finalized N+1 re-posts N's blocks under a later id at the next start and derive meets
-    /// block heights out of order. Left open-not-finalized for the startup sweep to abandon.
+    /// block heights out of order. Left open-not-finalized; the next start resumes it.
     #[error(
         "batch {batch}: the previous batch in this posting window failed before it finalized — refusing \
-         to FinalizeBatch out of order (it will be abandoned at the next start)"
+         to FinalizeBatch out of order (the next start resumes it)"
     )]
     PreviousBatchFailed { batch: u64 },
-    /// Defense-in-depth: the core fix is the authority-gated `FinalizeBatch` program change
-    /// (a third party can no longer finalize batch N+1 while our N is still open — the on-chain check
-    /// makes it unconstructable, not merely detected). This refusal stays as a belt-and-braces guard for
-    /// any batch id opened under a chain's program version from before that upgrade landed (or, on a
-    /// chain mid-upgrade, an in-flight batch straddling the boundary): if a `Finalized` id is ever found
-    /// above an `OpenNotFinalized` one in the pending window regardless, abandoning the open one would let
-    /// the anchor walk past it and its blocks would never be re-posted — a permanent DA hole. The sweep
-    /// refuses instead and sends nothing; the state stays repairable (the authority can still finalize the
-    /// open batch once its leaves are complete).
+    /// Defense-in-depth: `FinalizeBatch` is authority-gated on chain, so a third party can no longer finalize
+    /// batch N+1 while N is still open. This refusal stays for any batch opened under a program version from
+    /// before that gate (or straddling an upgrade): a `Finalized` id above an open-not-finalized one in the
+    /// pending window means the open one's blocks sit before blocks already finalized. The startup resume
+    /// refuses and sends nothing; the state stays repairable (the authority can finalize the open batch once
+    /// its leaves are complete).
     #[error(
-        "startup sweep: batch {finalized} is finalized above open-not-finalized batch {open} in the pending \
-         window — abandoning {open} would strand its blocks (its id can never be re-used and the anchor \
-         would skip past it); refusing to post. Finalize batch {open} (or repair by hand) and restart"
+        "startup: batch {finalized} is finalized above open-not-finalized batch {open} in the pending \
+         window — refusing to resume {open} out of order and sending nothing. Finalize batch {open} (or \
+         repair by hand) and restart"
     )]
     FinalizedAboveOpenBatch { open: u64, finalized: u64 },
     /// A continuity break in the log (a missing block, or a single block that alone exceeds the frame
@@ -207,176 +220,59 @@ pub async fn open_and_grow_batch<S: Sender>(
     Ok(sender.send_and_confirm(&ixs, tuning).await?)
 }
 
-/// At startup, the authority abandons **every**
-/// open-not-finalized batch in the pending window `[root.head_final_batch, cursor.next_batch)` — not only
-/// `next_batch - 1` (the original single-batch case). With a bounded posting window
-/// (`batches_in_flight > 1`) a crash can leave more than one batch open-not-finalized at once (e.g. batch N
-/// crashed mid-chunk while N+1 had already been `OpenBatch`'d): a stateless batcher cannot tell "still
-/// safely live" from "abandoned mid-flight" (`resume.rs`'s own module doc on
-/// `BatchAccountState::OpenNotFinalized`), so it never guesses — every batch in the window that is not
-/// already `Finalized` (DA-complete, just not yet settled — left alone for the settlement/prover side to
-/// catch up on) or `Missing` (already cleaned up, or never opened) is `AbandonBatch`'d and its chunk PDAs
-/// closed, in ascending batch-id order, before this process posts anything new. The on-chain chain-anchor
-/// resolution ([`crate::anchor::resolve_anchor`]) then sees a clean `Missing`/`Finalized` state throughout
-/// the window instead of a half-written batch this same restart would otherwise have to reason about.
-///
-/// **The lower bound is inclusive of `head_final_batch` itself.** Batch ids
-/// are 1-based per chain, 0 is the sentinel everywhere — so `head_final_batch == 0` (`InitChain`'s own
-/// initial value) unambiguously means "nothing has settled yet"; real batch 0 never exists to be
-/// confused with it (the old sentinel ambiguity this window used to have to reason about, the same
-/// one `resolve_anchor`'s own rows document, no longer arises). `head_final_batch` also tracks the
-/// SETTLEMENT side's own progress, not DA completion — a batch can be DA-`Finalized` long before
-/// settlement catches up to it — so it is kept inclusive anyway as defense in depth (a chain still on
-/// tooling that predates 1-based batch ids is still probed, never assumed safe to skip). Including it costs one
-/// extra, harmless account read either way: a genuinely settled/finalized batch there reads back
-/// `Finalized` (skipped, as always) or `Missing` (already closed, or never opened, skipped); only a batch
-/// that is actually `OpenNotFinalized` there is ever abandoned.
-/// Returns every batch id abandoned, in ascending order (empty if there was nothing to do).
-pub async fn abandon_open_batches_in_pending_window<A: AccountOps, S: Sender>(
-    accounts: &A,
-    sender: &S,
-    inbox_program_id: &Pubkey,
-    settlement_program_id: &Pubkey,
-    chain_id: u64,
-    payer_pubkey: Pubkey,
-    tuning: SendTuning,
-) -> Result<Vec<u64>, PipelineError> {
-    let (cursor_pda, _) =
-        zk_inbox_client::cursor_pda(inbox_program_id, settlement_program_id, chain_id);
-    let next_batch = match accounts.get_account(&cursor_pda).await? {
-        None => return Ok(Vec::new()), // InitBatchCursor never run for this chain — nothing to abandon.
-        Some(data) => zk_inbox_client::decode_batch_cursor(&data)?.next_batch,
-    };
-
-    let (root_pda, _) = zk_settlement_client::root_pda(settlement_program_id, chain_id);
-    let head_final_batch = match accounts.get_account(&root_pda).await? {
-        None => 0,
-        Some(data) => zk_settlement_client::decode_root_account(&data)?.head_final_batch,
-    };
-
-    // While no batch has settled, `head_final_batch` stays 0, so this window can span every batch the
-    // chain has ever opened — probing it one `get_account` per id would be thousands of sequential round
-    // trips against a rate-limited RPC on every restart. Paged, at the same page size the chain-anchor
-    // walk already uses (`resolve::PROBE_PAGE_SIZE` / `anchor::ANCHOR_WALK_PAGE_SIZE`, one shared home —
-    // `resolve::probe_batch_states_paged`), never one-at-a-time.
-    let ids: Vec<u64> = (head_final_batch..next_batch).collect();
-    let states = resolve::probe_batch_states_paged(
-        accounts,
-        inbox_program_id,
-        settlement_program_id,
-        chain_id,
-        &ids,
-    )
-    .await?;
-
-    // Defense-in-depth: FinalizeBatch is authority-gated on chain now, so this shape can no
-    // longer arise from a third party — only ever from this same chain's own authority (e.g. a program
-    // upgraded mid-flight, or a batch opened under an older program version). A Finalized id ABOVE an
-    // OpenNotFinalized one still means abandoning the open one would strand its blocks forever — refuse
-    // by name, send nothing, leave the state repairable.
-    let highest_finalized = ids
-        .iter()
-        .zip(&states)
-        .filter(|(_, st)| matches!(st, BatchAccountState::Finalized))
-        .map(|(&b, _)| b)
-        .max();
-    if let Some(finalized) = highest_finalized {
-        if let Some((&open, _)) = ids.iter().zip(&states).find(|(&b, st)| {
-            b < finalized && matches!(st, BatchAccountState::OpenNotFinalized { .. })
-        }) {
-            return Err(PipelineError::FinalizedAboveOpenBatch { open, finalized });
-        }
-    }
-
-    let mut abandoned = Vec::new();
-    for (batch, state) in ids.into_iter().zip(states) {
-        let expected_count = match state {
-            // Already abandoned by an earlier restart, or never opened.
-            BatchAccountState::Missing => continue,
-            // DA-complete, just not yet settled (settlement/prover side is behind, or the batch is simply
-            // waiting its turn) — left alone; the settlement side catches up on its own.
-            BatchAccountState::Finalized => continue,
-            BatchAccountState::OpenNotFinalized { expected_count, .. } => expected_count,
-        };
-
-        tracing::warn!(
-            "batch {batch} (in the pending window (head_final_batch={head_final_batch}, \
-             next_batch={next_batch})) is open-not-finalized at startup — abandoning it and closing its \
-             chunk PDAs before posting anything"
-        );
-        let abandon_ix = zk_inbox_client::abandon_batch_ix(
-            inbox_program_id,
-            &payer_pubkey,
-            settlement_program_id,
-            chain_id,
-            batch,
-        );
-        sender
-            .send_and_confirm(std::slice::from_ref(&abandon_ix), tuning)
-            .await?;
-
-        if expected_count > 0 {
-            let chunk_pdas: Vec<Pubkey> = (0..expected_count)
-                .map(|idx| {
-                    zk_inbox_client::chunk_pda(
-                        inbox_program_id,
-                        settlement_program_id,
-                        chain_id,
-                        batch,
-                        idx,
-                    )
-                    .0
-                })
-                .collect();
-            let exists = accounts.accounts_exist(&chunk_pdas).await?;
-            let existing_idxs: Vec<u32> = exists
-                .into_iter()
-                .enumerate()
-                .filter_map(|(idx, exists)| exists.then_some(idx as u32))
-                .collect();
-            // `Close` is cheap (a lamport move + a realloc(0), never
-            // proportional to a batch's own leaf count — `programs/zk-inbox/src/lib.rs`'s `Close` arm), so
-            // several ride in one transaction — packing `CLOSE_IXS_PER_TX` at a time cuts a real, abandoned
-            // 900-chunk batch's restart cost from ~900 sequential confirmations to ~225. Each `Close` derives
-            // its chunk, batch and root addresses from the chain's settlement program, so one `Close` costs
-            // about half of `chunk_compute_unit_limit` and four do not fit under a single one of them: a
-            // packed group asks for one `chunk_compute_unit_limit` per `Close` (measured in
-            // `tests/abandon_cu_limit.rs`).
-            for group in existing_idxs.chunks(CLOSE_IXS_PER_TX) {
-                let group_tuning = SendTuning {
-                    compute_unit_limit: tuning
-                        .compute_unit_limit
-                        .saturating_mul(group.len() as u32),
-                    ..tuning
-                };
-                let close_ixs: Vec<Instruction> = group
-                    .iter()
-                    .map(|&idx| {
-                        zk_inbox_client::close_chunk_ix(
-                            inbox_program_id,
-                            &payer_pubkey,
-                            settlement_program_id,
-                            chain_id,
-                            batch,
-                            idx,
-                        )
-                    })
-                    .collect();
-                sender.send_and_confirm(&close_ixs, group_tuning).await?;
-            }
-        }
-        abandoned.push(batch);
-    }
-    Ok(abandoned)
+/// Everything the startup recovery needs: the posting window's own configuration (programs, payer, chain,
+/// frame size, the send and finalize tuning, the posting-window depth) plus where the ordered log is and how
+/// it groups. The binary and the tests build it the same way.
+#[derive(Clone, Copy)]
+pub struct StartupRecover<'a> {
+    pub window: &'a WindowConfig,
+    pub log_dir: &'a std::path::Path,
+    pub sub_blocks_per_block: u16,
+    pub block_gas_limit: u64,
+    /// `profile.blocks_per_batch`: the resume search tries every group end up to this many blocks long.
+    pub blocks_per_batch: u64,
 }
 
-/// How many chunk `Close` instructions ride in one transaction during the startup
-/// abandon (`abandon_open_batches_in_pending_window`) — a conservative factor given each group's compute
-/// budget of one `chunk_compute_unit_limit` per `Close` (measured per-`Close` cost,
-/// `tests/abandon_cu_limit.rs`), not the account-list ceiling (each `Close`
-/// only adds one unique writable account — the chunk PDA — atop the shared signer/batch/root triple, so
-/// Solana's 64-account-per-transaction limit is nowhere close to binding at this count).
-pub const CLOSE_IXS_PER_TX: usize = 4;
+#[derive(Debug, thiserror::Error)]
+pub enum StartupError {
+    #[error("recovering open batches in the pending window at startup failed: {0}")]
+    Recover(#[from] PipelineError),
+    #[error("failed to resolve the resume anchor: {0}")]
+    Anchor(#[from] crate::anchor::AnchorError),
+}
+
+/// The batcher's whole startup recovery, in one place so a test can drive it exactly as a restarted
+/// process does: first FINISH every open-not-finalized batch in the pending window (never abandon one: an
+/// id the cursor has passed can never be opened again, and settlement still needs it — see
+/// [`crate::recover`]), then resolve the on-chain anchor both modes resume from. The binary calls this
+/// once, before the run loop starts. Finished batches are handed to `sink` like any other.
+pub async fn startup_recover<A: AccountOps, S: Sender>(
+    accounts: &A,
+    sender: &S,
+    metrics: &Metrics,
+    sink: &dyn PostRootSink,
+    cfg: &StartupRecover<'_>,
+) -> Result<crate::anchor::Anchor, StartupError> {
+    let resumed = crate::recover::resume_open_batches(accounts, sender, metrics, sink, cfg).await?;
+    if !resumed.is_empty() {
+        tracing::info!(
+            "finished {} open batch(es) at startup: {resumed:?}",
+            resumed.len()
+        );
+    }
+
+    let w = cfg.window;
+    Ok(crate::anchor::resolve_anchor(
+        accounts,
+        &w.inbox_program_id,
+        &w.settlement_program_id,
+        w.chain_id,
+        cfg.log_dir,
+        cfg.sub_blocks_per_block,
+        cfg.block_gas_limit,
+    )
+    .await?)
+}
 
 /// Builds one frame's whole on-chain plan: `Open` + a single `Write` of the frame's
 /// entire body (≤ 3,681 B, well inside the V1 envelope — see `sender.rs`'s own size-proof test) + `Seal` +
@@ -594,7 +490,9 @@ pub async fn finalize_and_verify<S: Sender, A: AccountOps>(
     // (`idx ‖ hash`, not `keccak(body)`) — comparing that to `keccak(frame.to_bytes())` here would refuse a perfectly
     // correct, already-finalized batch. `verify_acc` (called separately by the caller once this function returns) is
     // the content check on that case.
-    if !decoded.finalized {
+    // A finalize that has already started (`finalize_cursor > 0`, only ever from an earlier resumable step) has
+    // transformed some leaves in place; the startup resume verifies those in their transformed form itself.
+    if !decoded.finalized && decoded.finalize_cursor == 0 {
         if let Err(e) = verify_presealed_leaves(&data, decoded.expected_count, frames) {
             metrics.batches_failed_total.inc();
             return Err(e);
@@ -828,6 +726,10 @@ pub struct WindowConfig {
     pub chain_id: u64,
     pub max_frame_body_len: usize,
     pub chunk_tuning: SendTuning,
+    /// The open-and-grow transaction's own tuning (its compute-unit limit is `open_compute_unit_limit`).
+    pub open_tuning: SendTuning,
+    /// A chunk-lane frame that runs out of compute units at `chunk_tuning`'s limit is resent once at this one.
+    pub chunk_retry_compute_unit_limit: u32,
     pub finalize_tuning: SendTuning,
     pub finalize_poll_interval: Duration,
     pub finalize_max_polls: u32,
@@ -1028,7 +930,7 @@ impl<S: Sender + 'static, A: AccountOps + 'static> WindowedPoster<S, A> {
             self.sender.as_ref(),
             target,
             frames.len() as u32,
-            self.cfg.chunk_tuning,
+            self.cfg.open_tuning,
         )
         .await?;
         self.metrics
@@ -1251,9 +1153,10 @@ async fn settle_one_batch<S: Sender, A: AccountOps>(
 ) -> Result<u64, PipelineError> {
     let frame_jobs = build_frame_jobs(target, &frames);
     let outcome = sender
-        .send_and_confirm_many(
+        .send_and_confirm_many_retrying_compute(
             &frame_jobs,
             cfg.chunk_tuning,
+            cfg.chunk_retry_compute_unit_limit,
             cfg.in_flight_frames,
             cfg.confirm_poll_interval,
             cfg.signature_status_batch_size,
@@ -1271,8 +1174,8 @@ async fn settle_one_batch<S: Sender, A: AccountOps>(
 
     // `FinalizeBatch(N+1)` only after `FinalizeBatch(N)` confirmed AND N's hand-off is done.
     // A dropped sender means N failed (or its task vanished) BEFORE it signalled: that is not
-    // "go" — finalizing N+1 beside an N the next start will abandon re-posts N's blocks under a later id
-    // and derive meets heights out of order. This batch stays open-not-finalized for the startup sweep;
+    // "go" — finalizing N+1 beside an unfinalized N breaks the block order
+    // and derive meets heights out of order. This batch stays open-not-finalized for the next start, which finishes it;
     // `WindowedPoster::submit_group`'s `failed` flag stops any NEW batch from being opened.
     if let Some(prev) = wait_for_prev {
         if prev.await.is_err() {
@@ -1968,307 +1871,6 @@ mod tests {
             assert!(
                 matches!(err, PipelineError::PreFinalizeLeafMismatch { idx: 0, .. }),
                 "expected PreFinalizeLeafMismatch, got {err:?}"
-            );
-        }
-    }
-
-    // ===== The startup sweep pages its batch-account probes, never one `get_account` per id =====
-    mod paged_startup_sweep {
-        use super::*;
-        use crate::resolve::{AccountOps, ResolveError};
-        use crate::sender::{SendTuning, Sender, SenderError};
-        use solana_signature::Signature;
-        use std::collections::HashMap;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Mutex;
-
-        const PROGRAM: Pubkey = Pubkey::new_from_array([9u8; 32]);
-        const SETTLEMENT_PROGRAM: Pubkey = Pubkey::new_from_array([7u8; 32]);
-        const CHAIN_ID: u64 = 200_198;
-
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-        enum Scripted {
-            Missing,
-            Finalized,
-            OpenNotFinalized,
-        }
-
-        fn encode_scripted(state: Scripted) -> Option<Vec<u8>> {
-            match state {
-                Scripted::Missing => None,
-                Scripted::Finalized => {
-                    let mut d = vec![0u8; rome_zk_layouts::batch::account_len(0)];
-                    d[0..4].copy_from_slice(&rome_zk_layouts::batch::MAGIC.to_le_bytes());
-                    d[4] = rome_zk_layouts::batch::VERSION;
-                    d[rome_zk_layouts::batch::OFF_FINALIZED] = 1;
-                    Some(d)
-                }
-                Scripted::OpenNotFinalized => {
-                    // expected_count = 0: no chunk PDAs to close, keeping this test's fake to exactly the
-                    // two seams under test (AccountOps probing, and AbandonBatch's own account-list order)
-                    // without also having to model `accounts_exist`/chunk `Close`.
-                    let mut d = vec![0u8; rome_zk_layouts::batch::account_len(0)];
-                    d[0..4].copy_from_slice(&rome_zk_layouts::batch::MAGIC.to_le_bytes());
-                    d[4] = rome_zk_layouts::batch::VERSION;
-                    Some(d)
-                }
-            }
-        }
-
-        /// Counts how each seam was actually called — the whole point of this test: a page probe
-        /// (`get_multiple_account_data`) must be what reads every batch account, never `get_account` one id
-        /// at a time (`get_account` here is reserved for the two singleton reads, `batch_cursor` and the
-        /// settlement root).
-        struct CountingAccounts {
-            cursor_next_batch: u64,
-            head_final_batch: u64,
-            batch_pda_to_state: HashMap<Pubkey, Scripted>,
-            get_account_calls_for_batches: AtomicUsize,
-            get_multiple_account_data_calls: AtomicUsize,
-        }
-
-        impl AccountOps for CountingAccounts {
-            async fn get_account(&self, pubkey: &Pubkey) -> Result<Option<Vec<u8>>, ResolveError> {
-                let (cursor_pda, _) =
-                    zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
-                let (root_pda, _) = zk_settlement_client::root_pda(&SETTLEMENT_PROGRAM, CHAIN_ID);
-                if *pubkey == cursor_pda {
-                    let mut d = vec![0u8; rome_zk_layouts::cursor::LEN];
-                    d[rome_zk_layouts::cursor::OFF_MAGIC..rome_zk_layouts::cursor::OFF_MAGIC + 4]
-                        .copy_from_slice(&rome_zk_layouts::cursor::MAGIC.to_le_bytes());
-                    d[rome_zk_layouts::cursor::OFF_VERSION] = rome_zk_layouts::cursor::VERSION;
-                    d[rome_zk_layouts::cursor::OFF_NEXT_BATCH
-                        ..rome_zk_layouts::cursor::OFF_NEXT_BATCH + 8]
-                        .copy_from_slice(&self.cursor_next_batch.to_le_bytes());
-                    return Ok(Some(d));
-                }
-                if *pubkey == root_pda {
-                    let mut d = vec![0u8; rome_zk_layouts::root::MIN_LEN];
-                    d[rome_zk_layouts::root::OFF_MAGIC..rome_zk_layouts::root::OFF_MAGIC + 4]
-                        .copy_from_slice(&rome_zk_layouts::root::MAGIC.to_le_bytes());
-                    d[rome_zk_layouts::root::OFF_HEAD_FINAL_BATCH
-                        ..rome_zk_layouts::root::OFF_HEAD_FINAL_BATCH + 8]
-                        .copy_from_slice(&self.head_final_batch.to_le_bytes());
-                    return Ok(Some(d));
-                }
-                // Any other `get_account` call must be a batch-account probe done one at a time — exactly
-                // what this test requires the sweep not to do.
-                self.get_account_calls_for_batches
-                    .fetch_add(1, Ordering::SeqCst);
-                let state = self
-                    .batch_pda_to_state
-                    .get(pubkey)
-                    .copied()
-                    .unwrap_or(Scripted::Missing);
-                Ok(encode_scripted(state))
-            }
-
-            async fn accounts_exist(&self, pubkeys: &[Pubkey]) -> Result<Vec<bool>, ResolveError> {
-                Ok(vec![false; pubkeys.len()])
-            }
-
-            async fn get_multiple_account_data(
-                &self,
-                pubkeys: &[Pubkey],
-            ) -> Result<Vec<Option<Vec<u8>>>, ResolveError> {
-                self.get_multiple_account_data_calls
-                    .fetch_add(1, Ordering::SeqCst);
-                Ok(pubkeys
-                    .iter()
-                    .map(|p| {
-                        let state = self
-                            .batch_pda_to_state
-                            .get(p)
-                            .copied()
-                            .unwrap_or(Scripted::Missing);
-                        encode_scripted(state)
-                    })
-                    .collect())
-            }
-        }
-
-        /// Records only `AbandonBatch`'s own target batch id (via the shared `batch_pda_to_batch` reverse
-        /// map — this fake never goes through a real `OpenBatch`, so there is no other way to recover which
-        /// id an `AbandonBatch`/`Close` instruction's account list names), in the order sent.
-        struct RecordingSender {
-            batch_pda_to_batch: HashMap<Pubkey, u64>,
-            abandon_order: Mutex<Vec<u64>>,
-        }
-
-        impl Sender for RecordingSender {
-            async fn send_and_confirm(
-                &self,
-                instructions: &[Instruction],
-                _tuning: SendTuning,
-            ) -> Result<Signature, SenderError> {
-                for ix in instructions {
-                    if ix.program_id != PROGRAM {
-                        continue;
-                    }
-                    if let Ok(zk_inbox_client::InboxIx::AbandonBatch) =
-                        zk_inbox_client::decode_instruction(&ix.data)
-                    {
-                        let batch_pda = ix.accounts[1].pubkey;
-                        if let Some(&batch) = self.batch_pda_to_batch.get(&batch_pda) {
-                            self.abandon_order.lock().unwrap().push(batch);
-                        }
-                    }
-                }
-                Ok(Signature::new_unique())
-            }
-        }
-
-        /// Probing one `get_account` per id instead (as the sweep once did) makes this test fail on both counts:
-        /// `get_multiple_account_data_calls` would read 0 (never called) and `get_account_calls_for_batches` would read
-        /// 250 (one per id) instead of the asserted 3 / 0.
-        #[tokio::test]
-        async fn a_250_id_window_is_probed_in_3_pages_never_one_account_at_a_time() {
-            const HEAD_FINAL_BATCH: u64 = 1_000;
-            const WINDOW_LEN: u64 = 250; // -> ceil(250 / 100) = 3 pages of `PROBE_PAGE_SIZE` (100).
-            const NEXT_BATCH: u64 = HEAD_FINAL_BATCH + WINDOW_LEN;
-            const OPEN_A: u64 = HEAD_FINAL_BATCH + 37;
-            const OPEN_B: u64 = HEAD_FINAL_BATCH + 201;
-            const FINALIZED_A: u64 = HEAD_FINAL_BATCH + 5;
-            // Both finalized ids sit BELOW every open one: a finalized batch waiting on settlement below
-            // open ones is the legitimate shape. A finalized id ABOVE an open one is the refusal
-            // (`startup_sweep_refuses_and_abandons_nothing_when_a_finalized_batch_sits_above_an_open_one`).
-            const FINALIZED_B: u64 = HEAD_FINAL_BATCH + 20;
-
-            let mut batch_pda_to_state = HashMap::new();
-            let mut batch_pda_to_batch = HashMap::new();
-            for batch in HEAD_FINAL_BATCH..NEXT_BATCH {
-                let (pda, _) =
-                    zk_inbox_client::batch_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID, batch);
-                batch_pda_to_batch.insert(pda, batch);
-                let state = match batch {
-                    FINALIZED_A | FINALIZED_B => Scripted::Finalized,
-                    OPEN_A | OPEN_B => Scripted::OpenNotFinalized,
-                    _ => Scripted::Missing,
-                };
-                batch_pda_to_state.insert(pda, state);
-            }
-
-            let accounts = CountingAccounts {
-                cursor_next_batch: NEXT_BATCH,
-                head_final_batch: HEAD_FINAL_BATCH,
-                batch_pda_to_state,
-                get_account_calls_for_batches: AtomicUsize::new(0),
-                get_multiple_account_data_calls: AtomicUsize::new(0),
-            };
-            let sender = RecordingSender {
-                batch_pda_to_batch,
-                abandon_order: Mutex::new(Vec::new()),
-            };
-
-            let abandoned = abandon_open_batches_in_pending_window(
-                &accounts,
-                &sender,
-                &PROGRAM,
-                &SETTLEMENT_PROGRAM,
-                CHAIN_ID,
-                Pubkey::new_unique(),
-                SendTuning {
-                    compute_unit_limit: 200_000,
-                    loaded_accounts_data_size_limit:
-                        crate::config::default_loaded_accounts_data_size_limit(),
-                    priority_fee_micro_lamports: 1_000,
-                    max_priority_fee_micro_lamports: 200_000,
-                    confirm_timeout: std::time::Duration::from_secs(5),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("the sweep must succeed");
-
-            assert_eq!(
-                abandoned,
-                vec![OPEN_A, OPEN_B],
-                "exactly the two OpenNotFinalized ids, ascending"
-            );
-            assert_eq!(
-                sender.abandon_order.lock().unwrap().clone(),
-                vec![OPEN_A, OPEN_B],
-                "AbandonBatch must actually be sent for both, in the same ascending order"
-            );
-            assert_eq!(
-                accounts
-                    .get_multiple_account_data_calls
-                    .load(Ordering::SeqCst),
-                3,
-                "250 ids at PROBE_PAGE_SIZE=100 must page as ceil(250/100) = 3 calls"
-            );
-            assert_eq!(
-                accounts
-                    .get_account_calls_for_batches
-                    .load(Ordering::SeqCst),
-                0,
-                "no batch account may ever be read one at a time by this sweep"
-            );
-        }
-
-        /// Batch ids are 1-based; 0 is the sentinel everywhere. No behaviour
-        /// change here — the sweep already skips `Missing` unconditionally — but this pins the shape a
-        /// 1-based inbox actually produces at the settlement genesis sentinel: `head_final_batch` 0,
-        /// cursor `next_batch` 3, batches 1 and 2 finalized, batch 0 never opened (`Missing`). The window
-        /// is `[0, 3)`; nothing is abandoned, and the absent batch 0 costs one harmless probe, not an
-        /// error. Treating `Missing` as an error in the match below makes this test fail
-        /// on the very first (batch 0) entry.
-        #[tokio::test]
-        async fn sentinel_window_with_a_1_based_inbox_abandons_nothing_and_does_not_error_on_missing_batch_0(
-        ) {
-            let mut batch_pda_to_state = HashMap::new();
-            let mut batch_pda_to_batch = HashMap::new();
-            for batch in 0u64..3 {
-                let (pda, _) =
-                    zk_inbox_client::batch_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID, batch);
-                batch_pda_to_batch.insert(pda, batch);
-                let state = match batch {
-                    1 | 2 => Scripted::Finalized,
-                    _ => Scripted::Missing, // batch 0: never opened under the 1-based inbox.
-                };
-                batch_pda_to_state.insert(pda, state);
-            }
-
-            let accounts = CountingAccounts {
-                cursor_next_batch: 3,
-                head_final_batch: 0,
-                batch_pda_to_state,
-                get_account_calls_for_batches: AtomicUsize::new(0),
-                get_multiple_account_data_calls: AtomicUsize::new(0),
-            };
-            let sender = RecordingSender {
-                batch_pda_to_batch,
-                abandon_order: Mutex::new(Vec::new()),
-            };
-
-            let abandoned = abandon_open_batches_in_pending_window(
-                &accounts,
-                &sender,
-                &PROGRAM,
-                &SETTLEMENT_PROGRAM,
-                CHAIN_ID,
-                Pubkey::new_unique(),
-                SendTuning {
-                    compute_unit_limit: 200_000,
-                    loaded_accounts_data_size_limit:
-                        crate::config::default_loaded_accounts_data_size_limit(),
-                    priority_fee_micro_lamports: 1_000,
-                    max_priority_fee_micro_lamports: 200_000,
-                    confirm_timeout: std::time::Duration::from_secs(5),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("a Missing batch 0 at the sentinel must never be an error");
-
-            assert_eq!(
-                abandoned,
-                Vec::<u64>::new(),
-                "nothing is OpenNotFinalized in this window — abandons nothing"
-            );
-            assert!(
-                sender.abandon_order.lock().unwrap().is_empty(),
-                "AbandonBatch must never be sent when nothing is abandoned"
             );
         }
     }

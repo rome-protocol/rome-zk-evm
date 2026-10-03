@@ -1994,7 +1994,7 @@ mod tests {
             st.cursor_next_batch = st.cursor_next_batch.max(batch + 1);
         }
 
-        /// Simulates the batcher's own `AbandonBatch` sweep: the id is neither present nor ever will
+        /// Simulates an `AbandonBatch` run by hand: the id is neither present nor ever will
         /// be, and the cursor has already moved past it.
         fn abandon_inbox_batch(&self, batch: u64) {
             let mut st = self.0.state.lock().unwrap();

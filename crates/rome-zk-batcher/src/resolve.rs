@@ -195,11 +195,11 @@ pub enum ResolveOutcome {
     AlreadyPosted(u64),
 }
 
-/// The one home both the chain-anchor walk (`anchor.rs`) and the startup sweep
-/// (`pipeline::abandon_open_batches_in_pending_window`) page their batch-account probes through. It
+/// The one home both the chain-anchor walk (`anchor.rs`) and the startup recovery
+/// (`recover::resume_open_batches`) page their batch-account probes through. It
 /// mirrors the RPC node's own `getMultipleAccounts` cap (100), so a page here is exactly one real RPC round
 /// trip. Reading one batch account at a time (`getAccountInfo` per id) would be far slower: while
-/// `head_final_batch` is still 0 on a chain that has not settled, the sweep's pending window can span every
+/// `head_final_batch` is still 0 on a chain that has not settled, the startup recovery's pending window can span every
 /// batch the chain has ever opened — thousands of ids, and thousands of sequential round trips, against a
 /// rate-limited RPC on every restart.
 pub(crate) const PROBE_PAGE_SIZE: usize = 100;
@@ -238,7 +238,7 @@ pub(crate) async fn probe_batch_state<A: AccountOps>(
     decode_batch_probe(data, batch)
 }
 
-/// Probes every id in `ids` (any order — the startup sweep passes them ascending, ready-to-iterate),
+/// Probes every id in `ids` (any order — the startup recovery passes them ascending, ready-to-iterate),
 /// paged at [`PROBE_PAGE_SIZE`] per [`AccountOps::get_multiple_account_data`] call — never one
 /// `get_account` per id. Returns one [`BatchAccountState`] per input id, in the same order.
 pub(crate) async fn probe_batch_states_paged<A: AccountOps>(
@@ -258,7 +258,7 @@ pub(crate) async fn probe_batch_states_paged<A: AccountOps>(
             .collect();
         let datas = accounts.get_multiple_account_data(&pdas).await?;
         // The guard lives here, where the length is relied on — not only inside one backend's impl: a
-        // short page would otherwise zip-truncate and silently drop the tail ids of the sweep.
+        // short page would otherwise zip-truncate and silently drop the tail ids of the scan.
         if datas.len() != pdas.len() {
             return Err(ResolveError::ShortPage {
                 expected: pdas.len(),
@@ -341,8 +341,8 @@ async fn decide_finalized<A: AccountOps>(
 /// cannot ever complete a real `OpenBatch` (see [`ResolveError::CursorMissing`]).
 ///
 /// **One batcher per chain authority:** `expected_next_batch` is this run's own
-/// belief about the cursor — read once at startup (after the half-written-batch abandon,
-/// `pipeline::abandon_open_batches_in_pending_window`) and advanced by the caller after every successful post.
+/// belief about the cursor — read once at startup (after the half-written-batch recovery,
+/// `pipeline::startup_recover`) and advanced by the caller after every successful post.
 /// If the on-chain cursor has moved past it, another writer (a second instance holding this chain's
 /// authority key) posted under it — refused by name ([`ResolveError::CursorAdvanced`]) rather than
 /// treated as this run's own `PostUnder`, which would double-post and abandon the peer's in-flight batch.
@@ -382,8 +382,8 @@ pub async fn resolve_batch_id<A: AccountOps>(
 }
 
 /// Reads the chain's `batch_cursor.next_batch` directly — what a run seeds `expected_next_batch` from,
-/// once, right after the startup half-written-batch abandon: the abandon may itself
-/// have left the cursor unchanged (it only ever touches the batch/chunk accounts, never the cursor), so
+/// once, right after the startup half-written-batch recovery: finishing a batch never
+/// touches the cursor (only `OpenBatch` advances it), so
 /// this is simply "whatever the cursor says right now", read through the same [`AccountOps`] seam.
 pub async fn read_cursor_next_batch<A: AccountOps>(
     accounts: &A,
@@ -451,11 +451,11 @@ async fn resolve_via_cursor<A: AccountOps>(
                 }
             }
             BatchAccountState::OpenNotFinalized { .. } => {
-                // A `prev` left open by a crashed run is abandoned, and its chunk PDAs closed, by the startup
-                // sweep (`pipeline::abandon_open_batches_in_pending_window`) at the next start; here, in a live
+                // A `prev` left open by a crashed run is finished under the same id by the startup
+                // recovery (`pipeline::startup_recover`) at the next start; here, in a live
                 // run, it is this run's own batch still finalizing. Under the posting window this is the NORMAL
                 // steady state — our own batch `prev` is still finalizing while `next_batch` opens — so it is
-                // debug, not warn: a warn on every batch would drown the real ones (sweep abandons, CU budget).
+                // debug, not warn: a warn on every batch would drown the real ones (recovery, CU budget).
                 tracing::debug!(
                     "chain {chain_id}: batch {prev} (cursor.next_batch - 1) exists but is not yet \
                      finalized — its content cannot be safely compared to this run's own frames \
@@ -463,7 +463,7 @@ async fn resolve_via_cursor<A: AccountOps>(
                      it); proceeding to open batch {next_batch} under the cursor"
                 );
             }
-            // `prev` was AbandonBatch'd (or, on a fresh chain with next_batch == 1, this branch cannot
+            // `prev` has no account (never opened, or abandoned by hand; or, on a fresh chain with next_batch == 1, this branch cannot
             // occur) — nothing to compare this run's content against; proceed.
             BatchAccountState::Missing => {}
         }
@@ -907,7 +907,7 @@ mod tests {
 
     /// The short-page guard lived only inside the `RpcClient` impl; the paged probe itself
     /// zipped ids with whatever length came back, silently dropping the tail ids of a short page — exactly
-    /// the ids a startup sweep exists to find. The probe now refuses a short page by name whatever the
+    /// the ids a startup recovery exists to find. The probe now refuses a short page by name whatever the
     /// backend.
     struct ShortPageAccounts;
     impl AccountOps for ShortPageAccounts {
@@ -926,7 +926,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_short_page_from_any_backend_is_a_named_refusal_not_a_truncated_sweep() {
+    async fn a_short_page_from_any_backend_is_a_named_refusal_not_a_truncated_scan() {
         let ids: Vec<u64> = (0..7).collect();
         let err = probe_batch_states_paged(
             &ShortPageAccounts,

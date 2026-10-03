@@ -32,7 +32,7 @@
 //!      being true is a different, refused condition ([`AnchorError::ChunkMissing`]) — `Close` could not
 //!      have legitimately run yet.
 //!    - `OpenNotFinalized` → [`AnchorError::UnexpectedOpenBatch`]: this is the job of
-//!      `crate::pipeline::abandon_open_batches_in_pending_window`, which must run *before* this resolution so
+//!      `crate::pipeline::startup_recover`, which finishes every open batch *before* this resolution so
 //!      the walk never actually observes this state at `next_batch - 1`; seeing it here is a caller-order
 //!      bug, not a runtime condition to route around.
 //!    - `Missing` (abandoned, or never opened, or already rent-recycled) → keep walking.
@@ -66,13 +66,13 @@ use crate::resume::BatchAccountState;
 use crate::source::{BlockSource, SourceError};
 
 /// How many batch ids the anchor walk probes per `getMultipleAccounts`-style page — the one shared constant
-/// `resolve::probe_batch_states_paged`, the startup sweep's own paging, and this walk all use;
+/// `resolve::probe_batch_states_paged`, the startup recovery's own paging, and this walk all use;
 /// mirrors `resolve::AccountOps::get_multiple_account_data`'s own real-RPC page size.
 const ANCHOR_WALK_PAGE_SIZE: usize = resolve::PROBE_PAGE_SIZE;
 
 /// Decodes one already-fetched batch account's raw bytes into a [`BatchAccountState`] — the walk's own
 /// per-id decode, applied to a page [`AccountOps::get_multiple_account_data`] already read. Wraps
-/// [`resolve::decode_batch_probe`] (shared with the startup sweep — "one home" for the
+/// [`resolve::decode_batch_probe`] (shared with the startup recovery — "one home" for the
 /// per-entry decode) into this module's own [`AnchorError`] instead of `ResolveError`, so this walk's own
 /// error shape (and the regression test pinning it) is unchanged.
 fn decode_probe(data: Option<Vec<u8>>, batch: u64) -> Result<BatchAccountState, AnchorError> {
@@ -160,8 +160,8 @@ pub enum AnchorError {
     EmptyBlocks { batch: u64 },
     #[error(
         "batch_cursor.next_batch={n} names batch {batch} (in the pending window, > \
-         head_final_batch={head_final_batch}) as open-not-finalized — it must be abandoned \
-         (`pipeline::abandon_open_batches_in_pending_window`) before the resume anchor is \
+         head_final_batch={head_final_batch}) as open-not-finalized — it must be finished \
+         (`pipeline::startup_recover`) before the resume anchor is \
          resolved; seeing it here is a caller-ordering bug"
     )]
     UnexpectedOpenBatch {
@@ -269,6 +269,33 @@ pub async fn resolve_anchor<A: AccountOps>(
     sub_blocks_per_block: u16,
     block_gas_limit: u64,
 ) -> Result<Anchor, AnchorError> {
+    resolve_anchor_below(
+        accounts,
+        inbox_program_id,
+        settlement_program_id,
+        chain_id,
+        log_dir,
+        sub_blocks_per_block,
+        block_gas_limit,
+        None,
+    )
+    .await
+}
+
+/// [`resolve_anchor`] over only the batch ids strictly below `below_batch` (`None` = every id the cursor has
+/// issued): the start block of the first batch a startup resume finishes (`recover.rs`), computed as if that
+/// batch and everything above it did not exist yet. With `Some(n)` the walk starts at `min(n, cursor)`.
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_anchor_below<A: AccountOps>(
+    accounts: &A,
+    inbox_program_id: &Pubkey,
+    settlement_program_id: &Pubkey,
+    chain_id: u64,
+    log_dir: &Path,
+    sub_blocks_per_block: u16,
+    block_gas_limit: u64,
+    below_batch: Option<u64>,
+) -> Result<Anchor, AnchorError> {
     // The numbering-origin check runs before any on-chain state is read or any
     // block is grouped — independent of `profile.json` and of which of the three paths below (fresh
     // chain, finalized-batch decode, settlement-root fallback) this call ends up taking, so a 0-based
@@ -303,6 +330,7 @@ pub async fn resolve_anchor<A: AccountOps>(
                 .next_batch
         }
     };
+    let n = below_batch.map_or(n, |limit| n.min(limit));
     if n == 0 {
         // The ordered log starts at block 1 (genesis 0 is never sealed) — a fresh
         // chain's very first block to post is 1, not 0.
@@ -436,7 +464,41 @@ async fn decode_anchor_from_finalized_batch<A: AccountOps>(
     let decoded = zk_inbox_client::decode_batch_account(&data)
         .map_err(|source| AnchorError::BatchDecode { batch, source })?;
 
-    let chunk_pdas: Vec<Pubkey> = (0..decoded.expected_count)
+    let frames = read_batch_frames(
+        accounts,
+        inbox_program_id,
+        settlement_program_id,
+        chain_id,
+        batch,
+        decoded.expected_count,
+    )
+    .await?;
+    let compressed =
+        channel::reassemble(&frames).map_err(|source| AnchorError::Channel { batch, source })?;
+    pipeline::verify_acc(&decoded, &frames)
+        .map_err(|source| AnchorError::Verify { batch, source })?;
+    let blocks = channel::decode_stream(&compressed)
+        .map_err(|source| AnchorError::Channel { batch, source })?;
+    let last = blocks.last().ok_or(AnchorError::EmptyBlocks { batch })?;
+    Ok(Anchor {
+        from_block: last.number + 1,
+        prev_block_timestamp_secs: last.timestamp,
+    })
+}
+
+/// Reads every chunk of `batch` (`0..expected_count`) off chain, in order, and parses each into its frame:
+/// paged reads, header parse and validation, `Frame::from_bytes`. Every chunk must exist and be sealed.
+/// Shared by the finalized-batch anchor decode above and the startup resume of a batch whose every leaf
+/// is already present (`recover.rs`).
+pub(crate) async fn read_batch_frames<A: AccountOps>(
+    accounts: &A,
+    inbox_program_id: &Pubkey,
+    settlement_program_id: &Pubkey,
+    chain_id: u64,
+    batch: u64,
+    expected_count: u32,
+) -> Result<Vec<Frame>, AnchorError> {
+    let chunk_pdas: Vec<Pubkey> = (0..expected_count)
         .map(|idx| {
             zk_inbox_client::chunk_pda(
                 inbox_program_id,
@@ -450,7 +512,7 @@ async fn decode_anchor_from_finalized_batch<A: AccountOps>(
         .collect();
     let chunk_datas = accounts.get_multiple_account_data(&chunk_pdas).await?;
 
-    let mut frames = Vec::with_capacity(decoded.expected_count as usize);
+    let mut frames = Vec::with_capacity(expected_count as usize);
     for (idx, data) in chunk_datas.into_iter().enumerate() {
         let idx = idx as u32;
         let Some(data) = data else {
@@ -504,18 +566,7 @@ async fn decode_anchor_from_finalized_batch<A: AccountOps>(
         }
         frames.push(frame);
     }
-
-    let compressed =
-        channel::reassemble(&frames).map_err(|source| AnchorError::Channel { batch, source })?;
-    pipeline::verify_acc(&decoded, &frames)
-        .map_err(|source| AnchorError::Verify { batch, source })?;
-    let blocks = channel::decode_stream(&compressed)
-        .map_err(|source| AnchorError::Channel { batch, source })?;
-    let last = blocks.last().ok_or(AnchorError::EmptyBlocks { batch })?;
-    Ok(Anchor {
-        from_block: last.number + 1,
-        prev_block_timestamp_secs: last.timestamp,
-    })
+    Ok(frames)
 }
 
 /// When the last inbox batch's chunks are already rent-recycled, the
@@ -1192,7 +1243,7 @@ mod tests {
     }
 
     /// **Caller-ordering guard:** an `OpenNotFinalized` batch found in the walk is a hard, named error —
-    /// `pipeline::abandon_open_batches_in_pending_window` must have already run.
+    /// `pipeline::startup_recover` must have already run.
     #[tokio::test]
     async fn an_open_not_finalized_batch_in_the_walk_is_a_named_caller_ordering_error() {
         let chain = FakeChain::default();

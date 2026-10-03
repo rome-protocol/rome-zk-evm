@@ -104,8 +104,8 @@ pub enum AnchorError {
         cursor_next_batch: u64,
     },
     /// No chain write, alarm + stop. The inbox batch PDA for `candidate_batch` is absent
-    /// AND the inbox's own cursor has already moved past it in the SAME snapshot — the batcher's
-    /// `AbandonBatch` sweep already reclaimed it; this id will never be finalized.
+    /// AND the inbox's own cursor has already moved past it in the SAME snapshot — someone ran
+    /// `AbandonBatch` for it (the batcher never does); this id will never be finalized.
     #[error("inbox batch {batch} is abandoned (absent, cursor already past it)")]
     AbandonedInboxBatch { batch: u64 },
     #[error("inbox batch account {0} decode failed: {1}")]

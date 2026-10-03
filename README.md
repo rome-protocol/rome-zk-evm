@@ -73,6 +73,7 @@ for those commands.
 The portable [`deploy/rollup/`](deploy/rollup/) directory is available, with setup and commands in its
 [operator runbook](deploy/rollup/README.md).
 [Run on Solana devnet](docs/RUN-ON-DEVNET.md) walks through running your own chain on Rome's shared settlement.
+[Monitoring one rollup](docs/MONITORING.md) covers health checks and example alerts for that chain.
 For the available services and their configuration, start with
 [Deployment](docs/ARCHITECTURE.md#deployment) and the [component READMEs](docs/ARCHITECTURE.md#components).
 

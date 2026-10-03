@@ -152,7 +152,9 @@ the port: add rules to the `DOCKER-USER` chain or use your cloud provider's fire
 | 9001 to 9004 | metrics of sequencer, batcher, derive and prover | 127.0.0.1 only |
 | 5432 | the prover's postgres | 127.0.0.1 only, and only with the prover |
 
-reth-verifier and derive are never reachable from outside the machine. reth-verifier runs reth's `testing` API, which
+reth-verifier and derive are never reachable from outside the machine. reth-verifier also runs with peer discovery off,
+no peer slots and its peer listener on 127.0.0.1, so it never dials the public Ethereum network; derive is its only
+source of blocks. `./rollup check` fails if it ever has a peer. reth-verifier runs reth's `testing` API, which
 can include arbitrary transactions, so never publish its port or put it behind a proxy. The engine API (8551) is not
 published at all. Any local user on the machine can reach the 127.0.0.1 ports, so run the node on a machine you do
 not share.
@@ -169,6 +171,7 @@ Each service serves `GET /metrics` on its own port, on 127.0.0.1 only:
 | prover | 9004 |
 
 No monitoring stack is shipped. Scrape these ports with whatever you already run.
+[Monitoring one rollup](../../docs/MONITORING.md) explains what to watch and when to page someone.
 
 ## The prover is required for settlement
 
@@ -189,7 +192,8 @@ then `cd .fork && git submodule update --init --recursive`. The guest uses crate
 Building it for your `rendered/genesis.json` is not automated yet. Without that guest, your chain cannot
 post a root.
 
-The prover needs one NVIDIA GPU with more than 30 GB of memory and about 55 GB of proving keys on the host.
+The prover needs one NVIDIA GPU with more than 30 GB of memory and the ZisK proving keys on the host: about 41 GB to
+download, about 81 GB once installed (measured on a CPU host; a GPU host generates its own files, not measured yet).
 The final proof step needs about 30 GB of GPU memory; a 24 GB card is not enough. To turn it on, set `PROVER=on`
 in `.env` together with `VKEY_JSON`, `ELF_DIR` and `ZISK_HOME`, then run `./rollup init` and `./rollup up`. A local
 postgres container starts with it to hold the prover's history. Leave `PROVER` unset and none of this is rendered

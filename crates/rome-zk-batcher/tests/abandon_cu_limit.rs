@@ -4,12 +4,14 @@
 //! `leaf_hashes`/bitmap — but that was reasoned from the code, not measured. This pins the real CU cost,
 //! against the real `cargo build-sbf`-compiled `zk_inbox.so`, on a 900-leaf-sized batch account (Tiber's
 //! own real size: batch 4005 has 899 chunks), and against `chunk_compute_unit_limit`
-//! (40,000, from the deploy config), which `pipeline::abandon_open_batches_in_pending_window` reuses for
-//! both `AbandonBatch` and packed chunk `Close` sends.
+//! (100,000, from the deploy config), the budget the by-hand cleanup tools (`examples/abandon_batches.rs`,
+//! `examples/close_chunks.rs`) send under. The batcher itself never abandons a batch any more (a restart
+//! finishes a half-written batch, see `src/recover.rs`); these costs matter only for those tools, and
+//! `AbandonBatch` by hand halts the chain if settlement still needs that id.
 //!
 //! Follows `tests/finalize_cu_limit.rs`'s own `ProgramTest` + `BanksClient` pattern.
 
-use rome_zk_batcher::pipeline::{BatchTarget, CLOSE_IXS_PER_TX};
+use rome_zk_batcher::pipeline::BatchTarget;
 use rome_zk_testkit::{cursor_account, root_account_with_authority};
 use solana_program::instruction::Instruction;
 use solana_sdk::{
@@ -30,7 +32,10 @@ async fn send_measuring_cu(
     result.map(|()| cu)
 }
 
-const CHUNK_COMPUTE_UNIT_LIMIT: u64 = 40_000; // `config::default_chunk_compute_unit_limit`, Tiber's own value.
+/// How many chunk `Close` instructions one by-hand cleanup transaction packs.
+const CLOSE_IXS_PER_TX: usize = 4;
+
+const CHUNK_COMPUTE_UNIT_LIMIT: u64 = 100_000; // `config::default_chunk_compute_unit_limit`, Tiber's own value.
 
 /// `AbandonBatch` on a 900-leaf-sized batch account (Tiber's real batch 4005 has 899 chunks) must stay
 /// well under `chunk_compute_unit_limit` — `abandon_batch_inner` only ever reads the account's fixed
@@ -110,7 +115,7 @@ async fn abandon_batch_cu_on_a_900_leaf_account_fits_the_chunk_compute_unit_limi
     assert!(
         cu <= CHUNK_COMPUTE_UNIT_LIMIT,
         "AbandonBatch measured {cu} CU on a 900-leaf account, over chunk_compute_unit_limit \
-         ({CHUNK_COMPUTE_UNIT_LIMIT}) — abandon_open_batches_in_pending_window sends it under this same tuning"
+         ({CHUNK_COMPUTE_UNIT_LIMIT}) — the by-hand cleanup tools send it under this same tuning"
     );
 
     assert!(
@@ -124,7 +129,7 @@ async fn abandon_batch_cu_on_a_900_leaf_account_fits_the_chunk_compute_unit_limi
 }
 
 /// A single chunk `Close` (the cheap, authority-only path once the batch account is already gone — exactly
-/// what `pipeline::abandon_open_batches_in_pending_window` does for each of a half-written batch's chunk PDAs)
+/// what the by-hand cleanup tools do for each chunk PDA of an abandoned batch)
 /// and a transaction packing `CLOSE_IXS_PER_TX` of them together (the packed form this file measures): a single
 /// one fits under `chunk_compute_unit_limit`, and the packed group fits under one `chunk_compute_unit_limit` per
 /// Close (the budget the group asks for).
@@ -221,7 +226,7 @@ async fn packed_chunk_close_fits_the_chunk_compute_unit_limit() {
     );
 
     // A packed transaction of CLOSE_IXS_PER_TX Close instructions (idx 1..=CLOSE_IXS_PER_TX) — exactly the
-    // shape `abandon_open_batches_in_pending_window` now sends.
+    // shape the by-hand cleanup tools send.
     let packed_ixs: Vec<Instruction> = (1..=CLOSE_IXS_PER_TX as u32)
         .map(|idx| {
             zk_inbox_client::close_chunk_ix(
@@ -238,12 +243,12 @@ async fn packed_chunk_close_fits_the_chunk_compute_unit_limit() {
         .await
         .expect("a packed transaction of CLOSE_IXS_PER_TX Close instructions must succeed");
     eprintln!("packed {CLOSE_IXS_PER_TX}-Close CU: {packed_cu}");
-    // `abandon_open_batches_in_pending_window` gives a packed group one `chunk_compute_unit_limit` per Close.
+    // the by-hand cleanup tools give a packed group one `chunk_compute_unit_limit` per Close.
     let group_limit = CHUNK_COMPUTE_UNIT_LIMIT * CLOSE_IXS_PER_TX as u64;
     assert!(
         packed_cu <= group_limit,
         "packing {CLOSE_IXS_PER_TX} Close instructions measured {packed_cu} CU, over the group's budget of \
-         {CLOSE_IXS_PER_TX} x chunk_compute_unit_limit ({group_limit}) — abandon_open_batches_in_pending_window \
+         {CLOSE_IXS_PER_TX} x chunk_compute_unit_limit ({group_limit}) — the by-hand cleanup tools \
          sends packed groups under this tuning"
     );
 }

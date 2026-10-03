@@ -11236,7 +11236,10 @@ dependencies = [
 name = "rome-zk-executor-api"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
  "alloy-primitives",
+ "alloy-trie",
  "thiserror 2.0.21",
 ]
 

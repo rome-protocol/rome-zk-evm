@@ -15,6 +15,7 @@
 
 #![forbid(unsafe_code)]
 
+use alloy_eips::eip4895::Withdrawal;
 use alloy_primitives::{keccak256, Address, Bytes, TxHash, B256};
 use std::time::{Duration, Instant};
 
@@ -216,8 +217,8 @@ pub struct HeaderRule {
     pub beneficiary: Address,
     /// Always empty.
     pub extra_data: Bytes,
-    /// The withdrawals-trie root for this chain's permanently-empty withdrawals list — see
-    /// [`EMPTY_WITHDRAWALS`].
+    /// The withdrawals-trie root of the block's withdrawals: [`EMPTY_WITHDRAWALS`] for a block with none (every block
+    /// today), otherwise [`withdrawals_root`] of the block's deposit withdrawals.
     pub withdrawals_root: B256,
     /// Always `B256::ZERO` (no beacon chain behind this rollup).
     pub parent_beacon_block_root: B256,
@@ -241,6 +242,40 @@ pub fn canonical_header_rule(chain_id: u64, number: u64, fee_recipient: Address)
         parent_beacon_block_root: B256::ZERO,
         blob_gas_used: 0,
         excess_blob_gas: 0,
+    }
+}
+
+/// One deposit as the block's withdrawal: `{ index, validator_index: 0, address: recipient, amount: amount_gwei }`.
+/// The amount is already in gwei, the unit a withdrawal carries, so nothing is converted. The index is the deposit's
+/// position in the queue (not its position in the block). A deposit has no validator, so `validator_index` is
+/// always 0.
+pub fn deposit_withdrawal(index: u64, recipient: Address, amount_gwei: u64) -> Withdrawal {
+    Withdrawal {
+        index,
+        validator_index: 0,
+        address: recipient,
+        amount: amount_gwei,
+    }
+}
+
+/// The withdrawals-trie root of a block's withdrawals list (EIP-4895: the ordered trie of each withdrawal's RLP).
+/// For an empty list this is [`EMPTY_WITHDRAWALS`]. The one function the sequencer, derive and the guest all call, so
+/// they cannot disagree on a block's root.
+pub fn withdrawals_root(withdrawals: &[Withdrawal]) -> B256 {
+    alloy_trie::root::ordered_trie_root(withdrawals)
+}
+
+/// [`canonical_header_rule`] for a block that carries `withdrawals` (its slice of the deposit queue): the same rule,
+/// with `withdrawals_root` set to the root of that list. With an empty list it is exactly [`canonical_header_rule`].
+pub fn canonical_header_rule_with_withdrawals(
+    chain_id: u64,
+    number: u64,
+    fee_recipient: Address,
+    withdrawals: &[Withdrawal],
+) -> HeaderRule {
+    HeaderRule {
+        withdrawals_root: withdrawals_root(withdrawals),
+        ..canonical_header_rule(chain_id, number, fee_recipient)
     }
 }
 
@@ -427,5 +462,195 @@ mod tests {
     fn canonical_header_rule_reuses_the_shared_prev_randao_formula() {
         let rule = canonical_header_rule(7, 42, Address::ZERO);
         assert_eq!(rule.prev_randao, prev_randao(7, 42));
+    }
+
+    // ---- the withdrawals rule ------------------------------------------------------------------
+
+    /// One withdrawal: index 0, validator 0, recipient `0x11..11` (20 bytes), 1_000_000_000 gwei.
+    fn one_withdrawal() -> Vec<Withdrawal> {
+        vec![deposit_withdrawal(
+            0,
+            Address::repeat_byte(0x11),
+            1_000_000_000,
+        )]
+    }
+
+    /// Three withdrawals with indexes 7, 8, 9 (a block's slice of a deposit queue does not start at 0), distinct
+    /// recipients, and the extreme amounts 32e9, 1 and `u64::MAX`. Their `validator_index` is set by hand (3, 4,
+    /// 5) so the golden root below, computed with that field set, is also checked against the production
+    /// constructor's zero in a separate test.
+    fn three_withdrawals() -> Vec<Withdrawal> {
+        vec![
+            Withdrawal {
+                index: 7,
+                validator_index: 3,
+                address: Address::repeat_byte(0x01),
+                amount: 32_000_000_000,
+            },
+            Withdrawal {
+                index: 8,
+                validator_index: 4,
+                address: Address::repeat_byte(0xab),
+                amount: 1,
+            },
+            Withdrawal {
+                index: 9,
+                validator_index: 5,
+                address: Address::repeat_byte(0xff),
+                amount: u64::MAX,
+            },
+        ]
+    }
+
+    /// Golden roots, computed outside this crate in Python (pycryptodome keccak, a hand-built
+    /// RLP encoder and a hand-built Merkle-Patricia trie: a single leaf for one withdrawal; a root branch with
+    /// a sub-branch at nibble 0 and a leaf at nibble 8 for three).
+    const GOLDEN_ONE: &str = "0xcf22af342ad9b28194e609001599c3312b76400414b9eb7f88322a9307cde213";
+    const GOLDEN_THREE: &str = "0x11d99a0fc8898d01a71b68074bb96884aee589d101cffdaaec6c39b1dadded50";
+
+    #[test]
+    fn deposit_withdrawal_maps_the_record_to_the_four_fields() {
+        let w = deposit_withdrawal(41, Address::repeat_byte(0x22), 5_000);
+        assert_eq!(w.index, 41);
+        assert_eq!(w.validator_index, 0, "a deposit has no validator");
+        assert_eq!(w.address, Address::repeat_byte(0x22));
+        assert_eq!(w.amount, 5_000);
+    }
+
+    #[test]
+    fn withdrawals_root_of_an_empty_list_is_the_pinned_empty_constant() {
+        assert_eq!(withdrawals_root(&[]), EMPTY_WITHDRAWALS);
+    }
+
+    #[test]
+    fn withdrawals_root_matches_the_golden_roots() {
+        assert_eq!(
+            withdrawals_root(&one_withdrawal()),
+            GOLDEN_ONE.parse::<B256>().unwrap()
+        );
+        assert_eq!(
+            withdrawals_root(&three_withdrawals()),
+            GOLDEN_THREE.parse::<B256>().unwrap()
+        );
+    }
+
+    /// Independent computation for one withdrawal, by hand in the test: the trie of one item is one leaf node
+    /// `[compact(key nibbles), value]` with key `rlp(0) = 0x80` (nibbles 8, 0; even-length leaf prefix 0x20) and
+    /// value the withdrawal's RLP `[index, validator_index, address, amount]`; a root node is always hashed.
+    #[test]
+    fn withdrawals_root_of_one_withdrawal_equals_a_hand_built_leaf_node() {
+        // rlp([0, 0, 0x11 * 20, 1_000_000_000]) = list(0xdc) of 0x80, 0x80, 0x94 ++ addr, 0x84 ++ 3b9aca00
+        let mut value = vec![0xdc, 0x80, 0x80, 0x94];
+        value.extend_from_slice(&[0x11; 20]);
+        value.extend_from_slice(&[0x84, 0x3b, 0x9a, 0xca, 0x00]);
+        assert_eq!(value.len(), 29);
+        // leaf node = list(0xc0 + len) of bytes(0x20 0x80) = 0x82 0x20 0x80, and bytes(value) = 0x9d ++ value
+        let mut node = vec![0u8];
+        node.extend_from_slice(&[0x82, 0x20, 0x80, 0x80 + 29]);
+        node.extend_from_slice(&value);
+        node[0] = 0xc0 + (node.len() as u8 - 1);
+        assert_eq!(withdrawals_root(&one_withdrawal()), keccak256(&node));
+    }
+
+    /// The root is the same one alloy-consensus (what a stock reth builder and the stateless validator use)
+    /// computes, for every list length 0..=40 (every small trie shape), for the golden lists, and for a list of 300
+    /// (indexes past 0x7f, whose RLP key is more than one byte).
+    #[test]
+    fn withdrawals_root_agrees_with_alloy_consensus() {
+        for n in 0..=40u64 {
+            let list: Vec<Withdrawal> = (0..n)
+                .map(|i| Withdrawal {
+                    index: 1_000 + i * 3,
+                    validator_index: i % 5,
+                    address: Address::repeat_byte(i as u8 ^ 0x5a),
+                    amount: i.wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                })
+                .collect();
+            assert_eq!(
+                withdrawals_root(&list),
+                alloy_consensus::proofs::calculate_withdrawals_root(&list),
+                "length {n}"
+            );
+        }
+        for list in [one_withdrawal(), three_withdrawals()] {
+            assert_eq!(
+                withdrawals_root(&list),
+                alloy_consensus::proofs::calculate_withdrawals_root(&list)
+            );
+        }
+        // A list long enough that an index needs more than one RLP byte (index 128 and up).
+        let long: Vec<Withdrawal> = (0..300u64)
+            .map(|i| deposit_withdrawal(i, Address::repeat_byte(i as u8), i + 1))
+            .collect();
+        assert_eq!(
+            withdrawals_root(&long),
+            alloy_consensus::proofs::calculate_withdrawals_root(&long)
+        );
+    }
+
+    #[test]
+    fn withdrawals_root_depends_on_every_field_and_on_order() {
+        let base = three_withdrawals();
+        let root = withdrawals_root(&base);
+        let mut w = base.clone();
+        w[1].amount += 1;
+        assert_ne!(withdrawals_root(&w), root, "amount");
+        let mut w = base.clone();
+        w[1].address = Address::repeat_byte(0xac);
+        assert_ne!(withdrawals_root(&w), root, "recipient");
+        let mut w = base.clone();
+        w[1].index += 1;
+        assert_ne!(withdrawals_root(&w), root, "index");
+        let mut w = base.clone();
+        w[1].validator_index += 1;
+        assert_ne!(withdrawals_root(&w), root, "validator index");
+        let mut w = base.clone();
+        w.swap(0, 2);
+        assert_ne!(withdrawals_root(&w), root, "order");
+        let mut w = base;
+        w.pop();
+        assert_ne!(withdrawals_root(&w), root, "length");
+    }
+
+    /// With an empty list the new rule is byte-for-byte the old one, over a sweep of chains, block numbers
+    /// (including both sides of the prevRandao epoch boundary and the integer extremes) and fee recipients.
+    #[test]
+    fn rule_with_an_empty_withdrawal_list_equals_the_old_rule() {
+        let chains = [0u64, 1, 7, 200_101, 200_010, u64::MAX];
+        let numbers = [0u64, 1, 9, 10, 11, 39_181, 1 << 32, u64::MAX - 1, u64::MAX];
+        let recipients = [
+            Address::ZERO,
+            Address::repeat_byte(0xab),
+            Address::repeat_byte(0xff),
+            Address::repeat_byte(0x01),
+        ];
+        for chain in chains {
+            for number in numbers {
+                for fee in recipients {
+                    assert_eq!(
+                        canonical_header_rule_with_withdrawals(chain, number, fee, &[]),
+                        canonical_header_rule(chain, number, fee),
+                        "chain {chain} number {number} fee {fee}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A non-empty list changes the withdrawals root and nothing else.
+    #[test]
+    fn rule_with_withdrawals_changes_only_the_withdrawals_root() {
+        let fee = Address::repeat_byte(0xcd);
+        let old = canonical_header_rule(200_101, 12, fee);
+        let new = canonical_header_rule_with_withdrawals(200_101, 12, fee, &three_withdrawals());
+        assert_eq!(new.withdrawals_root, GOLDEN_THREE.parse::<B256>().unwrap());
+        assert_ne!(new.withdrawals_root, old.withdrawals_root);
+        assert_eq!(
+            new,
+            HeaderRule {
+                withdrawals_root: new.withdrawals_root,
+                ..old
+            }
+        );
     }
 }

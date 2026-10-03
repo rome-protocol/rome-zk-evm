@@ -61,7 +61,9 @@ services:
     restart: unless-stopped
     command: >
       node
+      --disable-discovery --max-outbound-peers 0 --max-inbound-peers 0 --addr 127.0.0.1
       --chain /genesis.json
+      --disable-discovery --max-outbound-peers 0 --max-inbound-peers 0
       --http --http.addr 0.0.0.0 --http.port 8547 --http.api eth,net,web3,testing,debug
       --authrpc.addr 0.0.0.0 --authrpc.port 8551 --authrpc.jwtsecret /jwt.hex
       --builder.gaslimit ${BLOCK_GAS_LIMIT:?BLOCK_GAS_LIMIT is not set - run ./rollup init}
@@ -147,7 +149,7 @@ services:
       # The entrypoint checks the proving keys against this manifest before every start (see prover/check-keys.sh).
       - ./prover/check-keys.sh:/opt/prover/check-keys.sh:ro
       - ${PROVER_KEYS_MANIFEST:-./prover/keys.sha256}:/opt/prover/keys.sha256:ro
-      # About 55 GB of proving keys on the host.
+      # The ZisK proving keys: about 41 GB to download, about 81 GB once installed (measured on a CPU host).
       # The final proof step needs one NVIDIA GPU with more than 30 GB of memory.
       # A 24 GB card is not enough.
       - ${ZISK_HOME:-/opt/zisk}:/opt/zisk:ro

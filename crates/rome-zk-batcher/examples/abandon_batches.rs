@@ -1,4 +1,6 @@
 //! Sends `AbandonBatch` for one or more batch ids, reclaiming each batch account's own rent to the payer.
+//! **Never run this for a batch settlement still needs: an abandoned id can be neither reopened nor skipped,
+//! so the chain halts for good at that id.** The batcher itself never abandons a batch (a restart finishes it).
 //! This does **not** reclaim the individual chunk PDAs opened under those batches — a separate rent pool,
 //! and a separate reclaim path: once a batch is abandoned, its chunk PDAs become closable *unconditionally*
 //! by their own authority (no root-finality wait — see `programs/zk-inbox/src/lib.rs`'s `Close` handler

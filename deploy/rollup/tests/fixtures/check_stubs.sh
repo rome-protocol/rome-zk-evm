@@ -11,6 +11,7 @@ set_world() { # healthy by default; callers overwrite single files
   echo 3 > "$S/oldest_age"
   echo 7 > "$S/cursor_next"; echo 5 > "$S/root_final"
   echo 0 > "$S/prover_behind"; echo 12 > "$S/prover_lag"
+  echo 0 > "$S/ver_peers"
 }
 
 make_stubs() {
@@ -37,7 +38,10 @@ case "\$url" in
       *) exit 1 ;;
     esac ;;
   http://127.0.0.1:8547|http://127.0.0.1:8547/)
-    printf '{"jsonrpc":"2.0","id":1,"result":"0x%x"}\n' "\$(bump ver_block ver_step)" ;;
+    case "\$(jq -r .method <<<"\$body")" in
+      net_peerCount) printf '{"jsonrpc":"2.0","id":1,"result":"0x%x"}\n' "\$(cat "\$S/ver_peers")" ;;
+      *) printf '{"jsonrpc":"2.0","id":1,"result":"0x%x"}\n' "\$(bump ver_block ver_step)" ;;
+    esac ;;
   http://127.0.0.1:9001/metrics) printf '# TYPE x counter\nrome_zk_sequencer_idle_ticks_total %s\n' "\$(bump idle_ticks idle_step)" ;;
   http://127.0.0.1:9002/metrics) printf 'rome_zk_batcher_oldest_unposted_block_age_seconds %s\n' "\$(cat "\$S/oldest_age")" ;;
   http://127.0.0.1:9004/metrics) printf 'rome_zk_prover_batches_behind %s\nrome_zk_prover_lag_seconds %s\n' "\$(cat "\$S/prover_behind")" "\$(cat "\$S/prover_lag")" ;;

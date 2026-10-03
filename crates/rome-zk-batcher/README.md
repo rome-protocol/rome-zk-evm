@@ -13,11 +13,12 @@ program.
   on-chain batch accounts — the last finalized batch's own posted blocks, decoded from its still-intact
   sealed chunks (or, once those are rent-recycled, from the settlement root plus an exact replay of the
   ordered log) — see `anchor::resolve_anchor`. Every not-finalized batch found in the pending window
-  `[root.head_final_batch, cursor.next_batch)` at startup is `AbandonBatch`'d and its chunk PDAs
-  closed before anything is posted (`resume`'s own module doc explains why a stateless resume can never
-  safely guess "still live" instead) — unless a finalized batch sits ABOVE an open one in that window, in
-  which case the sweep refuses by name (`PipelineError::FinalizedAboveOpenBatch`) and abandons nothing: defense
-  in depth now that `FinalizeBatch` is authority-gated on chain.
+  `[root.head_final_batch, cursor.next_batch)` at startup is **finished under its own id** before
+  anything new is posted (see the next bullet). A batch id is never given up: settlement posts exactly the
+  next id and needs that id's batch finalized, and an id the inbox cursor has passed can never be opened
+  again. A finalized batch sitting ABOVE an open one in that window is refused by name
+  (`PipelineError::FinalizedAboveOpenBatch`): defense in depth now that `FinalizeBatch` is authority-gated
+  on chain.
 - **Channel = batch, frame = chunk.** One batch (at most `blocks_per_batch` blocks, read from the
   sequencer's own `profile.json` — 10 by default and 60 on Tiber; `rome-zk-derive` does not read
   `profile.json` and carries the same value in its own config) is RLP-encoded and compressed as a
@@ -63,15 +64,29 @@ program.
 - **CU sampling never sits on the posting path.** The two `getTransaction` reads a finalized batch's own
   CU figures come from are spawned as a single budget-bounded (5 s total) background task; their outcome
   is a log line only and can never delay the next batch's own progress.
-- **At startup, every open-not-finalized batch in the pending window is abandoned, not just the newest**
-  (except when a finalized batch sits above an open one — then the sweep refuses and abandons nothing; defense
-  in depth now that `FinalizeBatch` is authority-gated on chain).
-  A bounded posting window can leave more than one batch open-not-finalized after a crash (e.g. the older
-  one still mid-chunk while a newer one had already been opened) — every one of them, from the settlement
-  root's own `head_final_batch` up to the cursor's `next_batch`, is swept before anything is posted. That
-  window is probed with paged `getMultipleAccounts` calls (100 ids per page — the same page size the
-  chain-anchor walk uses), never one `get_account` per id: while no batch has settled, `head_final_batch`
-  stays 0, so this window can span every batch the chain has ever opened.
+- **At startup, every open-not-finalized batch in the pending window is finished, never abandoned.**
+  A crash between `OpenBatch` and `FinalizeBatch` leaves a batch that settlement still needs. On the next
+  start the batcher takes each such batch (lowest id first) and works out which blocks it was cut from.
+  The chain still holds how many frames the batch expects, when it was opened, and a hash for every frame
+  already sealed; the frames that never landed exist only in the ordered log. So the batcher tries each
+  possible last block, from the block after the previous batch up to `blocks_per_batch` blocks long,
+  smallest first, and keeps the first one where (1) the log cuts into exactly the expected number of
+  frames, (2) every frame already on chain is byte-for-byte what this grouping would have produced, and
+  (3) every block is within the allowed time drift of the batch's open time. It then sends the missing
+  frames, finalizes (picking up from the finalize cursor if finalize had begun), checks `acc` and hands the
+  batch off like any other. If every frame is already on chain there is nothing to search: the frames are
+  read back from the chain. With more than one batch open, they are resumed in order, each starting where
+  the one before ends. Nothing is sent until the whole plan exists. If no grouping fits (the compressor
+  version, frame size, `blocks_per_batch` or the log changed since the crash) the batcher stops with the
+  named error `PipelineError::ResumeImpossible { batch, leaves_present, expected_count }`, sends nothing,
+  and leaves the batch open: rerun with the build and config that opened it. The window is probed with
+  paged `getMultipleAccounts` calls (100 ids per page — the same page size the chain-anchor walk uses),
+  never one `get_account` per id: while no batch has settled, `head_final_batch` stays 0, so this window
+  can span every batch the chain has ever opened.
+- **Never run `AbandonBatch` by hand on a batch settlement still needs: it halts the chain.** Settlement
+  posts exactly the next batch id, that id's batch must be finalized, and an abandoned id can never be
+  reopened or skipped, so the chain stops for good at that id. The `abandon_batches` example is only for
+  ids that nothing needs any more (for example leftovers from a measurement run on a throwaway chain).
 - **Re-derives before spending a fee.** Before committing to a channel's contents, this process decodes
   its own encoded stream back through the same stages a derivation node would use and compares the result
   to the sequencer's own blocks — a self-check that the compressed bytes it is about to pay to post
@@ -85,9 +100,10 @@ program.
 - **Back-pressure flows toward the sequencer, never toward silently dropping data.** When unposted bytes
   build up beyond a threshold, this process signals the sequencer to lower admission — it never drops
   transactions to keep up.
-- **Rent recycling waits for finality.** A chunk is only closed once the batch's root is final (per the
-  settlement watcher's status), never before — closing early would delete data availability the
-  settlement layer might still need.
+- **Posted inbox rent stays locked until the accounts are closed.** Closing a posted batch or chunk
+  needs a final root covering that batch; closing early would delete data the settlement layer may
+  still need. This batcher only closes chunks during startup cleanup of abandoned batches. It does
+  not close posted inbox accounts after finality, so plan for their rent to keep accumulating.
 - **A partial group also closes on its own after `batch_close_after_secs` — measured on this process's own
   receipt clock, never a block's own timestamp.** A group that never fills (the chain runs below its
   block-count cap, or produces nothing for a while) would otherwise sit unposted forever; once it has held
@@ -200,13 +216,16 @@ rome-zk-batcher --config batcher.toml --follow <log_dir>   # tail the log, post 
 Both modes resume from the same on-chain **chain anchor** (`anchor::resolve_anchor`) — there is no
 local resume file. On every start, before resolving the anchor or posting anything, every
 not-finalized batch found in the pending window `[root.head_final_batch, cursor.next_batch)` is
-`AbandonBatch`'d and its chunk PDAs closed — a prior instance's crash mid-post (possibly leaving more
-than one batch open under a bounded posting window) is never guessed at as "maybe still live". One
-exception, defense in depth now that `FinalizeBatch` is authority-gated on chain: if a finalized batch
+finished under its own id (`recover.rs`) — a prior instance's crash mid-post (possibly leaving more
+than one batch open under a bounded posting window) is repaired, not guessed at as "maybe still live" and
+not given up. If the log no longer matches what is on chain, the process stops with `ResumeImpossible`
+and sends nothing. One
+more refusal, defense in depth now that `FinalizeBatch` is authority-gated on chain: if a finalized batch
 sits above an open one in that window (for example a batch finalized under an older program version,
-or by another process holding this chain's authority key), the sweep refuses by name
-(`PipelineError::FinalizedAboveOpenBatch`) and abandons nothing — abandoning the open batch would
-strand its blocks; the process exits and stays halted on that chain until the open batch is finalized.
+or by another process holding this chain's authority key), startup refuses by name
+(`PipelineError::FinalizedAboveOpenBatch`) and sends nothing; the process exits and stays halted on that
+chain until the open batch is finalized. **`AbandonBatch` sent by hand halts the chain**: settlement still
+needs that id and an abandoned id can never be reopened, so do not run it for a batch that has not settled.
 This run then reads `batch_cursor.next_batch` once more as its own `expected_next_batch`: if the live
 cursor ever disagrees with it later, another writer holding this chain's authority key posted in
 between, and this process refuses by name rather than resolving a fresh id under a moved cursor —
@@ -256,6 +275,48 @@ those failures are noticed downstream.
 ## Throughput limit
 
 One payer key's frames-per-second limit is set by its per-block compute-unit budget, not by the transport.
+
+## Compute-unit limits
+
+Three limits cover the transactions that derive program addresses with a bump search. The search costs compute
+units for every extra attempt, and the attempts are fixed per address, so the cost varies with the batch id and the
+chunk slot. The batch cursor cannot skip an id, so a batch whose transaction does not fit its limit stops the chain at
+that id. An attempt fails with probability one half, so the chance an address needs at least m extra attempts is 2^-m.
+
+| Transaction | Limit (default) | Cost |
+|---|---|---|
+| Open-and-grow (`OpenBatch` plus the `GrowBatch` instructions a 900-leaf batch needs), once per batch | `open_compute_unit_limit` (400,000) | 23,677 CU, plus 4,500 CU per extra attempt on the batch address |
+| A frame's chunk transaction (`Open`, `Write`, `Seal`, `SealLeaf`), once per frame | `chunk_compute_unit_limit` (100,000) | about 16,400 CU, plus 1,500 CU per extra attempt on the batch address and 3,000 CU per extra attempt on the chunk address |
+| The same chunk transaction, resent once if it ran out of compute units | `chunk_retry_compute_unit_limit` (400,000) | as above |
+
+`tests/bump_search_cu_limit.rs` runs the compiled inbox program under the devnet inbox and settlement program ids and
+scans 256 batch ids for open-and-grow at 900 leaves and 900 chunk slots with a full-size body. The figures are
+23,677 CU at best, 28,431 at the median and 55,431 at the worst for open-and-grow, and 26,903 CU at the median and
+50,903 at the worst for a chunk transaction. Two batch ids from a wider scan, 274,100 and 1,895,697, cost 109,536 and
+132,063 CU in open-and-grow: both are over 100,000, which is why open-and-grow has its own limit, and the test
+requires the open limit to leave room for at least 40 more attempts (180,000 CU) above the cheapest id.
+
+A chunk frame that fails on chain for running out of compute units is resent once with the retry limit instead of
+failing the batch (`Sender::send_and_confirm_many_retrying_compute`; the runtime reports the overrun as
+`ComputationalBudgetExceeded` or as `ProgramFailedToComplete`, and both count). Only that frame pays the higher
+limit, once. At the 100,000 base limit a frame needs retrying when its attempts add up to more than 83,600 CU:
+28 chunk-address attempts on a batch address that needed none, which is about one frame in 270 million, or 23 when
+the batch address needed 10, about one in 8 million. `tests/chunk_compute_retry.rs` forces that path on the real
+program with a base limit below any frame's cost, and shows the frame landing on its retry.
+
+What is left after both: an open-and-grow transaction stops the chain only if the batch address needs 84 or more
+extra attempts (a chance of 2^-84 per batch id), and a frame fails after its retry only if its attempts add up to more
+than 383,600 CU, which is 128 chunk-address attempts on a batch address that needed none and still 87 on one that
+needed 83, the most that can open (below 2^-86 per frame). These are very small numbers, not zero: this does not say
+no batch can ever stall. The measured figures come from the scans; the 2^-m rule is the model for the rest.
+
+The priority fee is the limit times the price, and it is charged on the limit, not on what the
+transaction uses. At 1,000 micro-lamports per CU a 100,000 CU transaction pays 100 lamports; at the
+200,000 micro-lamport ceiling it pays 20,000. The block cost cap also charges the limit, so the payer
+clears about 292 frames per second at the 12,000,000 cap and about 585 at the 24,000,000 cap. A larger
+limit lowers both figures, which is why the chunk limit stays at 100,000 and the rare frame that needs more is retried
+instead. Open-and-grow and the retry are sent once per batch and once per rare frame, so their high limits cost
+almost nothing against the cap.
 
 ## Depends on
 

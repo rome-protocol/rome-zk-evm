@@ -16,7 +16,7 @@
 //! - [`throttle`] — the `Throttle` backpressure seam ("lowers admission, never drops").
 //! - [`sink`] — the `PostRootSink` hand-off seam a finalized batch is reported to.
 //! - [`resume`] — the stateless-resume decision table: given the inbox's on-chain batch state, decide
-//!   whether to post fresh, resume a half-written batch, or abandon-and-repost under a new id.
+//!   whether to post fresh, finish a half-written batch under its own id, or only hand off a finished one.
 //! - [`pipeline`] — wires the above into the full per-batch flow: `OpenBatch` -> parallel per-frame
 //!   `{Open+Write+Seal}` + `SealLeaf` -> `FinalizeBatch` -> verify `acc` -> hand off to a `PostRootSink`.
 //! - [`metrics`] — Prometheus counters/histograms.
@@ -46,6 +46,7 @@ pub mod loaded_accounts;
 pub mod metrics;
 pub mod pipeline;
 pub mod preflight;
+pub mod recover;
 pub mod resolve;
 pub mod resume;
 pub mod sender;

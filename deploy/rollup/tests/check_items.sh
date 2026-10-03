@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # deploy/rollup/tests/check_items.sh — `rollup check` items against stubbed docker and curl: services, chain id,
 # sequencer head (advancing, or idle by its own counter), batcher cursor and backlog, inbox batches, roots and
-# settlement lag (only meaningful with a prover), derive lag. One world file per knob; every item has a green and a
+# settlement lag (only meaningful with a prover), derive lag, verifier peers. One world file per knob; every item has a green and a
 # red case, and the red ones name what is wrong.
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/fixtures/common.sh"
@@ -24,6 +24,7 @@ expect "$out" '^PASS: inbox batches .*6' "inbox batches posted (next_batch - 1)"
 expect "$out" '^PASS: roots .*head_final_batch=5' "root decoded"
 expect "$out" '^SKIP: settlement lag — no prover' "settlement lag is skipped without a prover"
 expect "$out" '^PASS: derive lag' "derive follows the sequencer"
+expect "$out" '^PASS: verifier peers' "the verifier has no peers (discovery off)"
 
 echo 0x1 > "$S/chain_id_hex"; out="$(run)"
 expect "$out" '^FAIL: chain id — ChainIdMismatch' "wrong chain id fails by name"; echo 0x100067932 > "$S/chain_id_hex"
@@ -58,6 +59,10 @@ echo 95 > "$S/ver_block"
 echo 1 > "$S/ver_step"; out="$(run)"
 expect "$out" '^PASS: derive lag' "a verifier that keeps pace is fine"
 echo 0 > "$S/ver_step"
+
+echo 3 > "$S/ver_peers"; out="$(run)"
+expect "$out" '^FAIL: verifier peers — VerifierHasPeers' "a verifier with peers fails by name (it must never join a public peer network)"
+echo 0 > "$S/ver_peers"
 
 # With a prover configured: settlement lag and prover freshness become real items.
 echo "PROVER=on" >> "$ROLLUP_ENV"; echo "sequencer batcher reth-verifier derive prover postgres" > "$S/running"

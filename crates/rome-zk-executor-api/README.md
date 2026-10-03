@@ -26,6 +26,12 @@ caller's point of view this is not a new public surface — it is the same seam,
   — there is nothing a chain's `[profile].blocks_per_batch` (the batcher's own posting cadence, a
   different quantity that happens to share today's value) could thread into it even if a caller tried.
   Contracts that need real randomness use an oracle, as on any single-sequencer rollup.
+- **A block's withdrawals have one definition.** `deposit_withdrawal(index, recipient, amount_gwei)` builds the
+  withdrawal a deposit becomes (`validator_index` 0, the amount already in gwei), `withdrawals_root` is the
+  root of a block's withdrawals list, and `canonical_header_rule_with_withdrawals` is the header rule for a
+  block that carries them. The sequencer, derive and the stateless validator all call these, so they cannot
+  disagree on a block's `withdrawalsRoot`. With an empty list the root is `EMPTY_WITHDRAWALS` and the rule is
+  exactly `canonical_header_rule`, so a block without deposits is unchanged.
 - **A per-sub-block execution budget is enforced by the caller, not assumed by the executor.**
   `execute_sub_block` takes a gas limit and a wall-clock deadline; an executor must stop reaching new
   transactions once either binds, and must return everything it did not reach, in order, as
@@ -51,7 +57,10 @@ cargo test -p rome-zk-executor-api
 ```
 
 The tests here are the pure, deterministic ones: the `prev_randao` golden vector, and that it actually
-varies with chain id, block number, and batch boundary (never a constant). Behavioral tests of an actual
+varies with chain id, block number, and batch boundary (never a constant); and the withdrawals rule: the empty
+list gives `EMPTY_WITHDRAWALS`, the rule with an empty list equals the old rule over a sweep of inputs, and the
+root of one and of three withdrawals matches golden values computed outside the crate and the root alloy-consensus
+computes. Behavioral tests of an actual
 `Executor` implementation live in [`rome-zk-executor-reth`](../rome-zk-executor-reth) and
 [`rome-zk-sequencer`](../rome-zk-sequencer).
 
@@ -73,6 +82,8 @@ in-process reth implementation can sit behind this trait without changing anythi
 
 ## Depends on
 
-Nothing beyond `alloy-primitives` (for `Address`, `B256`, `Bytes`, `TxHash`, `keccak256`) and `thiserror`.
+`alloy-primitives` (for `Address`, `B256`, `Bytes`, `TxHash`, `keccak256`), `alloy-eips` (the `Withdrawal` type) and
+`alloy-trie` (the ordered-trie root), both with default features off, and `thiserror`. The crate builds for the
+zkVM target; CI checks that its dependency graph holds no `solana-program`.
 Implemented by [`rome-zk-executor-reth`](../rome-zk-executor-reth); consumed by
 [`rome-zk-sequencer`](../rome-zk-sequencer).

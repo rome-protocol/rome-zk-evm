@@ -18,15 +18,19 @@
 //! so a rerun over an unchanged (or grown) log posts only whatever the anchor has not yet covered.
 //!
 //! **Exactly one batcher per chain authority:** the run reads `batch_cursor.next_batch`
-//! once, right after the startup sweep below, as its own `expected_next_batch`, and refuses by name
+//! once, right after the startup recovery below, as its own `expected_next_batch`, and refuses by name
 //! (`resolve::ResolveError::CursorAdvanced`) the moment the live on-chain cursor disagrees with it — a
-//! second instance holding the same chain's authority key is destructive (it would double-post and abandon
+//! second instance holding the same chain's authority key is destructive (it would double-post and fight over
 //! the peer's in-flight batch), not merely unsupported.
 //!
 //! On every start (both modes), before resolving the anchor
 //! or posting anything, **every** open-not-finalized batch in the pending window
-//! `[root.head_final_batch, cursor.next_batch)` — not only `next_batch - 1` — is `AbandonBatch`'d and its
-//! chunk PDAs closed, never guessed at as "maybe still live" (`pipeline::abandon_open_batches_in_pending_window`).
+//! `[root.head_final_batch, cursor.next_batch)` — not only `next_batch - 1` — is **finished under its own
+//! id** (`pipeline::startup_recover`, `recover.rs`): the batcher re-derives the batch from the ordered log,
+//! checks it against the leaves already on chain, sends the frames that are missing and finalizes. It never
+//! abandons a batch, because settlement posts exactly the next id and an id the inbox cursor has passed
+//! can never be opened again. If the log no longer matches what is on chain it stops with
+//! `ResumeImpossible` and sends nothing. Running `AbandonBatch` by hand halts the chain.
 
 use clap::Parser;
 use rome_zk_batcher::anchor::{self, Anchor};
@@ -89,6 +93,7 @@ struct RunDeps {
     config: Config,
     payer_pubkey: solana_program::pubkey::Pubkey,
     chunk_tuning: SendTuning,
+    open_tuning: SendTuning,
     finalize_tuning: SendTuning,
     poll_interval: Duration,
 }
@@ -191,10 +196,16 @@ async fn main() -> ExitCode {
     // payer, so it needs its own, much tighter compute-unit limit than `tuning.compute_unit_limit`'s
     // general default: Solana's per-writable-account block cost cap charges every tx its *requested*
     // limit, so a too-high limit here caps the payer's own chunk-lane throughput regardless of `in_flight`
-    // (see `config::payer_cap_frames_per_sec`'s doc for the full accounting). `AbandonBatch`/`Close`
-    // reuse this same tuning — they are cheap, single-instruction sends.
+    // (see `config::payer_cap_frames_per_sec`'s doc for the full accounting). The batcher no longer sends
+    // `AbandonBatch` or `Close`; the same limit also serves the finalize-resume sends at startup.
     let chunk_tuning = SendTuning {
         compute_unit_limit: config.chunk_compute_unit_limit,
+        ..tuning
+    };
+    // The open-and-grow transaction has its own limit: its cost grows 4,500 CU per extra bump attempt on the
+    // batch address, and it is sent once per batch, so a high limit costs nothing on the per-frame cost cap.
+    let open_tuning = SendTuning {
+        compute_unit_limit: config.open_compute_unit_limit,
         ..tuning
     };
     // `FinalizeBatch` alone needs a much higher CU limit than every
@@ -236,6 +247,7 @@ async fn main() -> ExitCode {
         config,
         payer_pubkey,
         chunk_tuning,
+        open_tuning,
         finalize_tuning,
         poll_interval,
     };
@@ -265,82 +277,6 @@ async fn main() -> ExitCode {
         });
     }
 
-    // Abandon every open-not-finalized batch in the pending window
-    // `[root.head_final_batch, cursor.next_batch)` — before resolving the anchor (so the walk never has to
-    // reason about an OpenNotFinalized batch) or posting anything new.
-    match pipeline::abandon_open_batches_in_pending_window(
-        deps.rpc.as_ref(),
-        deps.sender.as_ref(),
-        &deps.config.inbox_program_id,
-        &deps.config.settlement_program_id,
-        chain_id,
-        deps.payer_pubkey,
-        deps.chunk_tuning,
-    )
-    .await
-    {
-        Ok(abandoned) if abandoned.is_empty() => {}
-        Ok(abandoned) => tracing::info!(
-            "abandoned {} open batch(es) at startup: {abandoned:?}",
-            abandoned.len()
-        ),
-        Err(e) => {
-            tracing::error!("abandoning open batches in the pending window at startup failed: {e}");
-            return ExitCode::FAILURE;
-        }
-    }
-
-    // The one on-chain anchor both modes resume from.
-    let anchor = match anchor::resolve_anchor(
-        deps.rpc.as_ref(),
-        &deps.config.inbox_program_id,
-        &deps.config.settlement_program_id,
-        chain_id,
-        log_dir,
-        profile_identity.sub_blocks_per_block,
-        profile_identity.block_gas_limit,
-    )
-    .await
-    {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::error!("failed to resolve the resume anchor: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    tracing::info!(
-        "resume anchor: from_block={} prev_block_timestamp_secs={}",
-        anchor.from_block,
-        anchor.prev_block_timestamp_secs
-    );
-
-    if let Some(given) = args.from_block {
-        if let Err(e) = anchor::verify_from_block_override(&anchor, given) {
-            tracing::error!("{e}");
-            return ExitCode::FAILURE;
-        }
-    }
-
-    // This run's own belief about the cursor, read once — after the startup sweep
-    // above (which never itself touches the cursor) — and advanced by one after every successful
-    // `OpenBatch` (`WindowedPoster::submit_group`). Any later disagreement with the live on-chain cursor
-    // means another writer holding this chain's authority key posted in between; `resolve::resolve_batch_id`
-    // refuses by name rather than silently resolving a new id under it.
-    let mut expected_next_batch = match resolve::read_cursor_next_batch(
-        deps.rpc.as_ref(),
-        &deps.config.inbox_program_id,
-        &deps.config.settlement_program_id,
-        chain_id,
-    )
-    .await
-    {
-        Ok(n) => n,
-        Err(e) => {
-            tracing::error!("failed to read the starting batch_cursor value: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
     // The poster (a `PostRootSink` is not yet consumed by anything real,
     // so a channel-backed sink with no receiver is the whole hand-off surface needed here;
     // `sink.rs`'s own doc: a slow or absent consumer must never stall batch production).
@@ -354,6 +290,8 @@ async fn main() -> ExitCode {
         chain_id,
         max_frame_body_len: deps.config.max_frame_body_len,
         chunk_tuning: deps.chunk_tuning,
+        open_tuning: deps.open_tuning,
+        chunk_retry_compute_unit_limit: deps.config.chunk_retry_compute_unit_limit,
         finalize_tuning: deps.finalize_tuning,
         // Matches the earlier poll shape (`FinalizePoll` in `post_one_group`): a 500 ms tick, up to
         // 120 polls (60 s) waiting for `leaves_present == expected_count` and again for `finalized`.
@@ -373,6 +311,62 @@ async fn main() -> ExitCode {
         // `config::default_cu_sample_every`'s own doc; refused nonzero at config load.
         cu_sample_every: deps.config.cu_sample_every,
     };
+    // Startup recovery (open-not-finalized batches in the pending window, then the one on-chain anchor
+    // both modes resume from) lives in the library so a test drives the same code path.
+    let anchor = match pipeline::startup_recover(
+        deps.rpc.as_ref(),
+        deps.sender.as_ref(),
+        deps.metrics.as_ref(),
+        sink.as_ref(),
+        &pipeline::StartupRecover {
+            window: &window_cfg,
+            log_dir,
+            sub_blocks_per_block: profile_identity.sub_blocks_per_block,
+            block_gas_limit: profile_identity.block_gas_limit,
+            blocks_per_batch: profile_identity.blocks_per_batch,
+        },
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    tracing::info!(
+        "resume anchor: from_block={} prev_block_timestamp_secs={}",
+        anchor.from_block,
+        anchor.prev_block_timestamp_secs
+    );
+
+    if let Some(given) = args.from_block {
+        if let Err(e) = anchor::verify_from_block_override(&anchor, given) {
+            tracing::error!("{e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // This run's own belief about the cursor, read once — after the startup recovery
+    // above (which never itself touches the cursor) — and advanced by one after every successful
+    // `OpenBatch` (`WindowedPoster::submit_group`). Any later disagreement with the live on-chain cursor
+    // means another writer holding this chain's authority key posted in between; `resolve::resolve_batch_id`
+    // refuses by name rather than silently resolving a new id under it.
+    let mut expected_next_batch = match resolve::read_cursor_next_batch(
+        deps.rpc.as_ref(),
+        &deps.config.inbox_program_id,
+        &deps.config.settlement_program_id,
+        chain_id,
+    )
+    .await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!("failed to read the starting batch_cursor value: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // The newest block number this run has actually seen
     // appended to the ordered log, shared between the main loop (writer, on every `source.next_block()`
     // that returns a block) and every batch's own settle task (reader, at its own hand-off time) — the

@@ -593,6 +593,18 @@ cmd_check() {
     skip "derive lag" "needs $MISSING, which is not running"
   fi
 
+  # Verifier peers: derive feeds the verifier over the Engine API, so it never needs a peer. A peer means peer discovery
+  # is on and the node has joined a public network, which cloud providers flag as cryptocurrency activity.
+  if needs reth-verifier; then
+    local peers; peers="$(rpc "$VERIFIER_RPC" net_peerCount)"
+    if [[ -z "$peers" ]]; then fail "verifier peers" "VerifierUnreachable: net_peerCount gave no answer from $VERIFIER_RPC"
+    elif (( peers == 0 )); then pass "verifier peers" "none (peer discovery is off)"
+    else fail "verifier peers" "VerifierHasPeers: $((peers)) peers; reth-verifier must run with --disable-discovery --max-outbound-peers 0 --max-inbound-peers 0"; fi
+  else
+    needs reth-verifier || true
+    skip "verifier peers" "needs $MISSING, which is not running"
+  fi
+
   echo "== rollup check :: $( (( FAILED == 0 )) && echo ALL PASS || echo SOME FAILED ) =="
   exit "$FAILED"
 }

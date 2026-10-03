@@ -410,61 +410,154 @@ pub trait Sender: Send + Sync {
         _poll_interval: Duration,
         _status_batch_size: usize,
     ) -> impl std::future::Future<Output = Result<BatchSendOutcome, SenderError>> + Send {
-        async move {
-            let started = Instant::now();
-            let in_flight = in_flight.max(1);
-            let mut confirmed = Vec::with_capacity(frames.len());
-            let mut total_steps = 0usize;
+        default_send_and_confirm_many(self, frames, tuning, None, in_flight)
+    }
 
-            for chunk in frames.chunks(in_flight) {
-                let results =
-                    futures_util::future::join_all(chunk.iter().map(|frame| async move {
-                        let frame_started = Instant::now();
-                        let mut stage_latencies = Vec::new();
-                        let mut last_sig = None;
-                        let mut steps = 0usize;
-                        for stage in frame {
-                            if stage.is_empty() {
-                                continue;
-                            }
-                            let stage_started = Instant::now();
-                            let sigs = futures_util::future::join_all(
-                                stage.iter().map(|tx| self.send_and_confirm(tx, tuning)),
-                            )
-                            .await;
-                            for sig in sigs {
-                                last_sig = Some(sig?);
-                                steps += 1;
-                            }
-                            stage_latencies.push(stage_started.elapsed());
-                        }
-                        Ok::<_, SenderError>((
-                            ConfirmedFrame {
-                                signature: last_sig
-                                    .expect("a non-empty FramePlan has at least one transaction"),
-                                confirm_latency: frame_started.elapsed(),
-                                stage_latencies,
-                            },
-                            steps,
-                        ))
-                    }))
-                    .await;
-                for r in results {
-                    let (cf, steps) = r?;
-                    confirmed.push(cf);
-                    total_steps += steps;
+    /// [`Self::send_and_confirm_many`] with one addition: a transaction that failed on chain because it ran out of
+    /// compute units ([`is_compute_exceeded`]) is resent once, unchanged, with `retry_compute_unit_limit` in place
+    /// of `tuning.compute_unit_limit`, instead of failing the whole call. A retry limit not above the base limit
+    /// turns the retry off. The batcher's chunk lane uses this: its base limit is tight (about 100,000 CU) because
+    /// the block cost cap charges every frame its limit, and a rare chunk address needs far more.
+    ///
+    /// **This default implementation** retries per transaction around [`Self::send_and_confirm`]. [`RpcSender`]
+    /// overrides it with a retry inside its batched confirm loop.
+    fn send_and_confirm_many_retrying_compute(
+        &self,
+        frames: &[FramePlan],
+        tuning: SendTuning,
+        retry_compute_unit_limit: u32,
+        in_flight: usize,
+        _poll_interval: Duration,
+        _status_batch_size: usize,
+    ) -> impl std::future::Future<Output = Result<BatchSendOutcome, SenderError>> + Send {
+        default_send_and_confirm_many(
+            self,
+            frames,
+            tuning,
+            Some(retry_compute_unit_limit),
+            in_flight,
+        )
+    }
+}
+
+/// True when `err` is an on-chain failure a transaction gets for running out of compute units. The runtime reports
+/// that two ways, both seen on the real compiled inbox program (`tests/chunk_compute_retry.rs`):
+/// [`InstructionError::ComputationalBudgetExceeded`] when a syscall (such as an address derivation) cannot charge
+/// its cost, and [`InstructionError::ProgramFailedToComplete`] when the program's own instruction meter runs out
+/// ("exceeded maximum number of instructions allowed"). The second is also the runtime's general program-fault
+/// error, so a match is "may have run out of compute units", not proof; a caller that resends on a match resends a
+/// transaction that already failed with no state change, at most once, and the resend fails the same way if the
+/// cause was not compute.
+pub fn is_compute_exceeded(err: &solana_transaction_error::TransactionError) -> bool {
+    matches!(
+        err,
+        solana_transaction_error::TransactionError::InstructionError(
+            _,
+            solana_instruction_error::InstructionError::ComputationalBudgetExceeded
+                | solana_instruction_error::InstructionError::ProgramFailedToComplete
+        )
+    )
+}
+
+/// [`is_compute_exceeded`] for a failed send: true only for a [`SenderError`] that carries that on-chain error.
+pub fn sender_error_is_compute_exceeded(err: &SenderError) -> bool {
+    sender_error_transaction_error(err).is_some_and(|e| is_compute_exceeded(&e))
+}
+
+/// One transaction through [`Sender::send_and_confirm`], resent once with `retry` as its compute-unit limit when
+/// the first attempt ran out of compute units. `None`, or a limit not above the base, never retries.
+async fn send_one_retrying_compute<S: Sender + ?Sized>(
+    sender: &S,
+    instructions: &[Instruction],
+    tuning: SendTuning,
+    retry: Option<u32>,
+) -> Result<Signature, SenderError> {
+    match sender.send_and_confirm(instructions, tuning).await {
+        Err(e)
+            if sender_error_is_compute_exceeded(&e)
+                && retry.is_some_and(|r| r > tuning.compute_unit_limit) =>
+        {
+            let retry = retry.expect("checked just above");
+            tracing::warn!(
+                "transaction ran out of compute units at {}; resending once at {retry}",
+                tuning.compute_unit_limit
+            );
+            sender
+                .send_and_confirm(
+                    instructions,
+                    SendTuning {
+                        compute_unit_limit: retry,
+                        ..tuning
+                    },
+                )
+                .await
+        }
+        other => other,
+    }
+}
+
+/// The trait's default frame driver: one [`Sender::send_and_confirm`] per transaction (with the one-shot compute
+/// retry of [`send_one_retrying_compute`] when `retry` is set), `in_flight` frames at a time.
+async fn default_send_and_confirm_many<S: Sender + ?Sized>(
+    sender: &S,
+    frames: &[FramePlan],
+    tuning: SendTuning,
+    retry: Option<u32>,
+    in_flight: usize,
+) -> Result<BatchSendOutcome, SenderError> {
+    let started = Instant::now();
+    let in_flight = in_flight.max(1);
+    let mut confirmed = Vec::with_capacity(frames.len());
+    let mut total_steps = 0usize;
+
+    for chunk in frames.chunks(in_flight) {
+        let results = futures_util::future::join_all(chunk.iter().map(|frame| async move {
+            let frame_started = Instant::now();
+            let mut stage_latencies = Vec::new();
+            let mut last_sig = None;
+            let mut steps = 0usize;
+            for stage in frame {
+                if stage.is_empty() {
+                    continue;
                 }
+                let stage_started = Instant::now();
+                let sigs = futures_util::future::join_all(
+                    stage
+                        .iter()
+                        .map(|tx| send_one_retrying_compute(sender, tx, tuning, retry)),
+                )
+                .await;
+                for sig in sigs {
+                    last_sig = Some(sig?);
+                    steps += 1;
+                }
+                stage_latencies.push(stage_started.elapsed());
             }
-
-            Ok(BatchSendOutcome {
-                frames: confirmed,
-                total_steps,
-                resubmits: 0,
-                elapsed: started.elapsed(),
-                rpc_retries: 0,
-            })
+            Ok::<_, SenderError>((
+                ConfirmedFrame {
+                    signature: last_sig
+                        .expect("a non-empty FramePlan has at least one transaction"),
+                    confirm_latency: frame_started.elapsed(),
+                    stage_latencies,
+                },
+                steps,
+            ))
+        }))
+        .await;
+        for r in results {
+            let (cf, steps) = r?;
+            confirmed.push(cf);
+            total_steps += steps;
         }
     }
+
+    Ok(BatchSendOutcome {
+        frames: confirmed,
+        total_steps,
+        resubmits: 0,
+        elapsed: started.elapsed(),
+        rpc_retries: 0,
+    })
 }
 
 /// The RPC calls [`run_send_and_confirm_many`] needs, and nothing else — modeled as a trait so this
@@ -698,6 +791,11 @@ struct Outstanding {
     stage_index: usize,
     tx_index: usize,
     priority_fee: u64,
+    /// The compute-unit limit this transaction's latest attempt carries: `tuning.compute_unit_limit`, then the
+    /// retry limit once it has been resent for running out of compute units.
+    compute_unit_limit: u32,
+    /// Set once the transaction has been resent at the retry limit; it is resent that way at most once.
+    cu_retried: bool,
     /// The `last_valid_block_height` that came back with the blockhash used for the *most
     /// recent* attempt at this transaction — a resubmit is only sent once `getBlockHeight` has passed
     /// this, never on a wall-clock guess.
@@ -764,12 +862,39 @@ impl RpcSender {
         poll_interval: Duration,
         status_batch_size: usize,
     ) -> Result<BatchSendOutcome, SenderError> {
+        self.send_and_confirm_many_with_compute_retry(
+            frames,
+            tuning,
+            None,
+            in_flight,
+            poll_interval,
+            status_batch_size,
+        )
+        .await
+    }
+
+    /// [`Self::send_and_confirm_many`] that resends a transaction once, with `retry_compute_unit_limit` in place
+    /// of `tuning.compute_unit_limit`, when it failed on chain for running out of compute units
+    /// ([`is_compute_exceeded`]) instead of failing the call. `None`, or a limit not above the base limit, leaves
+    /// that failure fatal. The failed attempt's signature is dropped from the tracked set, so its recorded error is
+    /// not read again; the retry then confirms (or fails) like any other attempt, and a second compute failure
+    /// is reported as [`SenderError::StepFailed`].
+    pub async fn send_and_confirm_many_with_compute_retry(
+        &self,
+        frames: &[FramePlan],
+        tuning: SendTuning,
+        retry_compute_unit_limit: Option<u32>,
+        in_flight: usize,
+        poll_interval: Duration,
+        status_batch_size: usize,
+    ) -> Result<BatchSendOutcome, SenderError> {
         self.retries.store(0, std::sync::atomic::Ordering::Relaxed);
-        let mut outcome = run_send_and_confirm_many(
+        let mut outcome = run_send_and_confirm_many_with_compute_retry(
             self,
             &self.payer,
             frames,
             tuning,
+            retry_compute_unit_limit,
             in_flight,
             poll_interval,
             status_batch_size,
@@ -795,6 +920,34 @@ async fn run_send_and_confirm_many<O: RpcOps>(
     poll_interval: Duration,
     status_batch_size: usize,
 ) -> Result<BatchSendOutcome, SenderError> {
+    run_send_and_confirm_many_with_compute_retry(
+        ops,
+        payer,
+        frames,
+        tuning,
+        None,
+        in_flight,
+        poll_interval,
+        status_batch_size,
+    )
+    .await
+}
+
+/// [`run_send_and_confirm_many`] with the one-shot compute retry of
+/// [`RpcSender::send_and_confirm_many_with_compute_retry`].
+#[allow(clippy::too_many_arguments)]
+async fn run_send_and_confirm_many_with_compute_retry<O: RpcOps>(
+    ops: &O,
+    payer: &Keypair,
+    frames: &[FramePlan],
+    tuning: SendTuning,
+    retry_compute_unit_limit: Option<u32>,
+    in_flight: usize,
+    poll_interval: Duration,
+    status_batch_size: usize,
+) -> Result<BatchSendOutcome, SenderError> {
+    let retry_compute_unit_limit =
+        retry_compute_unit_limit.filter(|r| *r > tuning.compute_unit_limit);
     let total = frames.len();
     let started = Instant::now();
     // The give-up ceiling: past it nothing is resubmitted, but a transaction that has landed (is at
@@ -912,6 +1065,8 @@ async fn run_send_and_confirm_many<O: RpcOps>(
                         stage_index,
                         tx_index,
                         priority_fee: tuning.priority_fee_micro_lamports,
+                        compute_unit_limit: tuning.compute_unit_limit,
+                        cu_retried: false,
                         last_valid_block_height,
                         signatures: vec![signature],
                     },
@@ -1039,6 +1194,61 @@ async fn run_send_and_confirm_many<O: RpcOps>(
                 }
             }
         }
+        // A transaction that ran out of compute units is resent once at the retry limit, instead of failing the
+        // call. Its failed signature is dropped from the tracked set (it executed and cannot succeed, and its
+        // recorded error would otherwise be read again on every later pass). The retry has a fresh signature, so
+        // it confirms or fails like any other attempt; a second compute failure falls through to `StepFailed`.
+        if let Some(retry_limit) = retry_compute_unit_limit {
+            let to_retry: Vec<(u64, Signature)> = slot_err
+                .iter()
+                .filter(|(id, (_, err))| {
+                    !slot_ok.contains_key(id)
+                        && is_compute_exceeded(err)
+                        && slots.get(id).is_some_and(|e| !e.cu_retried)
+                })
+                .map(|(id, (sig, _))| (*id, *sig))
+                .collect();
+            if !to_retry.is_empty() {
+                let (fresh_hash, fresh_last_valid) = ops.get_latest_blockhash().await?;
+                blockhash = fresh_hash;
+                last_valid_block_height = fresh_last_valid;
+                blockhash_fetched_at = Instant::now();
+                let submits = to_retry.iter().map(|(id, _)| {
+                    let entry = &slots[id];
+                    tracing::warn!(
+                        "frame {} stage {} tx {} ran out of compute units at {}; resending once at {retry_limit}",
+                        entry.frame_index,
+                        entry.stage_index,
+                        entry.tx_index,
+                        entry.compute_unit_limit,
+                    );
+                    submit(
+                        ops,
+                        payer,
+                        &frames[entry.frame_index][entry.stage_index][entry.tx_index],
+                        retry_limit,
+                        tuning.loaded_accounts_data_size_limit,
+                        entry.priority_fee,
+                        blockhash,
+                    )
+                });
+                let results = futures_util::future::join_all(submits).await;
+                for ((id, failed_sig), result) in to_retry.iter().zip(results) {
+                    let signature = result?;
+                    resubmits += 1;
+                    let entry = slots.get_mut(id).expect("to_retry ids are live slot ids");
+                    entry.compute_unit_limit = retry_limit;
+                    entry.cu_retried = true;
+                    entry.last_valid_block_height = last_valid_block_height;
+                    entry.signatures.retain(|s| s != failed_sig);
+                    entry.signatures.push(signature);
+                    sig_index.remove(failed_sig);
+                    sig_index.insert(signature, *id);
+                    slot_err.remove(id);
+                    slot_landed.remove(id);
+                }
+            }
+        }
         for (slot_id, (_, err)) in &slot_err {
             if slot_ok.contains_key(slot_id) {
                 continue; // an Ok for the same transaction arrived in the same poll — that wins.
@@ -1082,7 +1292,7 @@ async fn run_send_and_confirm_many<O: RpcOps>(
                         ops,
                         payer,
                         &frames[entry.frame_index][entry.stage_index][entry.tx_index],
-                        tuning.compute_unit_limit,
+                        entry.compute_unit_limit,
                         tuning.loaded_accounts_data_size_limit,
                         fee,
                         blockhash,
@@ -1319,6 +1529,27 @@ impl Sender for RpcSender {
             self,
             frames,
             tuning,
+            in_flight,
+            poll_interval,
+            status_batch_size,
+        )
+        .await
+    }
+
+    async fn send_and_confirm_many_retrying_compute(
+        &self,
+        frames: &[FramePlan],
+        tuning: SendTuning,
+        retry_compute_unit_limit: u32,
+        in_flight: usize,
+        poll_interval: Duration,
+        status_batch_size: usize,
+    ) -> Result<BatchSendOutcome, SenderError> {
+        RpcSender::send_and_confirm_many_with_compute_retry(
+            self,
+            frames,
+            tuning,
+            Some(retry_compute_unit_limit),
             in_flight,
             poll_interval,
             status_batch_size,
@@ -2654,6 +2885,162 @@ mod tests {
                 assert_eq!(tx_index, 0);
             }
             other => panic!("expected StepFailed, got {other:?}"),
+        }
+    }
+
+    fn compute_exceeded() -> TransactionError {
+        TransactionError::InstructionError(
+            0,
+            solana_instruction_error::InstructionError::ComputationalBudgetExceeded,
+        )
+    }
+
+    /// Waits until `marker` has had `n` signatures submitted, then returns the `n`th.
+    async fn nth_signature(ops: &FakeOps, marker: Marker, n: usize) -> Signature {
+        loop {
+            let sigs = ops.signatures_for(marker);
+            if sigs.len() >= n {
+                return sigs[n - 1];
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    #[test]
+    fn only_the_two_compute_overrun_instruction_errors_count_as_compute_exceeded() {
+        assert!(is_compute_exceeded(&compute_exceeded()));
+        assert!(is_compute_exceeded(&TransactionError::InstructionError(
+            3,
+            solana_instruction_error::InstructionError::ProgramFailedToComplete
+        )));
+        assert!(!is_compute_exceeded(&TransactionError::AccountInUse));
+        assert!(!is_compute_exceeded(&TransactionError::InstructionError(
+            0,
+            solana_instruction_error::InstructionError::Custom(1)
+        )));
+    }
+
+    /// A frame that ran out of compute units at the base limit is resent once at the retry limit and lands;
+    /// the other frame is untouched and keeps the base limit.
+    #[tokio::test]
+    async fn a_frame_that_ran_out_of_compute_units_is_resent_once_at_the_retry_limit_and_lands() {
+        let ops = FakeOps::new(false);
+        let payer = Keypair::new();
+        let frames = vec![single_stage_frame(0), single_stage_frame(1)];
+        let ops2 = ops.clone();
+        let handle = tokio::spawn(async move {
+            run_send_and_confirm_many_with_compute_retry(
+                &ops2,
+                &payer,
+                &frames,
+                tuning(),
+                Some(400_000),
+                4,
+                Duration::from_millis(1),
+                MAX_SIGNATURE_STATUSES_PER_CALL,
+            )
+            .await
+        });
+        let m = |frame_index| Marker {
+            frame_index,
+            stage_index: 0,
+            tx_index: 0,
+        };
+        ops.release(nth_signature(&ops, m(0), 1).await, None);
+        ops.release(nth_signature(&ops, m(1), 1).await, Some(compute_exceeded()));
+        // The retry is a second submission of frame 1; it lands.
+        ops.release(nth_signature(&ops, m(1), 2).await, None);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(30), handle)
+            .await
+            .expect("the send must end")
+            .unwrap()
+            .expect("the retried frame must land");
+        assert_eq!(outcome.frames.len(), 2);
+        assert_eq!(
+            ops.sent_compute_unit_limits(),
+            vec![Some(200_000), Some(200_000), Some(400_000)],
+            "frame 0 and frame 1's first attempt at the base limit, then one retry at the retry limit"
+        );
+    }
+
+    /// The retry happens once: a second compute failure at the retry limit fails the call at that frame.
+    #[tokio::test]
+    async fn a_second_compute_failure_at_the_retry_limit_fails_the_frame() {
+        let ops = FakeOps::new(false);
+        let payer = Keypair::new();
+        let frames = vec![single_stage_frame(0)];
+        let ops2 = ops.clone();
+        let handle = tokio::spawn(async move {
+            run_send_and_confirm_many_with_compute_retry(
+                &ops2,
+                &payer,
+                &frames,
+                tuning(),
+                Some(400_000),
+                4,
+                Duration::from_millis(1),
+                MAX_SIGNATURE_STATUSES_PER_CALL,
+            )
+            .await
+        });
+        let m = Marker {
+            frame_index: 0,
+            stage_index: 0,
+            tx_index: 0,
+        };
+        ops.release(nth_signature(&ops, m, 1).await, Some(compute_exceeded()));
+        ops.release(nth_signature(&ops, m, 2).await, Some(compute_exceeded()));
+        let err = tokio::time::timeout(Duration::from_secs(30), handle)
+            .await
+            .expect("the send must end")
+            .unwrap()
+            .expect_err("a second compute failure must fail");
+        assert!(sender_error_is_compute_exceeded(&err), "got {err:?}");
+        assert_eq!(
+            ops.sent_compute_unit_limits(),
+            vec![Some(200_000), Some(400_000)],
+            "exactly one retry, never a third attempt"
+        );
+    }
+
+    /// With no retry limit (or one not above the base) a compute failure is fatal at once, as before.
+    #[tokio::test]
+    async fn without_a_retry_limit_a_compute_failure_is_fatal() {
+        for retry in [None, Some(200_000u32), Some(100_000)] {
+            let ops = FakeOps::new(false);
+            let payer = Keypair::new();
+            let frames = vec![single_stage_frame(0)];
+            let ops2 = ops.clone();
+            let handle = tokio::spawn(async move {
+                run_send_and_confirm_many_with_compute_retry(
+                    &ops2,
+                    &payer,
+                    &frames,
+                    tuning(),
+                    retry,
+                    4,
+                    Duration::from_millis(1),
+                    MAX_SIGNATURE_STATUSES_PER_CALL,
+                )
+                .await
+            });
+            let m = Marker {
+                frame_index: 0,
+                stage_index: 0,
+                tx_index: 0,
+            };
+            ops.release(nth_signature(&ops, m, 1).await, Some(compute_exceeded()));
+            let err = tokio::time::timeout(Duration::from_secs(30), handle)
+                .await
+                .expect("the send must end")
+                .unwrap()
+                .expect_err("must fail");
+            assert!(
+                sender_error_is_compute_exceeded(&err),
+                "retry {retry:?}: {err:?}"
+            );
+            assert_eq!(ops.sent_compute_unit_limits().len(), 1, "retry {retry:?}");
         }
     }
 

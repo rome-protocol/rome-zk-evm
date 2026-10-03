@@ -1,0 +1,90 @@
+# Example Prometheus alert rules to adapt to your scrape jobs, chain settings, and paging route.
+# Scrape 127.0.0.1:9001 (sequencer), :9002 (batcher), :9003 (derive) and :9004 (prover, only when PROVER=on).
+# Inside the compose network the hosts are sequencer, batcher, derive and prover.
+# Replace <sequencer job> below with the sequencer scrape job name.
+# Remove the prover group below unless PROVER=on.
+groups:
+  - name: rome-zk-rollup
+    rules:
+      - alert: RomeZkSequencerMetricsMissing
+        expr: absent_over_time(rome_zk_sequencer_idle_ticks_total[2m])
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: Sequencer metrics are missing
+          description: Check the sequencer container and its local metrics port.
+      - alert: RomeZkBatcherMetricsMissing
+        expr: absent_over_time(rome_zk_batcher_oldest_unposted_block_age_seconds[2m])
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: Batcher metrics are missing
+          description: Check the batcher container and its local metrics port.
+      - alert: RomeZkDeriveMetricsMissing
+        expr: absent_over_time(rome_zk_derive_critical_total[2m])
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: Derive metrics are missing
+          description: Check the derive container and its local metrics port.
+      - alert: RomeZkSequencerStalled
+        expr: increase(rome_zk_sequencer_blocks_sealed_total[2m]) == 0 and increase(rome_zk_sequencer_idle_ticks_total[2m]) == 0
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: Sequencer is neither sealing blocks nor reporting idle ticks
+          description: Run ./rollup check and inspect the sequencer logs.
+      - alert: RomeZkBatchesNotFinalizing
+        expr: sum(increase(rome_zk_sequencer_blocks_sealed_total[10m] offset 5m)) > 0 unless on() sum(increase(rome_zk_batcher_batches_finalized_total[15m])) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: Blocks were sealed but no inbox batch finalized in 15 minutes
+          description: Raise the offset if batch_close_after_secs is above 60; inspect batcher logs and restart count, the payer balance and Solana RPC.
+      - alert: RomeZkDeriveStuckBehind
+        expr: (max(reth_blockchain_tree_canonical_chain_height{job="<sequencer job>"}) - max(rome_zk_derive_head_block) >= 120) and on() (max(delta(rome_zk_derive_head_block[2m])) <= 0) and on() (max(rome_zk_derive_head_block) > 0)
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: Derived head is at least 120 blocks behind and has stopped advancing
+          description: Compare the sequencer and verifier RPC heads; run ./rollup check.
+      - alert: RomeZkDeriveCritical
+        expr: increase(rome_zk_derive_critical_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: Derive hit a strict error
+          description: "Best effort: derive exits on this error and Docker restarts it; check its restart count and logs."
+  - name: rome-zk-prover-when-enabled
+    rules:
+      - alert: RomeZkProverMetricsMissing
+        expr: absent_over_time(rome_zk_prover_batches_behind[2m])
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: Prover metrics are missing
+          description: Check the prover and Postgres containers when PROVER=on.
+      - alert: RomeZkProverBatchesBehind
+        expr: rome_zk_prover_batches_behind > 2
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: Prover is more than two batches behind
+          description: Inspect the prover logs and its input, proof, and posting stages.
+      - alert: RomeZkProverOldestBatch
+        expr: rome_zk_prover_lag_seconds > 600 and rome_zk_prover_batches_behind > 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: Prover batch lag exceeds 600 seconds
+          description: Confirm the posted and final heads on Solana; this gauge keeps the last relayed batch's lag.

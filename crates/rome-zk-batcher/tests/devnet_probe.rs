@@ -148,7 +148,7 @@ async fn design_frame_v1_tx_simulates_clean_on_target_cluster() {
         .expect("get_latest_blockhash");
 
     let config = solana_message::v1::TransactionConfig::empty()
-        .with_compute_unit_limit(40_000) // chunk_compute_unit_limit default
+        .with_compute_unit_limit(100_000) // chunk_compute_unit_limit default
         .with_loaded_accounts_data_size_limit(loaded_accounts_data_size_limit);
     let message =
         solana_message::v1::Message::try_compile_with_config(&payer_v1, &v1_ixs, blockhash, config)

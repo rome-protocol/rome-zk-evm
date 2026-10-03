@@ -8,7 +8,15 @@ description = "The Executor trait, factored out of rome-zk-sequencer so an imple
 
 [dependencies]
 alloy-primitives = { version = "1.6", default-features = false, features = ["std"] }
+# The withdrawals rule: `Withdrawal` (alloy-eips) and the ordered-trie root (alloy-trie), the same pair of crates the
+# guest's execution layer already resolves, so one function serves the sequencer, derive and the guest.
+alloy-eips = { version = "2.0", default-features = false }
+alloy-trie = { version = "0.9", default-features = false }
 thiserror = "2"
+
+[dev-dependencies]
+# Cross-check only: the root this crate computes must equal alloy-consensus' own `calculate_withdrawals_root`.
+alloy-consensus = { version = "2", default-features = false }
 
 [lints]
 workspace = true

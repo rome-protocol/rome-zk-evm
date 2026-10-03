@@ -7,7 +7,7 @@
 # The prover is its own cargo workspace under crates/rome-zk-prover, so it builds from that directory rather than from
 # the repository root's workspace.
 #
-# The image does not contain the ZisK toolchain or the proving keys (about 55 GB on the host).
+# The image does not contain the ZisK toolchain or the proving keys (about 41 GB to download, about 81 GB installed).
 # The final proof step needs one NVIDIA GPU with more than 30 GB of memory.
 # A 24 GB card is not enough. Mount the keys at /opt/zisk from ZISK_HOME.
 # The image includes CUDA, OpenMPI, Node and snarkjs for the PLONK step.
