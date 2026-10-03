@@ -48,12 +48,14 @@ fn golden_blocks() -> Vec<Block> {
             timestamp: 1_757_000_000,
             gas_limit: 100_000_000,
             txs: vec![signed_tx(&signer, 0), signed_tx(&signer, 1)],
+            deposits_end: None,
         },
         Block {
             number: 1,
             timestamp: 1_757_000_001,
             gas_limit: 100_000_000,
             txs: vec![signed_tx(&signer, 2)],
+            deposits_end: None,
         },
     ]
 }

@@ -63,7 +63,6 @@ services:
       node
       --disable-discovery --max-outbound-peers 0 --max-inbound-peers 0 --addr 127.0.0.1
       --chain /genesis.json
-      --disable-discovery --max-outbound-peers 0 --max-inbound-peers 0
       --http --http.addr 0.0.0.0 --http.port 8547 --http.api eth,net,web3,testing,debug
       --authrpc.addr 0.0.0.0 --authrpc.port 8551 --authrpc.jwtsecret /jwt.hex
       --builder.gaslimit ${BLOCK_GAS_LIMIT:?BLOCK_GAS_LIMIT is not set - run ./rollup init}

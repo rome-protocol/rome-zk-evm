@@ -65,6 +65,7 @@ fn block(number: u64, nonce: u64, signer: &PrivateKeySigner) -> Block {
         timestamp: 1_757_000_000 + number,
         gas_limit: 100_000_000,
         txs: vec![signed_tx(signer, nonce)],
+        deposits_end: None,
     }
 }
 
@@ -149,6 +150,7 @@ fn a_size_closed_nine_block_group_decodes_through_derive_and_the_carried_block_s
         timestamp: 1_757_000_009,
         gas_limit: 100_000_000,
         txs: vec![large_tx],
+        deposits_end: None,
     };
     let small_len = rome_zk_batcher::channel::encode_stream(&small_blocks).len();
     let mut with_large = small_blocks.clone();

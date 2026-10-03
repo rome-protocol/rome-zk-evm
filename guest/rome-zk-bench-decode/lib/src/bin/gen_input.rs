@@ -81,6 +81,7 @@ fn main() {
                             )
                         })
                         .collect(),
+                    deposits_end: None,
                 })
                 .collect();
             let compressed = rome_zk_channel::encode_stream(&block_list);

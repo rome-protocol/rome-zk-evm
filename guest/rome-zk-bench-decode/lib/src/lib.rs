@@ -189,6 +189,7 @@ mod tests {
                     alloy_primitives::Bytes::from(vec![(number * 131 + i as u64) as u8; tx_len])
                 })
                 .collect(),
+            deposits_end: None,
         }
     }
 
@@ -208,6 +209,7 @@ mod tests {
                 txs: (0..txs_per_block)
                     .map(|i| alloy_primitives::Bytes::from(pseudo_random_tx(n, i as u64, tx_len)))
                     .collect(),
+                deposits_end: None,
             })
             .collect()
     }

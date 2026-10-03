@@ -134,6 +134,7 @@ fn build_blocks(corpus: &[Bytes], tx_count: usize, blocks: u64) -> Vec<Block> {
                 timestamp: 1_757_000_000 + b,
                 gas_limit: 100_000_000,
                 txs,
+                deposits_end: None,
             }
         })
         .collect()

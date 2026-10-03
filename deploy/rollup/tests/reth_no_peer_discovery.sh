@@ -16,6 +16,8 @@ for svc in $services; do
   for flag in "--disable-discovery" "--max-outbound-peers 0" "--max-inbound-peers 0" "--addr 127.0.0.1"; do
     if grep -qF -- "$flag" <<<"$block"; then pass "$svc runs with $flag"; else fail "$svc runs with $flag" "missing from its command"; fi
   done
+  dups="$(grep -oE -- '--[a-z][a-z0-9.-]*' <<<"$block" | sort | uniq -d | tr '\n' ' ')"
+  if [[ -z "$dups" ]]; then pass "$svc: no flag given twice"; else fail "$svc: no flag given twice" "repeated: $dups(reth refuses to start)"; fi
 done
 if grep -nE ':3030[34]' "$COMPOSE" >/dev/null; then fail "no devp2p port is published" "$(grep -nE ':3030[34]' "$COMPOSE" | head -2 | tr '\n' ' ')"; else pass "no devp2p port is published"; fi
 finish reth_no_peer_discovery

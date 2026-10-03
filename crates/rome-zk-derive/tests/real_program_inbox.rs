@@ -66,6 +66,7 @@ fn two_block_batch() -> Vec<Block> {
             timestamp: 1_757_000_000 + block_number,
             gas_limit: 100_000_000,
             txs,
+            deposits_end: None,
         });
     }
     blocks

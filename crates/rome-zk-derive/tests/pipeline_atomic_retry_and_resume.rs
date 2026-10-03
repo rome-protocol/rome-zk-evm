@@ -34,6 +34,7 @@ fn block(number: u64) -> Block {
         timestamp: 1_757_000_000 + number,
         gas_limit: 100_000_000,
         txs: vec![],
+        deposits_end: None,
     }
 }
 

@@ -157,6 +157,7 @@ async fn an_untampered_batch_derives_and_does_reach_the_engine() {
         timestamp: 1_757_000_001,
         gas_limit: 100_000_000,
         txs: vec![raw],
+        deposits_end: None,
     }];
     // Batch 0's blocks are design-numbered starting at 1 (the sequencer
     // numbers its first sealed block 1, so design number == real height, no offset — this fixture's

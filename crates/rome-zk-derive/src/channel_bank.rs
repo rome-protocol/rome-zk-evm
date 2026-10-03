@@ -115,6 +115,7 @@ mod tests {
                     .map(|i| i.wrapping_mul(2_654_435_761) as u8)
                     .collect::<Vec<u8>>(),
             )],
+            deposits_end: None,
         }
     }
 

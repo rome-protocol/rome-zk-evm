@@ -242,6 +242,7 @@ impl BlockSource {
                 timestamp,
                 gas_limit: self.block_gas_limit,
                 txs,
+                deposits_end: None,
             },
             sub_block_header_hashes,
         }))

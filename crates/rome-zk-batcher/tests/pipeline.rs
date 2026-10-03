@@ -66,6 +66,7 @@ fn three_block_batch_with_about_40_txs() -> Vec<Block> {
             timestamp: 1_757_000_000 + block_number,
             gas_limit: 100_000_000,
             txs,
+            deposits_end: None,
         });
     }
     blocks

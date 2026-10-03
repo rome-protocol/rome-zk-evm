@@ -357,6 +357,7 @@ mod tests {
             timestamp: 1_757_000_000 + number,
             gas_limit: 100_000_000,
             txs: vec![],
+            deposits_end: None,
         }
     }
 
@@ -549,6 +550,7 @@ mod tests {
             timestamp: 1_757_000_000 + number,
             gas_limit: 100_000_000,
             txs: vec![tx(4)],
+            deposits_end: None,
         }
     }
 
@@ -563,6 +565,7 @@ mod tests {
             timestamp: 1_757_000_009,
             gas_limit: 100_000_000,
             txs: vec![tx(10_000)],
+            deposits_end: None,
         };
         // A budget picked to sit strictly between "9 small blocks alone" and "9 small blocks + the large
         // one" (both measured directly via `encode_stream`, not guessed) — big enough for the large block
@@ -666,6 +669,7 @@ mod tests {
             timestamp: 1_757_000_000,
             gas_limit: 100_000_000,
             txs: vec![tx(10_000)],
+            deposits_end: None,
         };
         let err = g.push(huge, Instant::now()).unwrap_err();
         assert!(matches!(
@@ -857,6 +861,7 @@ mod tests {
             timestamp: stale_timestamp_base + number, // deliberately stale/irrelevant to the receipt clock
             gas_limit: 100_000_000,
             txs: vec![],
+            deposits_end: None,
         };
         let mut g = SizeCappedGrouper::new(10, 900, 3_681, None);
         let t0 = Instant::now();

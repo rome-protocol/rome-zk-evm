@@ -1112,6 +1112,7 @@ cluster = "devnet"
             timestamp: 1_757_000_000 + n,
             gas_limit: 5_000_000,
             txs: vec![],
+            deposits_end: None,
         };
         let mut closed_at = None;
         let now = std::time::Instant::now();

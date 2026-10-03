@@ -35,6 +35,7 @@ fn measure(label: &str, txs: Vec<Bytes>) {
             timestamp: 1_757_000_000 + i as u64,
             gas_limit: 100_000_000,
             txs: chunk.to_vec(),
+            deposits_end: None,
         })
         .collect();
     let compressed = encode_stream(&blocks);

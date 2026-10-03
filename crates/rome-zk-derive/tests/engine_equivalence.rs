@@ -169,6 +169,7 @@ async fn a_batch_derived_through_the_real_engine_api_matches_rome_zk_executor_re
             timestamp,
             gas_limit: chain_spec.genesis().gas_limit,
             txs: block_txs,
+            deposits_end: None,
         });
     }
 

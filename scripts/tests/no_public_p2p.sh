@@ -4,6 +4,7 @@
 # statically:
 #   1. every stock reth or geth service in every deploy/*/docker-compose*.yml starts with --disable-discovery,
 #      --max-outbound-peers 0, --max-inbound-peers 0 and its p2p listener on 127.0.0.1 (--addr 127.0.0.1);
+#      and no flag appears twice in its command (reth refuses a repeated flag and the node never starts);
 #   2. no compose file publishes a devp2p port (30303 or 30304);
 #   3. every Rust file that builds an in-process reth node (NodeConfig) disables both discovery kinds.
 set -uo pipefail
@@ -23,6 +24,8 @@ for f in "$ROOT"/deploy/*/docker-compose*.yml; do
     for flag in "--disable-discovery" "--max-outbound-peers 0" "--max-inbound-peers 0" "--addr 127.0.0.1"; do
       if grep -qF -- "$flag" <<<"$block"; then pass "$rel $svc: $flag"; else fail "$rel $svc: $flag" "missing from its command"; fi
     done
+    dups="$(grep -oE -- '--[a-z][a-z0-9.-]*' <<<"$block" | sort | uniq -d | tr '\n' ' ')"
+    if [[ -z "$dups" ]]; then pass "$rel $svc: no flag given twice"; else fail "$rel $svc: no flag given twice" "repeated: $dups(reth refuses to start)"; fi
   done
   if grep -nE '^[[:space:]]*-[[:space:]]*"?[^#]*:3030[34]' "$f" >/dev/null; then fail "$rel publishes no devp2p port" "$(grep -nE ':3030[34]' "$f" | head -2 | tr '\n' ' ')"; else pass "$rel publishes no devp2p port"; fi
 done

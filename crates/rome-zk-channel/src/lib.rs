@@ -25,11 +25,15 @@
 //! ## Block RLP shape `block_k = RLP{ number: u64, timestamp: u64, gas_limit: u64, txs: Vec<raw tx bytes> }` — a
 //! block's `txs` are opaque length-prefixed byte strings (this codec never parses tx contents), matching how the
 //! ordered log itself stores them (`rome_zk_sequencer::log::SubBlockRecord::txs`).
+//!
+//! A block may carry an optional fifth item, `deposits_end: u64` (the cumulative deposit cursor), if and only if the
+//! cursor changes in that block. A four-item block (`deposits_end: None`) encodes exactly as it always has. Decoders
+//! accept four or five items and nothing else; [`resolve_deposits_end`] applies the strict-increase rule.
 
 #![forbid(unsafe_code)]
 
 use alloy_primitives::{keccak256, Bytes};
-use alloy_rlp::{RlpDecodable, RlpEncodable};
+use alloy_rlp::{Decodable, Encodable, Header};
 
 /// Frame header length: 16-byte channel id + 2-byte frame number + 1-byte `is_last` flag. The single definition is
 /// `rome_zk_layouts::frame::FRAME_HEADER_LEN`; re-exported under this name so every existing call site (this module,
@@ -73,16 +77,167 @@ pub enum ChannelError {
     Zstd(String),
     #[error("rlp decode failed: {0}")]
     Rlp(#[from] alloy_rlp::Error),
+    #[error(
+        "block {block_index} carries deposits_end {got}, which is not above the previous value {previous} \
+         (a fifth field must strictly increase; the first block's previous value is the batch's `from`)"
+    )]
+    DepositsEndNotIncreasing {
+        block_index: usize,
+        previous: u64,
+        got: u64,
+    },
+    #[error(
+        "deposits_end for block {block_index} is {got}, below the previous value {previous} (the cumulative value never decreases)"
+    )]
+    DepositsEndDecreases {
+        block_index: usize,
+        previous: u64,
+        got: u64,
+    },
+    #[error("deposits_end list has {ends} values for {blocks} blocks (one per block)")]
+    DepositsEndLength { blocks: usize, ends: usize },
 }
 
 /// One block's channel-stream content. `txs` are raw (already-signed, EIP-2718-encoded) tx bytes, in the block's
 /// inclusion order — see `source.rs` for how these are read off the ordered log.
-#[derive(Debug, Clone, PartialEq, Eq, RlpEncodable, RlpDecodable)]
+///
+/// `deposits_end` is the optional fifth RLP item. A block carries it if and only if the cumulative deposit cursor
+/// changes in that block; a block without it keeps the previous block's value, and the first block's previous value
+/// is the batch's `from`. `None` encodes to exactly the four-item list this type always encoded to. See
+/// [`resolve_deposits_end`] for the strict-increase rule and [`set_deposits_end`] for the canonical encoder.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
     pub number: u64,
     pub timestamp: u64,
     pub gas_limit: u64,
     pub txs: Vec<Bytes>,
+    pub deposits_end: Option<u64>,
+}
+
+impl Block {
+    fn payload_length(&self) -> usize {
+        self.number.length()
+            + self.timestamp.length()
+            + self.gas_limit.length()
+            + self.txs.length()
+            + self.deposits_end.map_or(0, |d| d.length())
+    }
+}
+
+// Hand-written, not `#[rlp(trailing)]`: plain trailing mode decodes a `0x80` fifth item as `None` (alloy-rlp-derive
+// 0.3.16 `de.rs:161`), which would be a second encoding of "no field"; the canonical trailing mode refuses
+// `Option<u64>` outright (`de.rs:47`). Here a present fifth item is always `Some`, and `None` is only ever the
+// absence of the item.
+impl Encodable for Block {
+    fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
+        Header {
+            list: true,
+            payload_length: self.payload_length(),
+        }
+        .encode(out);
+        self.number.encode(out);
+        self.timestamp.encode(out);
+        self.gas_limit.encode(out);
+        self.txs.encode(out);
+        if let Some(d) = self.deposits_end {
+            d.encode(out);
+        }
+    }
+
+    fn length(&self) -> usize {
+        let payload_length = self.payload_length();
+        Header {
+            list: true,
+            payload_length,
+        }
+        .length()
+            + payload_length
+    }
+}
+
+impl Decodable for Block {
+    fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+        let header = Header::decode(buf)?;
+        if !header.list {
+            return Err(alloy_rlp::Error::UnexpectedString);
+        }
+        if buf.len() < header.payload_length {
+            return Err(alloy_rlp::Error::InputTooShort);
+        }
+        let (mut payload, rest) = buf.split_at(header.payload_length);
+        let number = u64::decode(&mut payload)?;
+        let timestamp = u64::decode(&mut payload)?;
+        let gas_limit = u64::decode(&mut payload)?;
+        let txs = Vec::<Bytes>::decode(&mut payload)?;
+        // `u64::decode` is canonical: it refuses a leading zero and a one-byte value wrapped in a string prefix.
+        let deposits_end = if payload.is_empty() {
+            None
+        } else {
+            Some(u64::decode(&mut payload)?)
+        };
+        // Exactly four or five items: anything after the optional fifth is refused.
+        if !payload.is_empty() {
+            return Err(alloy_rlp::Error::ListLengthMismatch {
+                expected: header.payload_length - payload.len(),
+                got: header.payload_length,
+            });
+        }
+        *buf = rest;
+        Ok(Block {
+            number,
+            timestamp,
+            gas_limit,
+            txs,
+            deposits_end,
+        })
+    }
+}
+
+/// The deposit cursor in force at the end of each block: a block's fifth field when it has one, else the previous
+/// block's value, with `from` as the value before block 0. Refuses a fifth field that is not strictly above the
+/// previous value (equal, decreasing, and a first block equal to `from` all fail). Derive and the guest share this.
+pub fn resolve_deposits_end(blocks: &[Block], from: u64) -> Result<Vec<u64>, ChannelError> {
+    let mut previous = from;
+    let mut out = Vec::with_capacity(blocks.len());
+    for (block_index, block) in blocks.iter().enumerate() {
+        if let Some(got) = block.deposits_end {
+            if got <= previous {
+                return Err(ChannelError::DepositsEndNotIncreasing {
+                    block_index,
+                    previous,
+                    got,
+                });
+            }
+            previous = got;
+        }
+        out.push(previous);
+    }
+    Ok(out)
+}
+
+/// The canonical encoder: given the cumulative deposit cursor at the end of each block (`ends`, one per block,
+/// never decreasing, `from` the value before block 0), sets each block's fifth field to `Some(end)` exactly where
+/// the value changes and to `None` where it does not. The inverse of [`resolve_deposits_end`].
+pub fn set_deposits_end(blocks: &mut [Block], from: u64, ends: &[u64]) -> Result<(), ChannelError> {
+    if blocks.len() != ends.len() {
+        return Err(ChannelError::DepositsEndLength {
+            blocks: blocks.len(),
+            ends: ends.len(),
+        });
+    }
+    let mut previous = from;
+    for (block_index, (block, &got)) in blocks.iter_mut().zip(ends).enumerate() {
+        if got < previous {
+            return Err(ChannelError::DepositsEndDecreases {
+                block_index,
+                previous,
+                got,
+            });
+        }
+        block.deposits_end = (got != previous).then_some(got);
+        previous = got;
+    }
+    Ok(())
 }
 
 /// `keccak256(chain_id_le[8] ++ batch_le[8])[..16]` — the 16-byte channel id every frame of one batch's
@@ -373,6 +528,7 @@ mod tests {
             txs: (0..tx_count)
                 .map(|i| tx((number * 31 + i as u64) as u8, tx_len))
                 .collect(),
+            deposits_end: None,
         }
     }
 
@@ -387,12 +543,14 @@ mod tests {
                 timestamp: 1_757_000_000,
                 gas_limit: 100_000_000,
                 txs: vec![Bytes::from_static(b"tx-a"), Bytes::from_static(b"tx-b")],
+                deposits_end: None,
             },
             Block {
                 number: 1,
                 timestamp: 1_757_000_001,
                 gas_limit: 100_000_000,
                 txs: vec![Bytes::from_static(b"tx-c")],
+                deposits_end: None,
             },
         ];
         let compressed = encode_stream(&blocks);
@@ -421,12 +579,14 @@ mod tests {
                 timestamp: 1_757_000_000,
                 gas_limit: 100_000_000,
                 txs: vec![Bytes::from_static(b"tx-a"), Bytes::from_static(b"tx-b")],
+                deposits_end: None,
             },
             Block {
                 number: 1,
                 timestamp: 1_757_000_001,
                 gas_limit: 100_000_000,
                 txs: vec![Bytes::from_static(b"tx-c")],
+                deposits_end: None,
             },
         ];
         let compressed = encode_stream(&blocks);
@@ -444,6 +604,47 @@ mod tests {
             hex::encode(&all_frame_bytes),
             expected_frames_hex,
             "cut_frames output changed — see this test's doc before updating the literal"
+        );
+    }
+
+    /// Golden RLP of a four-field block, captured from the derived `RlpEncodable` impl BEFORE the hand-written
+    /// impls replaced it. A `deposits_end: None` block must keep encoding to exactly these bytes
+    /// for the life of the format, so every deposit-free stream, public value and ELF input stays identical.
+    #[test]
+    fn golden_four_field_block_rlp_is_pinned() {
+        let block0 = Block {
+            number: 0,
+            timestamp: 1_757_000_000,
+            gas_limit: 100_000_000,
+            txs: vec![Bytes::from_static(b"tx-a"), Bytes::from_static(b"tx-b")],
+            deposits_end: None,
+        };
+        let block1 = Block {
+            number: 1,
+            timestamp: 1_757_000_001,
+            gas_limit: 100_000_000,
+            txs: vec![Bytes::from_static(b"tx-c")],
+            deposits_end: None,
+        };
+        let empty = Block {
+            number: 127,
+            timestamp: 128,
+            gas_limit: 0,
+            txs: vec![],
+            deposits_end: None,
+        };
+        assert_eq!(
+            hex::encode(alloy_rlp::encode(&block0)),
+            "d6808468b9b1408405f5e100ca8474782d618474782d62"
+        );
+        assert_eq!(
+            hex::encode(alloy_rlp::encode(&block1)),
+            "d1018468b9b1418405f5e100c58474782d63"
+        );
+        assert_eq!(hex::encode(alloy_rlp::encode(&empty)), "c57f818080c0");
+        assert_eq!(
+            hex::encode(alloy_rlp::encode(vec![block0, block1])),
+            "e9d6808468b9b1408405f5e100ca8474782d618474782d62d1018468b9b1418405f5e100c58474782d63"
         );
     }
 
@@ -473,6 +674,7 @@ mod tests {
                     .map(|i| i.wrapping_mul(2654435761u32) as u8)
                     .collect::<Vec<u8>>(),
             )],
+            deposits_end: None,
         };
         let compressed = encode_stream(std::slice::from_ref(&block));
         assert!(
@@ -719,5 +921,318 @@ mod tests {
             matches!(err, ChannelError::Zstd(_) | ChannelError::Rlp(_)),
             "corrupted stream must fail decode with a named error, got {err:?}"
         );
+    }
+
+    // ---- the fifth field ----
+
+    fn block_with_end(number: u64, deposits_end: Option<u64>) -> Block {
+        Block {
+            number,
+            timestamp: 1_757_000_000 + number,
+            gas_limit: 100_000_000,
+            txs: vec![Bytes::from_static(b"tx")],
+            deposits_end,
+        }
+    }
+
+    fn decode_block(raw: &str) -> Result<Block, alloy_rlp::Error> {
+        let bytes = hex::decode(raw).unwrap();
+        let mut slice = bytes.as_slice();
+        let block = <Block as alloy_rlp::Decodable>::decode(&mut slice)?;
+        assert!(slice.is_empty(), "decode left bytes behind");
+        Ok(block)
+    }
+
+    #[test]
+    fn five_field_block_encodes_to_pinned_bytes_and_round_trips() {
+        let block = Block {
+            number: 2,
+            timestamp: 1000,
+            gas_limit: 7,
+            txs: vec![],
+            deposits_end: Some(300),
+        };
+        let encoded = alloy_rlp::encode(&block);
+        assert_eq!(hex::encode(&encoded), "c9028203e807c082012c");
+        assert_eq!(decode_block("c9028203e807c082012c").unwrap(), block);
+        assert_eq!(alloy_rlp::Encodable::length(&block), encoded.len());
+        // And the four-field shape decodes to `None`.
+        let four = decode_block("c6028203e807c0").unwrap();
+        assert_eq!(four.deposits_end, None);
+    }
+
+    #[test]
+    fn block_decode_refuses_malformed_shapes() {
+        // Six items.
+        assert!(matches!(
+            decode_block("c6010203c00405"),
+            Err(alloy_rlp::Error::ListLengthMismatch { .. })
+        ));
+        // Leading-zero fifth integer.
+        assert_eq!(
+            decode_block("c7010203c0820005"),
+            Err(alloy_rlp::Error::LeadingZero)
+        );
+        // One-byte value wrapped in a string prefix.
+        assert_eq!(
+            decode_block("c6010203c08105"),
+            Err(alloy_rlp::Error::NonCanonicalSingleByte)
+        );
+        // A list where the fifth integer should be.
+        assert_eq!(
+            decode_block("c5010203c0c0").unwrap_err(),
+            alloy_rlp::Error::UnexpectedList
+        );
+        // Three items, and a bare string instead of a list.
+        assert!(decode_block("c3010203").is_err());
+        assert_eq!(
+            decode_block("05").unwrap_err(),
+            alloy_rlp::Error::UnexpectedString
+        );
+    }
+
+    /// A present `0x80` fifth item is `Some(0)`, never "no field": there is one encoding of "no field" (the
+    /// four-item list). The resolve rule then refuses it, since no value is below zero.
+    #[test]
+    fn an_empty_string_fifth_item_is_some_zero_and_is_refused_by_resolve() {
+        let block = decode_block("c5010203c080").unwrap();
+        assert_eq!(block.deposits_end, Some(0));
+        assert_eq!(
+            alloy_rlp::encode(&block),
+            hex::decode("c5010203c080").unwrap()
+        );
+        assert!(matches!(
+            resolve_deposits_end(&[block], 0),
+            Err(ChannelError::DepositsEndNotIncreasing {
+                block_index: 0,
+                previous: 0,
+                got: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn resolve_deposits_end_carries_the_value_forward() {
+        let blocks = [
+            block_with_end(0, None),
+            block_with_end(1, Some(12)),
+            block_with_end(2, None),
+            block_with_end(3, Some(13)),
+        ];
+        assert_eq!(
+            resolve_deposits_end(&blocks, 10).unwrap(),
+            vec![10, 12, 12, 13]
+        );
+        assert_eq!(resolve_deposits_end(&[], 10).unwrap(), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn resolve_deposits_end_refuses_equal_decreasing_and_first_block_equal_to_from() {
+        let equal = [block_with_end(0, Some(12)), block_with_end(1, Some(12))];
+        assert_eq!(
+            resolve_deposits_end(&equal, 10),
+            Err(ChannelError::DepositsEndNotIncreasing {
+                block_index: 1,
+                previous: 12,
+                got: 12
+            })
+        );
+        let decreasing = [block_with_end(0, Some(12)), block_with_end(1, Some(11))];
+        assert_eq!(
+            resolve_deposits_end(&decreasing, 10),
+            Err(ChannelError::DepositsEndNotIncreasing {
+                block_index: 1,
+                previous: 12,
+                got: 11
+            })
+        );
+        let first_equals_from = [block_with_end(0, Some(10))];
+        assert_eq!(
+            resolve_deposits_end(&first_equals_from, 10),
+            Err(ChannelError::DepositsEndNotIncreasing {
+                block_index: 0,
+                previous: 10,
+                got: 10
+            })
+        );
+        let first_below_from = [block_with_end(0, Some(9))];
+        assert!(resolve_deposits_end(&first_below_from, 10).is_err());
+    }
+
+    #[test]
+    fn set_deposits_end_writes_the_field_only_where_the_value_changes() {
+        let mut blocks: Vec<Block> = (0..5).map(|n| block_with_end(n, None)).collect();
+        set_deposits_end(&mut blocks, 10, &[10, 12, 12, 13, 13]).unwrap();
+        let fields: Vec<Option<u64>> = blocks.iter().map(|b| b.deposits_end).collect();
+        assert_eq!(fields, vec![None, Some(12), None, Some(13), None]);
+        assert_eq!(
+            resolve_deposits_end(&blocks, 10).unwrap(),
+            vec![10, 12, 12, 13, 13]
+        );
+        // The inverse also holds when the first block already moves the cursor.
+        set_deposits_end(&mut blocks, 10, &[11, 11, 11, 11, 11]).unwrap();
+        assert_eq!(blocks[0].deposits_end, Some(11));
+        assert!(blocks[1..].iter().all(|b| b.deposits_end.is_none()));
+    }
+
+    #[test]
+    fn set_deposits_end_refuses_a_decrease_and_a_length_mismatch() {
+        let mut blocks: Vec<Block> = (0..2).map(|n| block_with_end(n, None)).collect();
+        assert_eq!(
+            set_deposits_end(&mut blocks, 10, &[12, 11]),
+            Err(ChannelError::DepositsEndDecreases {
+                block_index: 1,
+                previous: 12,
+                got: 11
+            })
+        );
+        assert_eq!(
+            set_deposits_end(&mut blocks, 10, &[10, 10, 10]),
+            Err(ChannelError::DepositsEndLength { blocks: 2, ends: 3 })
+        );
+        assert_eq!(
+            set_deposits_end(&mut blocks, 10, &[9, 9]),
+            Err(ChannelError::DepositsEndDecreases {
+                block_index: 0,
+                previous: 10,
+                got: 9
+            })
+        );
+    }
+
+    #[test]
+    fn five_field_stream_round_trips_through_decode_stream() {
+        let mut blocks: Vec<Block> = (0..6).map(|n| sample_block(n, 3, 40)).collect();
+        set_deposits_end(&mut blocks, 100, &[100, 103, 103, 104, 110, 110]).unwrap();
+        assert_eq!(blocks[0].deposits_end, None);
+        assert_eq!(blocks[1].deposits_end, Some(103));
+        let compressed = encode_stream(&blocks);
+        assert_eq!(decode_stream(&compressed).unwrap(), blocks);
+    }
+
+    #[cfg(feature = "decode-pure")]
+    #[test]
+    fn five_field_stream_round_trips_through_decode_stream_pure() {
+        let mut blocks: Vec<Block> = (0..6).map(|n| sample_block(n, 3, 40)).collect();
+        set_deposits_end(&mut blocks, 100, &[100, 103, 103, 104, 110, 110]).unwrap();
+        let compressed = encode_stream(&blocks);
+        assert_eq!(decode_stream_pure(&compressed).unwrap(), blocks);
+        assert_eq!(
+            decode_stream_pure(&compressed).unwrap(),
+            decode_stream(&compressed).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_six_item_block_inside_a_stream_is_refused() {
+        // A list of one block that carries six items.
+        let rlp = hex::decode("c7c6010203c00405").unwrap();
+        let err = decode_rlp_blocks(&rlp).unwrap_err();
+        assert!(matches!(err, ChannelError::Rlp(_)), "got {err:?}");
+    }
+
+    // ---- recorded streams: every one decodes with `None` everywhere and re-encodes to the identical RLP ----
+
+    /// Reassembles the chunk bodies (frame header + body each) of one recorded batch and returns the
+    /// uncompressed RLP the C `zstd` decoder produces.
+    fn recorded_rlp(chunk_bodies: &[Vec<u8>]) -> Vec<u8> {
+        let frames: Vec<Frame> = chunk_bodies
+            .iter()
+            .map(|c| Frame::from_bytes(c).unwrap())
+            .collect();
+        let compressed = reassemble(&frames).unwrap();
+        #[cfg(feature = "decode-pure")]
+        {
+            let pure = decompress_pure(&compressed).unwrap();
+            assert_eq!(
+                pure,
+                zstd::decode_all(compressed.as_slice()).unwrap(),
+                "both decompressors agree on the recorded stream"
+            );
+        }
+        zstd::decode_all(compressed.as_slice()).unwrap()
+    }
+
+    fn assert_recorded_stream_is_unchanged(name: &str, chunk_bodies: &[Vec<u8>]) {
+        let rlp = recorded_rlp(chunk_bodies);
+        let blocks = decode_rlp_blocks(&rlp).unwrap();
+        assert!(!blocks.is_empty(), "{name}: the stream has blocks");
+        assert!(
+            blocks.iter().all(|b| b.deposits_end.is_none()),
+            "{name}: a recorded stream carries no fifth field"
+        );
+        assert_eq!(
+            alloy_rlp::encode(&blocks),
+            rlp,
+            "{name}: the stream no longer re-encodes to the recorded RLP"
+        );
+    }
+
+    /// `chunk_bodies_hex` of `fixtures/inbox/*.json`, read without a JSON dependency (the field is an array of
+    /// plain hex strings).
+    fn inbox_fixture_chunk_bodies(rel: &str) -> Vec<Vec<u8>> {
+        let path = format!("{}/../../{rel}", env!("CARGO_MANIFEST_DIR"));
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let key = raw.find("\"chunk_bodies_hex\"").unwrap();
+        let open = key + raw[key..].find('[').unwrap();
+        let close = open + raw[open..].find(']').unwrap();
+        raw[open + 1..close]
+            .split(',')
+            .map(|item| item.trim().trim_matches('"'))
+            .filter(|item| !item.is_empty())
+            .map(|item| hex::decode(item).unwrap())
+            .collect()
+    }
+
+    /// bincode (standard config) variable-length unsigned integer.
+    fn bincode_varint(buf: &mut &[u8]) -> u64 {
+        let tag = buf[0];
+        let (value, used) = match tag {
+            0..=250 => (tag as u64, 1),
+            251 => (u16::from_le_bytes(buf[1..3].try_into().unwrap()) as u64, 3),
+            252 => (u32::from_le_bytes(buf[1..5].try_into().unwrap()) as u64, 5),
+            253 => (u64::from_le_bytes(buf[1..9].try_into().unwrap()), 9),
+            _ => panic!("unsupported varint tag {tag}"),
+        };
+        *buf = &buf[used..];
+        value
+    }
+
+    /// `chunk_bodies` of a `fixtures/prover-input/*.bin` public frame: an 8-byte LE length prefix, then the
+    /// bincode `RomePublicInput` = chain_id, batch, open_slot, open_unix_ts (zigzag), max_drift_secs (all varints),
+    /// expected_count (varint), then `Vec<Vec<u8>>`.
+    fn prover_input_chunk_bodies(rel: &str) -> Vec<Vec<u8>> {
+        let path = format!("{}/../../{rel}", env!("CARGO_MANIFEST_DIR"));
+        let raw = std::fs::read(&path).unwrap();
+        let len = u64::from_le_bytes(raw[0..8].try_into().unwrap()) as usize;
+        let mut buf = &raw[8..8 + len];
+        for _ in 0..6 {
+            bincode_varint(&mut buf);
+        }
+        let count = bincode_varint(&mut buf);
+        (0..count)
+            .map(|_| {
+                let n = bincode_varint(&mut buf) as usize;
+                let body = buf[..n].to_vec();
+                buf = &buf[n..];
+                body
+            })
+            .collect()
+    }
+
+    #[test]
+    fn recorded_inbox_batch_2043_decodes_with_none_and_re_encodes_identically() {
+        let bodies = inbox_fixture_chunk_bodies("fixtures/inbox/txv1-dev-batch-2043.json");
+        assert_eq!(bodies.len(), 1);
+        assert_recorded_stream_is_unchanged("txv1-dev-batch-2043", &bodies);
+    }
+
+    #[test]
+    fn recorded_prover_input_streams_decode_with_none_and_re_encode_identically() {
+        for name in ["txv1-dev-batch-3930", "txv1-dev-reset6-batch-1"] {
+            let bodies = prover_input_chunk_bodies(&format!("fixtures/prover-input/{name}.bin"));
+            assert!(!bodies.is_empty(), "{name}: chunk bodies were found");
+            assert_recorded_stream_is_unchanged(name, &bodies);
+        }
     }
 }

@@ -803,6 +803,7 @@ mod tests {
                         alloy_primitives::Bytes::from(bytes)
                     })
                     .collect(),
+                deposits_end: None,
             })
             .collect();
         let compressed = channel::encode_stream(&blocks);
@@ -835,6 +836,7 @@ mod tests {
             timestamp,
             gas_limit: 100_000_000,
             txs: vec![],
+            deposits_end: None,
         }
     }
 

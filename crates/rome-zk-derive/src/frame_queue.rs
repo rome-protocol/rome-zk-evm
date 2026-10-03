@@ -64,6 +64,7 @@ mod tests {
             timestamp: 1_757_000_000,
             gas_limit: 100_000_000,
             txs: vec![alloy_primitives::Bytes::from_static(b"tx")],
+            deposits_end: None,
         }];
         let compressed = channel::encode_stream(&blocks);
         let frames = channel::cut_frames(CHAIN_ID, BATCH, &compressed, 3_681);
@@ -83,6 +84,7 @@ mod tests {
             timestamp: 1_757_000_000,
             gas_limit: 100_000_000,
             txs: vec![alloy_primitives::Bytes::from_static(b"tx")],
+            deposits_end: None,
         }];
         let compressed = channel::encode_stream(&blocks);
         // Cut for a DIFFERENT batch id than we validate against below — same chain_id, wrong channel.
@@ -105,6 +107,7 @@ mod tests {
             txs: vec![alloy_primitives::Bytes::from(
                 (0..2000u32).map(|i| i as u8).collect::<Vec<u8>>(),
             )],
+            deposits_end: None,
         }];
         let compressed = channel::encode_stream(&blocks);
         let frames = channel::cut_frames(CHAIN_ID, BATCH, &compressed, 64);

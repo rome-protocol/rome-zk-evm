@@ -1451,12 +1451,14 @@ mod tests {
                 timestamp: 1,
                 gas_limit: 100,
                 txs: vec![Bytes::from_static(b"tx-a")],
+                deposits_end: None,
             },
             Block {
                 number: 1,
                 timestamp: 2,
                 gas_limit: 100,
                 txs: vec![Bytes::from_static(b"tx-b"), Bytes::from_static(b"tx-c")],
+                deposits_end: None,
             },
         ]
     }

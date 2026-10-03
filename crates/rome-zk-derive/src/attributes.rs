@@ -60,6 +60,7 @@ mod tests {
             timestamp: 1_757_000_005,
             gas_limit: 100_000_000,
             txs: vec![Bytes::from_static(b"tx")],
+            deposits_end: None,
         };
         let attrs = attributes_for_block(200_101, Address::ZERO, &block);
         assert_eq!(attrs.chain_id, 200_101);
@@ -88,6 +89,7 @@ mod tests {
             timestamp: 1_757_000_005,
             gas_limit: 100_000_000,
             txs: vec![],
+            deposits_end: None,
         };
         let fee_recipient = Address::repeat_byte(0x77);
         let attrs = attributes_for_block(200_101, fee_recipient, &block);

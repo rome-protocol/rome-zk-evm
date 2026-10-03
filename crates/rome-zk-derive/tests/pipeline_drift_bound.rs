@@ -28,6 +28,7 @@ fn block_with_timestamp(number: u64, timestamp: u64) -> Block {
         timestamp,
         gas_limit: 100_000_000,
         txs: vec![],
+        deposits_end: None,
     }
 }
 

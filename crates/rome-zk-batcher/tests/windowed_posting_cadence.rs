@@ -463,6 +463,7 @@ fn block(number: u64, byte: u8) -> Block {
         timestamp: 1_757_000_000 + number,
         gas_limit: 100_000_000,
         txs: vec![alloy_primitives::Bytes::from(vec![byte; 4])],
+        deposits_end: None,
     }
 }
 

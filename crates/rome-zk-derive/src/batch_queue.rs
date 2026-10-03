@@ -190,6 +190,7 @@ mod tests {
             timestamp: 1_757_000_000 + batch * DEFAULT_BLOCKS_PER_BATCH + offset,
             gas_limit: 100_000_000,
             txs,
+            deposits_end: None,
         }
     }
 
