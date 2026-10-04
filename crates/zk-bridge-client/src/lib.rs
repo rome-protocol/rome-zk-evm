@@ -5,7 +5,9 @@
 pub mod vault_tool;
 
 use solana_program::{instruction::AccountMeta, pubkey::Pubkey};
-use zk_bridge::{BridgeIx, FundArgs, InitVaultArgs, ReleaseExitArgs};
+use zk_bridge::{
+    BridgeIx, CloseDepositArgs, DepositArgs, FundArgs, InitVaultArgs, ReleaseExitArgs,
+};
 
 pub use zk_bridge::state::{vault_authority_pda, vault_config_pda, vault_token_pda};
 
@@ -173,6 +175,145 @@ pub fn release_exit_ix(
             chain_id,
             message_hash,
         }),
+    )
+}
+
+/// The wrapped-SOL mint: the mint a vault holds when a chain's native asset is SOL.
+pub const NATIVE_MINT: Pubkey =
+    solana_program::pubkey!("So11111111111111111111111111111111111111112");
+
+/// The `deposit_queue` PDA of a chain under the bridge program.
+pub fn deposit_queue_pda(
+    program_id: &Pubkey,
+    settlement_program: &Pubkey,
+    chain_id: u64,
+) -> (Pubkey, u8) {
+    rome_zk_layouts::deposit_queue::deposit_queue::pda(
+        program_id,
+        &settlement_program.to_bytes(),
+        chain_id,
+    )
+}
+
+/// The `deposit_record` PDA of deposit `index` under the bridge program.
+pub fn deposit_record_pda(
+    program_id: &Pubkey,
+    settlement_program: &Pubkey,
+    chain_id: u64,
+    index: u64,
+) -> (Pubkey, u8) {
+    rome_zk_layouts::deposit_queue::deposit_record::pda(
+        program_id,
+        &settlement_program.to_bytes(),
+        chain_id,
+        index,
+    )
+}
+
+/// `Deposit`: locks `amount` of the vault's mint (in base units) and queues a credit of the same value, in
+/// gwei, to `l2_recipient`.
+///
+/// `index` is the queue's current `count`: the number of the record this deposit creates, read off the
+/// on-chain queue just before sending. If another deposit lands first the record address no longer matches
+/// and the program refuses by name; rebuild with the new count and send again. `fee_recipient` is the key in
+/// the queue's active parameters. `depositor` signs and pays the record's rent and the fee; the record's
+/// sender is `depositor`.
+///
+/// accounts: `[depositor (signer, writable), depositor_token (writable), vault_config (read-only),
+/// vault_token (writable), deposit_queue (writable), deposit_record (writable), exit_config (read-only),
+/// fee_recipient (writable), token_program, system_program, root (read-only), registry (read-only)]`.
+#[allow(clippy::too_many_arguments)]
+pub fn deposit_ix(
+    program_id: &Pubkey,
+    depositor: &Pubkey,
+    depositor_token: &Pubkey,
+    settlement_program: &Pubkey,
+    chain_id: u64,
+    mint: &Pubkey,
+    index: u64,
+    fee_recipient: &Pubkey,
+    amount: u64,
+    l2_recipient: [u8; 20],
+) -> solana_program::instruction::Instruction {
+    let (vault_config, _) = vault_config_pda(program_id, settlement_program, chain_id);
+    let (vault_token, _) = vault_token_pda(program_id, settlement_program, chain_id, mint);
+    let (queue, _) = deposit_queue_pda(program_id, settlement_program, chain_id);
+    let (record, _) = deposit_record_pda(program_id, settlement_program, chain_id, index);
+    let (exit_config, _) = rome_zk_layouts::exit::exit_config::pda(settlement_program, chain_id);
+    let (root, _) = rome_zk_layouts::root::pda(settlement_program, chain_id);
+    let (registry, _) = rome_zk_layouts::registry::pda(settlement_program, chain_id);
+    ix(
+        program_id,
+        vec![
+            AccountMeta::new(*depositor, true),
+            AccountMeta::new(*depositor_token, false),
+            AccountMeta::new_readonly(vault_config, false),
+            AccountMeta::new(vault_token, false),
+            AccountMeta::new(queue, false),
+            AccountMeta::new(record, false),
+            AccountMeta::new_readonly(exit_config, false),
+            AccountMeta::new(*fee_recipient, false),
+            AccountMeta::new_readonly(zk_bridge::token::TOKEN_PROGRAM_ID, false),
+            AccountMeta::new_readonly(solana_system_interface::program::id(), false),
+            AccountMeta::new_readonly(root, false),
+            AccountMeta::new_readonly(registry, false),
+        ],
+        BridgeIx::Deposit(DepositArgs {
+            chain_id,
+            amount,
+            l2_recipient,
+        }),
+    )
+}
+
+/// The instructions that turn `lamports` of the wallet's SOL into wrapped SOL in its own associated token
+/// account, ready to be the `depositor_token` of a `Deposit` into a vault whose mint is [`NATIVE_MINT`]:
+/// create the account if it is missing, move the lamports in, and sync the token balance to them. Put them
+/// ahead of `deposit_ix` in the same transaction. Returns the token account's address with the instructions.
+pub fn wrap_sol_ixs(
+    wallet: &Pubkey,
+    lamports: u64,
+) -> (Pubkey, Vec<solana_program::instruction::Instruction>) {
+    let ata = recipient_ata(wallet, &NATIVE_MINT);
+    let create = create_recipient_ata_idempotent_ix(wallet, wallet, &NATIVE_MINT);
+    let transfer = solana_system_interface::instruction::transfer(wallet, &ata, lamports);
+    // SPL Token `SyncNative`: instruction 17, one writable account (the wrapped-SOL token account).
+    let sync = solana_program::instruction::Instruction {
+        program_id: zk_bridge::token::TOKEN_PROGRAM_ID,
+        accounts: vec![AccountMeta::new(ata, false)],
+        data: vec![17u8],
+    };
+    (ata, vec![create, transfer, sync])
+}
+
+/// `CloseDeposit`: refunds deposit `index`'s record rent to its sender once a finalized batch has credited
+/// the deposit and that batch is final. Permissionless; `sender` is the record's sender (read it off the
+/// record), and the rent always goes there.
+///
+/// accounts: `[bridge_config (read-only), registry (read-only), cursor (read-only), deposit_record
+/// (writable), sender (writable)]`. `inbox_program` is the one the bridge config names.
+pub fn close_deposit_ix(
+    program_id: &Pubkey,
+    inbox_program: &Pubkey,
+    settlement_program: &Pubkey,
+    chain_id: u64,
+    index: u64,
+    sender: &Pubkey,
+) -> solana_program::instruction::Instruction {
+    let (config, _) = rome_zk_layouts::deposit_queue::bridge_config::pda(program_id);
+    let (registry, _) = rome_zk_layouts::registry::pda(settlement_program, chain_id);
+    let (cursor, _) = rome_zk_layouts::cursor::pda(inbox_program, settlement_program, chain_id);
+    let (record, _) = deposit_record_pda(program_id, settlement_program, chain_id, index);
+    ix(
+        program_id,
+        vec![
+            AccountMeta::new_readonly(config, false),
+            AccountMeta::new_readonly(registry, false),
+            AccountMeta::new_readonly(cursor, false),
+            AccountMeta::new(record, false),
+            AccountMeta::new(*sender, false),
+        ],
+        BridgeIx::CloseDeposit(CloseDepositArgs { chain_id, index }),
     )
 }
 

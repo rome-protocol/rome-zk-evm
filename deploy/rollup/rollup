@@ -8,6 +8,7 @@
 #                                       .env and the programs file)
 #   ./rollup register --dry-run         print the registration commands without running anything
 #   ./rollup register --confirm         register the chain on Solana (no verifier keys) and write rendered/pdas.env
+#   ./rollup guest-build [--skip-program-vk]   build the batch guest for rendered/genesis.json into rendered/guest/
 #   ./rollup up [service...]            start the node (the prover too when PROVER=on)
 #   ./rollup down                       stop and remove the containers; the data volumes stay
 #   ./rollup logs [-f] [--tail N] [service...]   the services' logs
@@ -504,6 +505,93 @@ cmd_up() {
   dc up -d "$@"
 }
 
+# ------------------------------------------------------------------------------------------------------ guest-build
+# The guest embeds your genesis, so every chain has its own ELF. The build runs in the guest-build image
+# (deploy/rollup/guest-build), which holds ZisK 1.2.0-alpha and clones the public sources of the node tag and the guest
+# tag; the image is built here the first time. The output is rendered/guest/<elf sha256>.elf and rendered/guest/vkey.json:
+# point ELF_DIR at the directory and VKEY_JSON at the file. The programVK needs the ZisK proving keys (ZISK_HOME) and about
+# 36 GB of memory; without them vkey.json is written without it and the command says so.
+GUEST_BUILD_EVM_TAG_DEFAULT=v0.2.1
+GUEST_BUILD_GUEST_TAG_DEFAULT=v0.2.0
+cmd_guest_build() {
+  local skip_vk=0 a
+  for a in "$@"; do
+    case "$a" in
+      --skip-program-vk) skip_vk=1 ;;
+      *) die UnknownArgument "'$a' (usage: rollup guest-build [--skip-program-vk])" ;;
+    esac
+  done
+  require_init
+  [[ -f "$OUT/chain-id.env" ]] || die NotInitialised "$OUT/chain-id.env does not exist (run ./rollup init first)"
+  command -v docker >/dev/null 2>&1 || die DockerMissing "docker is not installed (the guest is built in an image)"
+  local chain_id genesis_id funded
+  chain_id="$(rz_env_get "$OUT/chain-id.env" CHAIN_ID)"
+  [[ "$chain_id" =~ ^[0-9]+$ ]] || die ChainIdMissing "$OUT/chain-id.env has no CHAIN_ID (run ./rollup init again)"
+  genesis_id="$(python3 -c 'import json,sys
+v=json.load(open(sys.argv[1]))["config"]["chainId"]
+assert isinstance(v,int) and not isinstance(v,bool) and v>0
+print(v)' "$OUT/genesis.json" 2>/dev/null)" || die GenesisInvalid "$OUT/genesis.json is not a genesis file with a numeric config.chainId"
+  [[ "$genesis_id" == "$chain_id" ]] || die ChainIdMismatch "$OUT/genesis.json has config.chainId $genesis_id but your chain's id is $chain_id (from $OUT/chain-id.env). A guest built from this genesis could never prove your chain. Run ./rollup init again."
+  funded="$(python3 -c 'import json,sys
+a=json.load(open(sys.argv[1])).get("alloc") or {}
+def n(v):
+    v=v.get("balance","0") if isinstance(v,dict) else "0"
+    return int(v,16) if isinstance(v,str) and v.lower().startswith("0x") else int(v)
+print(sum(1 for v in a.values() if n(v)>0))' "$OUT/genesis.json" 2>/dev/null)" || die GenesisInvalid "$OUT/genesis.json has an alloc the guest build cannot read"
+  [[ "$funded" -le 1 ]] || die GenesisFundedAccountLimit "$OUT/genesis.json gives $funded accounts a non-zero balance; at most one is allowed (the one balance must be locked in your chain's vault)"
+  [[ "$OUT" != *,* ]] || die OutputDirInvalid "$OUT has a comma in it, which a bind mount cannot take"
+
+  local zisk_home keys=() keyargs=()
+  zisk_home="$(cfg ZISK_HOME)"
+  if (( skip_vk )); then
+    echo "guest-build: --skip-program-vk: vkey.json will have no programVK" >&2
+  elif [[ -z "$zisk_home" ]]; then
+    echo "guest-build: ZISK_HOME is not set in $ENV_FILE, so the programVK is not computed and vkey.json will have none (set it to the directory holding the ZisK proving keys to get it)" >&2
+  elif [[ ! -d "$(abs "$zisk_home")/provingKey" ]]; then
+    die ProvingKeyDirMissing "$(abs "$zisk_home")/provingKey does not exist (ZISK_HOME in $ENV_FILE must hold the ZisK 1.2.0-alpha proving keys; or pass --skip-program-vk)"
+  else
+    zisk_home="$(abs "$zisk_home")"
+    [[ "$zisk_home" != *,* ]] || die KeyPathInvalid "$zisk_home has a comma in it, which a bind mount cannot take"
+    keys=(--mount "type=bind,source=$zisk_home/provingKey,target=/keys/provingKey,readonly")
+    keyargs=(--proving-key-dir /keys/provingKey)
+  fi
+
+  local evm_tag guest_tag image
+  evm_tag="$(cfg ROME_ZK_TAG "$GUEST_BUILD_EVM_TAG_DEFAULT")"
+  guest_tag="$(cfg ROME_ZK_GUEST_TAG "$GUEST_BUILD_GUEST_TAG_DEFAULT")"
+  image="rome-zk-guest-build:$evm_tag-$guest_tag"
+  echo "guest-build: building the image $image (ZisK 1.2.0-alpha, rome-zk-evm $evm_tag, rome-zk-guest $guest_tag); the first build takes several minutes" >&2
+  docker build --platform linux/amd64 -t "$image" \
+    --build-arg "ROME_ZK_EVM_TAG=$evm_tag" --build-arg "ROME_ZK_GUEST_TAG=$guest_tag" \
+    "$ROLLUP_DIR/guest-build" >&2 || die GuestBuildImageFailed "docker build of $image failed"
+
+  mkdir -p "$OUT/guest" || die OutputDirFailed "cannot create $OUT/guest"
+  local started result rc
+  started="$(date +%s)"
+  result="$(docker run --rm --platform linux/amd64 \
+    --mount "type=bind,source=$OUT/genesis.json,target=/in/genesis.json,readonly" \
+    --mount "type=bind,source=$OUT/guest,target=/out" \
+    ${keys[@]+"${keys[@]}"} -e "OUT_UID=$(id -u)" -e "OUT_GID=$(id -g)" \
+    "$image" --expect-chain-id "$chain_id" ${keyargs[@]+"${keyargs[@]}"})"; rc=$?
+  [[ $rc -eq 0 ]] || die GuestBuildFailed "the build in $image stopped with exit $rc (the reason is above)"
+  local sha pvk
+  sha="$(sed -n 's/^elf_sha256=//p' <<<"$result" | head -n 1)"
+  pvk="$(sed -n 's/^program_vk=//p' <<<"$result" | head -n 1)"
+  [[ "$sha" =~ ^[0-9a-f]{64}$ && -f "$OUT/guest/$sha.elf" && -f "$OUT/guest/vkey.json" ]] || die GuestBuildFailed "the build reported no ELF under $OUT/guest"
+  [[ "$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$OUT/guest/$sha.elf")" == "$sha" ]] || die GuestBuildFailed "$OUT/guest/$sha.elf does not hash to $sha"
+  echo "guest ELF       $OUT/guest/$sha.elf"
+  echo "elf sha256      $sha"
+  echo "chain id        $chain_id"
+  echo "program VK      ${pvk:-none}"
+  echo "vkey.json       $OUT/guest/vkey.json"
+  echo "took            $(( $(date +%s) - started )) s"
+  echo "Set ELF_DIR=$OUT/guest and VKEY_JSON=$OUT/guest/vkey.json in $ENV_FILE for the prover."
+  if [[ -z "$pvk" || "$pvk" == none ]]; then
+    echo "ProgramVkNotComputed: vkey.json has no programVK (the reason is above), and the prover refuses a vkey.json without one. Run this command on a machine with the ZisK proving keys (ZISK_HOME) and at least 40 GiB of memory, or get the programVK for this ELF from Rome and add it to vkey.json as \"programVK\"." >&2
+  fi
+  return 0
+}
+
 # --------------------------------------------------------------------------------------------- operator commands
 # One context for every command below: the rendered chain, the Solana RPC, the programs file and the payer key. Sets
 # CHAIN_ID and PAYER (the host path of the key). Each command then says which keys it mounts.
@@ -962,6 +1050,7 @@ cmd="${1:-}"; shift || true
 case "$cmd" in
   init) cmd_init "$@" ;;
   register) cmd_register "$@" ;;
+  guest-build) cmd_guest_build "$@" ;;
   up) cmd_up "$@" ;;
   check) cmd_check "$@" ;;
   down) cmd_down "$@" ;;

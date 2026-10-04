@@ -98,6 +98,38 @@ pub enum BridgeError {
     NoPendingParams = 33,
     /// `ActivateDepositParams`: the proposal's activation slot has not been reached.
     ActivationNotReached = 34,
+    /// `Deposit`: the amount is below the queue's active minimum.
+    DepositBelowMinimum = 35,
+    /// `Deposit`: the L2 recipient is the zero address or the chain's exit portal (a credit to the portal
+    /// is burned, because the portal records no message for it).
+    DepositRecipientInvalid = 36,
+    /// `Deposit`: the `exit_config` account is not at `exit_config::pda(settlement_program, chain_id)`, is
+    /// not owned by that settlement program, or does not hold an exit config for this chain.
+    ExitConfigNotCanonical = 37,
+    /// `Deposit`: the chain's `exit_config.bridge_program` is not this program, so this program is not the
+    /// chain's bridge and takes no deposits for it.
+    NotChainsBridge = 38,
+    /// `Deposit`: the `fee_recipient` account is not the key in the queue's active parameters.
+    WrongFeeRecipient = 39,
+    /// The `deposit_record` account is not at `["deposit", settlement_program, chain_id, index]` under this
+    /// program, is not owned by it, or does not hold the record for that index.
+    WrongDepositRecord = 40,
+    /// `Deposit`: the record address for the next index already holds a written record.
+    DepositRecordInUse = 41,
+    /// `Deposit`: the `vault_token` account is not the vault's token account for the chain and mint.
+    WrongVaultToken = 42,
+    /// `CloseDeposit`: the cursor is not at the inbox's `["batch_cursor", ...]` PDA for the chain, is not
+    /// owned by the registry's inbox, or is not a version 2 cursor.
+    WrongCursor = 43,
+    /// `CloseDeposit`: no finalized batch has credited this deposit yet (`cursor.deposit_next <= index`).
+    DepositNotCredited = 44,
+    /// `CloseDeposit`: the batch that credits this deposit is not final yet
+    /// (`index >= cursor.deposit_final`).
+    DepositNotFinal = 45,
+    /// `CloseDeposit`: the account that receives the rent is not the record's `sender`.
+    WrongRentRecipient = 46,
+    /// The fee recipient is an executable account or a sysvar, which cannot take the fee.
+    FeeRecipientNotPlain = 47,
 }
 
 impl From<BridgeError> for ProgramError {

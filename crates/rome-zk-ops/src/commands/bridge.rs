@@ -1,4 +1,4 @@
-//! The bridge commands: `vault init`, `vault fund`, `vault show` and `release-exit`. The planning (what to refuse,
+//! The bridge commands: `vault init`, `vault fund`, `vault show`, `release-exit` and `deposit`. The planning (what to refuse,
 //! in which order, what to build) is `zk_bridge_client::vault_tool` and the instruction builders in `zk_bridge_client`;
 //! this module only reads the accounts those functions need, maps their refusals to named errors, and sends through
 //! [`crate::commands::execute_many`], so every send is one V1 transaction through `rome-zk-solana-sender`.
@@ -382,6 +382,168 @@ pub async fn release_exit<C: Chain>(
         report.line(format!("-- sent: {sig}"));
     }
     Ok(report)
+}
+
+pub struct DepositRequest {
+    pub settlement: Pubkey,
+    pub bridge: Pubkey,
+    pub chain_id: u64,
+    /// Raw units of the vault's mint (lamports when the vault holds wrapped SOL).
+    pub amount: u64,
+    /// The 20-byte address that is credited on the chain.
+    pub l2_recipient: [u8; 20],
+    /// Wrap `amount` lamports of the depositor's SOL first, in the same transaction. Only for a vault whose mint is
+    /// wrapped SOL.
+    pub wrap_sol: bool,
+    /// The depositor's keypair file; it signs and pays the record's rent and the fee.
+    pub keypair: PathBuf,
+}
+
+/// `deposit`: lock `amount` of the vault's mint and queue a credit of the same value, in gwei, to `l2_recipient`.
+/// Reads the vault (for the mint) and the queue (for the next index, the minimum and the fee recipient) before any
+/// key file is opened, then sends `Deposit`, preceded by the wrap instructions with `--wrap-sol`, as one V1
+/// transaction.
+pub async fn deposit<C: Chain>(
+    chain: &C,
+    req: DepositRequest,
+    mode: Mode,
+) -> Result<Report, OpsError> {
+    let mut report = Report::default();
+    let (vault_pda, _) =
+        zk_bridge_client::vault_config_pda(&req.bridge, &req.settlement, req.chain_id);
+    let vault_data = fetch(chain, &vault_pda, "vault_config", "VaultConfigFetchFailed")
+        .await?
+        .ok_or_else(|| {
+            OpsError::chain(
+                "VaultConfigNotFound",
+                format!("vault_config {vault_pda} not found; the chain has no bridge vault under this bridge"),
+            )
+        })?;
+    let vault = zk_bridge_client::decode_vault_config_account(&vault_data).map_err(|e| {
+        OpsError::chain(
+            "VaultConfigUndecodable",
+            format!("vault_config {vault_pda} does not decode: {e}"),
+        )
+    })?;
+    check_vault_settlement(&vault, &req.settlement)?;
+
+    let (queue_pda, _) =
+        zk_bridge_client::deposit_queue_pda(&req.bridge, &req.settlement, req.chain_id);
+    let queue_data = fetch(chain, &queue_pda, "deposit_queue", "DepositQueueFetchFailed")
+        .await?
+        .ok_or_else(|| {
+            OpsError::chain(
+                "DepositQueueNotFound",
+                format!("deposit_queue {queue_pda} not found; the chain's deposit queue has not been set up"),
+            )
+        })?;
+    let queue = rome_zk_layouts::deposit_queue::deposit_queue::read(&queue_data).map_err(|e| {
+        OpsError::chain(
+            "DepositQueueUndecodable",
+            format!("deposit_queue {queue_pda} does not decode: {e:?}"),
+        )
+    })?;
+
+    if req.amount < queue.params.min_amount {
+        return Err(OpsError::chain(
+            "DepositBelowMinimum",
+            format!(
+                "amount {} is below the queue's minimum {} (raw units)",
+                req.amount, queue.params.min_amount
+            ),
+        ));
+    }
+    if req.l2_recipient == [0u8; 20] {
+        return Err(OpsError::chain(
+            "DepositRecipientInvalid",
+            "the recipient is the zero address".to_string(),
+        ));
+    }
+    if req.wrap_sol && vault.mint != zk_bridge_client::NATIVE_MINT {
+        return Err(OpsError::chain(
+            "WrapSolNeedsNativeMint",
+            format!(
+                "--wrap-sol was given but the vault's mint is {}, not wrapped SOL",
+                vault.mint
+            ),
+        ));
+    }
+    let gwei = rome_zk_layouts::deposit_queue::amount_gwei(req.amount, vault.mint_decimals)
+        .map_err(|e| OpsError::chain("DepositAmountInvalid", format!("{e:?}")))?;
+
+    let depositor = keys::load(&req.keypair, "--keypair")?;
+    let depositor_key = keys::pubkey(&depositor);
+    let index = queue.count;
+    let fee_recipient = Pubkey::new_from_array(queue.params.fee_recipient);
+    let mut ixs = Vec::new();
+    let depositor_token = if req.wrap_sol {
+        let (ata, wrap) = zk_bridge_client::wrap_sol_ixs(&depositor_key, req.amount);
+        ixs.extend(wrap);
+        ata
+    } else {
+        zk_bridge_client::recipient_ata(&depositor_key, &vault.mint)
+    };
+    let deposit_ix = zk_bridge_client::deposit_ix(
+        &req.bridge,
+        &depositor_key,
+        &depositor_token,
+        &req.settlement,
+        req.chain_id,
+        &vault.mint,
+        index,
+        &fee_recipient,
+        req.amount,
+        req.l2_recipient,
+    );
+    ixs.push(deposit_ix.clone());
+
+    report.line(format!(
+        "-- deposit: chain {}, settlement {}, bridge {}",
+        req.chain_id, req.settlement, req.bridge
+    ));
+    report.line(format!("  depositor        {depositor_key}"));
+    report.line(format!(
+        "  recipient        0x{}",
+        hex::encode(req.l2_recipient)
+    ));
+    report.line(format!(
+        "  amount           {} raw units of {} ({gwei} gwei credited)",
+        req.amount, vault.mint
+    ));
+    report.line(format!(
+        "  record index     {index} (the queue's current count)"
+    ));
+    report.line(format!(
+        "  fee              {} lamports to {fee_recipient}",
+        queue.params.fee_lamports
+    ));
+    if req.wrap_sol {
+        report.line(
+            "  instructions 1-3: wrap SOL (create the token account if missing, transfer, sync)",
+        );
+    }
+    report.line("  instruction: Deposit (zk-bridge)");
+    print_accounts(&mut report, &deposit_ix);
+
+    let signers = Signers::new(depositor, vec![]);
+    if let Some(sig) = execute_many(chain, mode, "Deposit", &ixs, &signers, &mut report).await? {
+        report.line(format!("-- sent: {sig}"));
+    }
+    Ok(report)
+}
+
+fn check_vault_settlement(
+    vault: &zk_bridge_client::VaultConfigAccount,
+    settlement: &Pubkey,
+) -> Result<(), OpsError> {
+    zk_bridge_client::check_vault_settlement(vault, settlement).map_err(|e| {
+        OpsError::chain(
+            "VaultSettlementMismatch",
+            e.to_string()
+                .trim_start_matches("VaultSettlementMismatch: ")
+                .to_string(),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -782,5 +944,215 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.name, "ExitRecordNotFound");
+    }
+
+    // ---- deposit ----
+
+    const RECIPIENT: [u8; 20] = [0xab; 20];
+
+    fn queue_bytes(count: u64, min_amount: u64, fee_recipient: Pubkey) -> Vec<u8> {
+        use rome_zk_layouts::deposit_queue::deposit_queue as q;
+        let mut d = vec![0u8; q::LEN];
+        q::write(
+            &mut d,
+            &q::DepositQueueFields {
+                count,
+                head_hash: [1u8; 32],
+                params: q::DepositParams {
+                    inclusion_deadline_secs: 600,
+                    max_per_batch: 64,
+                    max_per_block: 16,
+                    min_amount,
+                    fee_lamports: 2_000_000,
+                    fee_recipient: fee_recipient.to_bytes(),
+                },
+                pending: q::DepositParams::default(),
+                activation_slot: 0,
+            },
+        );
+        d
+    }
+
+    fn queue_pda() -> Pubkey {
+        zk_bridge_client::deposit_queue_pda(&bridge(), &program(), CHAIN).0
+    }
+
+    fn deposit_req(path: PathBuf, amount: u64, wrap_sol: bool) -> DepositRequest {
+        DepositRequest {
+            settlement: program(),
+            bridge: bridge(),
+            chain_id: CHAIN,
+            amount,
+            l2_recipient: RECIPIENT,
+            wrap_sol,
+            keypair: path,
+        }
+    }
+
+    fn deposit_chain(mint: Pubkey, count: u64, fee_recipient: Pubkey) -> FakeChain {
+        FakeChain::default()
+            .with(vault_pda(), vault_bytes(program(), mint))
+            .with(queue_pda(), queue_bytes(count, 1_000, fee_recipient))
+    }
+
+    #[tokio::test]
+    async fn deposit_dry_run_prints_the_transaction_and_sends_nothing() {
+        let (_, path) = key_file("dep-dry");
+        let chain = deposit_chain(Pubkey::new_unique(), 4, Pubkey::new_unique());
+        let report = deposit(&chain, deposit_req(path.clone(), 5_000, false), Mode::Dry)
+            .await
+            .unwrap();
+        remove(&path);
+        assert_eq!(chain.sent_count(), 0);
+        let text = report.lines.join("\n");
+        assert!(text.contains("instruction: Deposit"), "{text}");
+        assert!(text.contains("record index     4"), "{text}");
+        assert!(text.contains("nothing sent to any cluster"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn deposit_confirm_sends_one_transaction_with_the_deposit_at_the_queues_count() {
+        let (k, path) = key_file("dep-send");
+        let fee = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let chain = deposit_chain(mint, 7, fee);
+        let report = deposit(
+            &chain,
+            deposit_req(path.clone(), 5_000, false),
+            Mode::Confirm,
+        )
+        .await
+        .unwrap();
+        remove(&path);
+        assert!(report.sent());
+        assert_eq!(chain.tx_count(), 1);
+        let sent = chain.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        let ix = &sent[0];
+        assert_eq!(ix.program_id, bridge());
+        let depositor = key_pubkey(&k);
+        assert_eq!(ix.accounts[0].pubkey, depositor);
+        assert_eq!(
+            ix.accounts[1].pubkey,
+            zk_bridge_client::recipient_ata(&depositor, &mint)
+        );
+        assert_eq!(
+            ix.accounts[5].pubkey,
+            zk_bridge_client::deposit_record_pda(&bridge(), &program(), CHAIN, 7).0
+        );
+        assert_eq!(ix.accounts[7].pubkey, fee);
+    }
+
+    #[tokio::test]
+    async fn deposit_with_wrap_sol_puts_the_wrap_ahead_of_the_deposit_in_one_transaction() {
+        let (_, path) = key_file("dep-wrap");
+        let chain = deposit_chain(zk_bridge_client::NATIVE_MINT, 0, Pubkey::new_unique());
+        deposit(
+            &chain,
+            deposit_req(path.clone(), 5_000, true),
+            Mode::Confirm,
+        )
+        .await
+        .unwrap();
+        remove(&path);
+        assert_eq!(chain.tx_count(), 1);
+        assert_eq!(chain.sent_count(), 4);
+        assert_eq!(chain.sent.lock().unwrap()[3].program_id, bridge());
+    }
+
+    #[tokio::test]
+    async fn deposit_refuses_wrap_sol_for_a_vault_that_is_not_wrapped_sol() {
+        let (_, path) = key_file("dep-wrap-no");
+        let chain = deposit_chain(Pubkey::new_unique(), 0, Pubkey::new_unique());
+        let err = deposit(
+            &chain,
+            deposit_req(path.clone(), 5_000, true),
+            Mode::Confirm,
+        )
+        .await
+        .unwrap_err();
+        remove(&path);
+        assert_eq!(err.name, "WrapSolNeedsNativeMint");
+        assert_eq!(chain.sent_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn deposit_refuses_below_the_minimum_and_a_zero_recipient_by_name() {
+        let (_, path) = key_file("dep-refuse");
+        let chain = deposit_chain(Pubkey::new_unique(), 0, Pubkey::new_unique());
+        let err = deposit(&chain, deposit_req(path.clone(), 999, false), Mode::Confirm)
+            .await
+            .unwrap_err();
+        assert_eq!(err.name, "DepositBelowMinimum");
+        let mut req = deposit_req(path.clone(), 5_000, false);
+        req.l2_recipient = [0u8; 20];
+        let err = deposit(&chain, req, Mode::Confirm).await.unwrap_err();
+        remove(&path);
+        assert_eq!(err.name, "DepositRecipientInvalid");
+        assert_eq!(chain.sent_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn deposit_refuses_a_missing_vault_a_missing_queue_and_a_foreign_settlement_by_name() {
+        let (_, path) = key_file("dep-missing");
+        let chain = FakeChain::default();
+        let err = deposit(
+            &chain,
+            deposit_req(path.clone(), 5_000, false),
+            Mode::Confirm,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.name, "VaultConfigNotFound");
+
+        let chain =
+            FakeChain::default().with(vault_pda(), vault_bytes(program(), Pubkey::new_unique()));
+        let err = deposit(
+            &chain,
+            deposit_req(path.clone(), 5_000, false),
+            Mode::Confirm,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.name, "DepositQueueNotFound");
+
+        let chain = FakeChain::default().with(
+            vault_pda(),
+            vault_bytes(Pubkey::new_unique(), Pubkey::new_unique()),
+        );
+        let err = deposit(
+            &chain,
+            deposit_req(path.clone(), 5_000, false),
+            Mode::Confirm,
+        )
+        .await
+        .unwrap_err();
+        remove(&path);
+        assert_eq!(err.name, "VaultSettlementMismatch");
+    }
+
+    #[tokio::test]
+    async fn deposit_reads_the_chain_before_it_opens_the_key_and_names_a_failed_read() {
+        for mode in [Mode::Dry, Mode::Confirm] {
+            let chain = FakeChain::default().failing(vault_pda(), "connection refused");
+            let err = deposit(
+                &chain,
+                deposit_req(PathBuf::from("/nonexistent/depositor.json"), 5_000, false),
+                mode,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.name, "VaultConfigFetchFailed", "{mode:?}");
+        }
+        let chain = deposit_chain(Pubkey::new_unique(), 0, Pubkey::new_unique());
+        let err = deposit(
+            &chain,
+            deposit_req(PathBuf::from("/nonexistent/depositor.json"), 5_000, false),
+            Mode::Confirm,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(chain.sent_count(), 0);
+        assert!(!err.name.is_empty());
     }
 }

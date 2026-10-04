@@ -4,6 +4,21 @@ This changelog describes the system as built on `main`, grouped by component. It
 release-tag cadence yet — see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for what each component does
 and how they fit together.
 
+## Bridge deposits
+
+- `zk-bridge` gains `Deposit` (tag 3) and `CloseDeposit` (tag 8). A deposit locks tokens in the vault, pays the
+  queue's fee, writes the next deposit record and moves the queue's count and hash chain on; the record's sender is
+  the depositor's wallet. A deposit is refused by name for a chain whose root or registry is gone or not owned by
+  the settlement program, so a reclaimed chain takes no deposit it could never credit or refund. `CloseDeposit`
+  refunds a record's rent to its sender once the batch that credited it is final, read from the inbox's version 2
+  cursor. Three deposits signed by the synthetic small batch's seed depositors reproduce its records and the end of
+  its hash chain byte for byte.
+- `ActivateDepositParams` checks again that the fee recipient is rent-exempt, and the parameter checks refuse a fee
+  recipient that is an executable account or a sysvar.
+- `zk-bridge-client` gains `deposit_ix`, `wrap_sol_ixs`, `close_deposit_ix` and the queue and record addresses.
+- `rome-zk-ops` gains `deposit` (a dry run unless `--confirm`; `--wrap-sol` wraps the lamports first in the same
+  transaction).
+
 ## Inbox cursor v2
 
 - `InitBatchCursor` creates the batch cursor as a 69-byte version-2 account: `deposit_next` 0, `deposit_hash`

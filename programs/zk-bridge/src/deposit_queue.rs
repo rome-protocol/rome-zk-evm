@@ -7,7 +7,8 @@
 //!
 //! Parameter bounds are fixed in this program and change only with an upgrade: a deadline between 1 and 24
 //! hours, `1 <= max_per_block <= max_per_batch <= 256`, a minimum amount of at least 1 base unit, a fee of
-//! at most 0.01 SOL, and a fee recipient that holds the rent-exempt minimum for an empty account. The
+//! at most 0.01 SOL, and a fee recipient that holds the rent-exempt minimum for an empty account and is
+//! neither executable nor a sysvar (checked again when a proposal activates). The
 //! chain authority changes the parameters the way it changes its exit config: a proposal with an
 //! activation slot at least one challenge window away, then a permissionless activation.
 
@@ -80,12 +81,60 @@ pub fn check_params(p: &DepositParamsArgs, fee_recipient: &AccountInfo) -> Progr
     if p.fee_lamports > MAX_FEE_LAMPORTS {
         return Err(BridgeError::FeeTooHigh.into());
     }
-    if *fee_recipient.key != p.fee_recipient
-        || fee_recipient.lamports() < Rent::get()?.minimum_balance(0)
-    {
+    check_fee_recipient(fee_recipient, &p.fee_recipient)
+}
+
+/// The fee recipient account is the key the parameters name, holds the rent-exempt minimum for an empty
+/// account, and can take lamports: not executable and not a sysvar. Run when parameters are set and again
+/// when a proposal activates, because the account can change between the two.
+pub fn check_fee_recipient(fee_recipient: &AccountInfo, expected: &Pubkey) -> ProgramResult {
+    if fee_recipient.key != expected || fee_recipient.lamports() < Rent::get()?.minimum_balance(0) {
         return Err(BridgeError::FeeRecipientNotRentExempt.into());
     }
+    if fee_recipient.executable || *fee_recipient.owner == solana_sdk_ids::sysvar::id() {
+        return Err(BridgeError::FeeRecipientNotPlain.into());
+    }
     Ok(())
+}
+
+/// Checks `root_acc` is the chain's `["root", chain_id]` account under `settlement_program` and is owned by
+/// it. A reclaimed chain has no root, and nothing can credit or refund a deposit made there.
+pub fn require_root(
+    settlement_program: &Pubkey,
+    chain_id: u64,
+    root_acc: &AccountInfo,
+) -> ProgramResult {
+    let (expect_root, _) = rome_zk_layouts::root::pda(settlement_program, chain_id);
+    if expect_root != *root_acc.key || root_acc.owner != settlement_program {
+        return Err(BridgeError::RootNotCanonical.into());
+    }
+    let d = root_acc.try_borrow_data()?;
+    match rome_zk_layouts::root::read(&d) {
+        Ok(root) if root.chain_id == chain_id => Ok(()),
+        _ => Err(BridgeError::RootNotCanonical.into()),
+    }
+}
+
+/// Checks `registry_acc` is the chain's registry under `settlement_program`, owned by it and holding this
+/// chain's registry, and returns its header.
+pub fn load_registry(
+    settlement_program: &Pubkey,
+    chain_id: u64,
+    registry_acc: &AccountInfo,
+) -> Result<rome_zk_layouts::registry::RegistryHeader, ProgramError> {
+    let (expect_registry, _) = rome_zk_layouts::registry::pda(settlement_program, chain_id);
+    if expect_registry != *registry_acc.key || registry_acc.owner != settlement_program {
+        return Err(BridgeError::RegistryNotCanonical.into());
+    }
+    let registry = {
+        let d = registry_acc.try_borrow_data()?;
+        rome_zk_layouts::registry::read_header(&d)
+            .map_err(|_| ProgramError::from(BridgeError::RegistryNotCanonical))?
+    };
+    if registry.chain_id != chain_id {
+        return Err(BridgeError::RegistryNotCanonical.into());
+    }
+    Ok(registry)
 }
 
 /// Checks `root` is at the config's settlement program's `["root", chain_id]` PDA, owned by that program,
@@ -115,7 +164,7 @@ fn require_chain_authority(
 }
 
 /// Checks `queue_acc` is the chain's queue under this program, owned by it, and decodes it.
-fn load_queue(
+pub fn load_queue(
     program_id: &Pubkey,
     settlement_program: &Pubkey,
     chain_id: u64,
@@ -169,18 +218,7 @@ pub fn init_deposit_queue(
     )?;
 
     // The registry belongs to the canonical settlement program, and it must name the canonical inbox.
-    let (expect_registry, _) = rome_zk_layouts::registry::pda(&settlement_program, args.chain_id);
-    if expect_registry != *registry_acc.key || registry_acc.owner != &settlement_program {
-        return Err(BridgeError::RegistryNotCanonical.into());
-    }
-    let registry = {
-        let d = registry_acc.try_borrow_data()?;
-        rome_zk_layouts::registry::read_header(&d)
-            .map_err(|_| ProgramError::from(BridgeError::RegistryNotCanonical))?
-    };
-    if registry.chain_id != args.chain_id {
-        return Err(BridgeError::RegistryNotCanonical.into());
-    }
+    let registry = load_registry(&settlement_program, args.chain_id, registry_acc)?;
     if registry.inbox_program != config.inbox_program {
         return Err(BridgeError::WrongInboxProgram.into());
     }
@@ -286,8 +324,9 @@ pub fn propose_deposit_params(
     Ok(())
 }
 
-/// accounts: `[bridge_config (read-only), deposit_queue (writable)]`. Permissionless: only the clock and
-/// the pending state a proposal wrote are trusted.
+/// accounts: `[bridge_config (read-only), deposit_queue (writable), fee_recipient (read-only)]`.
+/// Permissionless: only the clock, the pending state a proposal wrote and the fee recipient's own account
+/// are trusted. The fee recipient is checked again here, since it can have changed since the proposal.
 pub fn activate_deposit_params(
     program_id: &Pubkey,
     it: &mut std::slice::Iter<AccountInfo>,
@@ -295,6 +334,7 @@ pub fn activate_deposit_params(
 ) -> ProgramResult {
     let config_acc = next_account_info(it)?;
     let queue_acc = next_account_info(it)?;
+    let fee_recipient_acc = next_account_info(it)?;
 
     let config = bridge_config::load(program_id, config_acc)?;
     let settlement_program = Pubkey::new_from_array(config.settlement_program);
@@ -306,6 +346,10 @@ pub fn activate_deposit_params(
     if Clock::get()?.slot < fields.activation_slot {
         return Err(BridgeError::ActivationNotReached.into());
     }
+    check_fee_recipient(
+        fee_recipient_acc,
+        &Pubkey::new_from_array(fields.pending.fee_recipient),
+    )?;
     fields.params = fields.pending;
     fields.pending = DepositParams::default();
     fields.activation_slot = 0;

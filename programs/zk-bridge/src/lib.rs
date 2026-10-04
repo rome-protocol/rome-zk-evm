@@ -1,6 +1,7 @@
 //! `zk-bridge`: THE VAULT — the minimal SPL escrow program that releases a proved settlement exit to
 //! `record.sol_recipient`. Instructions: `InitVault`, `Fund`, `ReleaseExit`, and the deposit setup:
-//! `InitBridgeConfig`, `InitDepositQueue`, `ProposeDepositParams`, `ActivateDepositParams`. Custody lives here;
+//! `InitBridgeConfig`, `InitDepositQueue`, `ProposeDepositParams`, `ActivateDepositParams`, and the deposit
+//! path: `Deposit` and `CloseDeposit`. Custody lives here;
 //! verification (`ProveExit`/`ConsumeExit`) lives in `programs/zk-settlement`, which this program never
 //! modifies — it only CPIs `ConsumeExit`, signed by its own `["exit_consumer", chain_id]` PDA
 //! (`rome_zk_layouts::exit::exit_consumer_pda`), which is the entire mechanism by which "only the
@@ -10,10 +11,12 @@
 //! as a chain's `exit_config.bridge_program`, its `exit_consumer` PDA is the only address that can
 //! ever satisfy `zk-settlement::exit::consume_exit`'s authorisation check for that chain.
 //!
-//! v1 scope: native asset only, one mint per chain, no deposit path (`InitVault`/`Fund`
-//! stand in for a real bridge-in until one exists) — see `README.md` for the full fund-safety writeup.
+//! v1 scope: native asset only, one mint per chain. `Deposit` locks tokens in the vault and queues a credit
+//! on the chain; `Fund` stays as the plain top-up — see `README.md` for the full fund-safety writeup.
 
 pub mod bridge_config;
+pub mod close_deposit;
+pub mod deposit;
 pub mod deposit_queue;
 pub mod errors;
 pub mod fund;
@@ -24,8 +27,9 @@ pub mod state;
 pub mod token;
 
 pub use instruction::{
-    ActivateDepositParamsArgs, BridgeIx, DepositParamsArgs, FundArgs, InitBridgeConfigArgs,
-    InitDepositQueueArgs, InitVaultArgs, ProposeDepositParamsArgs, ReleaseExitArgs,
+    ActivateDepositParamsArgs, BridgeIx, CloseDepositArgs, DepositArgs, DepositParamsArgs,
+    FundArgs, InitBridgeConfigArgs, InitDepositQueueArgs, InitVaultArgs, ProposeDepositParamsArgs,
+    ReleaseExitArgs,
 };
 pub use state::{vault_authority_pda, vault_config_pda, vault_token_pda};
 
@@ -49,8 +53,7 @@ pub fn process_instruction(
         BridgeIx::InitVault(args) => init_vault::init_vault(program_id, it, args),
         BridgeIx::Fund(args) => fund::fund(program_id, it, args),
         BridgeIx::ReleaseExit(args) => release::release_exit(program_id, it, args),
-        // Tag 3 is held for the deposit instruction; refused until it exists.
-        BridgeIx::DepositNotYetAvailable => Err(ProgramError::InvalidInstructionData),
+        BridgeIx::Deposit(args) => deposit::deposit(program_id, it, args),
         BridgeIx::InitBridgeConfig(args) => bridge_config::init_bridge_config(program_id, it, args),
         BridgeIx::InitDepositQueue(args) => deposit_queue::init_deposit_queue(program_id, it, args),
         BridgeIx::ProposeDepositParams(args) => {
@@ -59,5 +62,6 @@ pub fn process_instruction(
         BridgeIx::ActivateDepositParams(args) => {
             deposit_queue::activate_deposit_params(program_id, it, args)
         }
+        BridgeIx::CloseDeposit(args) => close_deposit::close_deposit(program_id, it, args),
     }
 }

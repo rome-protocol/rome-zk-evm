@@ -68,11 +68,28 @@ authorise a release for that chain — see `rome_zk_layouts::exit::exit_consumer
   one `root.challenge_window_slots` away; anyone may activate them once that slot is reached. A proposal is
   refused while another is pending.
 
-Instruction tag 3 is reserved for the deposit instruction and is refused until that instruction exists.
+- **`Deposit { chain_id, amount, l2_recipient }`** (tag 3) — a user locks `amount` base units of the vault's mint
+  in the vault and queues a credit of the same value, in gwei, to a 20-byte address on the chain. The depositor
+  signs and pays the record's rent and the queue's fee (to the fee recipient in the queue's active parameters);
+  the record's sender is the depositor's wallet. The record is written at `["deposit_record", settlement_program,
+  chain_id, index]` for the queue's current `count`, the queue's `count` and hash chain advance, and a record
+  address that was pre-funded is adopted. Every account is bound by address: the vault config and the queue sit at
+  their PDAs under the vault config's settlement program, and the chain's root, registry and exit config are that
+  program's accounts. Refused by name: a vault config or queue of another settlement program or chain; a chain whose
+  root or registry is gone or not owned by the settlement program (a reclaimed chain keeps its queue and vault, so
+  a deposit there could never be credited or refunded); an exit config naming another bridge; a zero recipient or
+  the exit portal; a fee recipient other than the parameter; an amount below the minimum; a mint whose amount does
+  not fit in gwei; a record address that already holds a record.
+- **`CloseDeposit { chain_id, index }`** (tag 8) — permissionless; refunds a record's rent to its sender once a
+  finalized batch has credited the deposit and that batch is final. The cursor must be the chain's, at the inbox's
+  address, owned by the inbox and at version 2: `deposit_next > index` means a batch has credited it, `index <
+  deposit_final` means that batch is final. The rent always goes to the record's sender. The vault and the fee
+  recipient are not touched.
 
 **Parameter bounds, fixed in the program (an upgrade changes them):** an inclusion deadline of 1 to 24 hours;
 `1 <= max_per_block <= max_per_batch <= 256`; `min_amount >= 1` base unit; a fee of at most 0.01 SOL; and a fee
-recipient account that holds the rent-exempt minimum for an empty account.
+recipient account that holds the rent-exempt minimum for an empty account (checked again on activation) and is
+neither executable nor a sysvar.
 
 ## Fund-safety invariants
 
@@ -208,6 +225,12 @@ Deposit setup (same tests, `programs/zk-bridge/tests/deposit_setup.rs`; printed 
 `InitBridgeConfig` **12,718 CU** (4,948 to 5,014 for the refusals, 14,271 when the address was pre-funded and
 adopted), `InitDepositQueue` **19,881 CU** (it computes the queue's seed hash with the keccak syscall),
 `ProposeDepositParams` **12,906 CU**, `ActivateDepositParams` **6,686 CU**.
+
+Deposits (`programs/zk-bridge/tests/deposit.rs`; printed by each test, against fixture accounts for the settlement
+side): `Deposit` **36,039 CU** for the first deposit of a queue (33,040 and 34,540 for the next two of the golden
+test), **39,353 CU** when the record address was pre-funded
+and adopted, **54,751 CU** for the wrap-SOL instructions and a `Deposit` in one transaction; a refusal costs
+5,767 to 26,626 CU. `CloseDeposit` **12,453 CU** (5,135 to 11,717 CU for the refusals).
 
 (Re-key note: promoting `settlement_program` into the vault PDA seeds shifts every PDA's own
 bump-seed search depth, so these figures moved from their earlier values — down, in this measurement,

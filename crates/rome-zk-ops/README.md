@@ -25,6 +25,7 @@ rome-zk-ops [--rpc-url URL] [--confirm | --dry-run | --offline] <command>
 | `vault fund --payer-keypair F --amount N --settlement P --bridge P --chain-id N` | Moves raw token units from the payer's token account into the vault. Refused by name before any instruction is built if the vault belongs to another settlement program. |
 | `vault show --settlement P --bridge P --chain-id N` | Prints the vault's configuration and token balance, or that it is not initialised. Sends nothing. |
 | `release-exit --settlement P --bridge P --chain-id N --message-hash 0x... --payer-keypair F` | Reads a proved exit record, creates the recipient's token account if it is missing, and sends `ReleaseExit` in the same transaction. A record that does not exist, or is not proved, is refused by name. |
+| `deposit --keypair F --amount N --recipient 0x... --settlement P --bridge P --chain-id N [--wrap-sol]` | Reads the chain's vault and deposit queue, then sends `Deposit` for the queue's next index: locks `--amount` raw units of the vault's mint and queues a credit to the 20-byte recipient. `--wrap-sol` wraps that many lamports first, in the same transaction, for a vault that holds wrapped SOL. An amount below the minimum, a zero recipient, a missing vault or queue, or a vault of another settlement program is refused by name before any key file is opened. |
 
 Run `rome-zk-ops <command> --help` for every flag. `--rpc-url` defaults to the public Solana devnet endpoint,
 `https://api.devnet.solana.com`.

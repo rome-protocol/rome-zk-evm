@@ -252,8 +252,17 @@ program built for your chain's genesis. The batch guest source is published at
 [`rome-protocol/rome-zk-guest`](https://github.com/rome-protocol/rome-zk-guest), tag `v0.2.0`. From the root of
 this repository, run `git clone --branch v0.2.0 https://github.com/rome-protocol/rome-zk-guest.git .fork`,
 then `cd .fork && git submodule update --init --recursive`. The guest uses crates from this repository.
-Building it for your `rendered/genesis.json` is not automated yet. Without that guest, your chain cannot
-post a root.
+Build it with `./rollup guest-build`. The command builds the guest-build image (the ZisK 1.2.0-alpha toolchain
+and the two public sources, `rome-zk-evm` at `ROME_ZK_TAG` and `rome-zk-guest` at `ROME_ZK_GUEST_TAG`, from
+`.env`; the defaults are the tags this guide names), builds the guest for `rendered/genesis.json` inside it and
+writes `rendered/guest/<sha256>.elf` and `rendered/guest/vkey.json`. Two machines get the same sha256 for the same
+genesis. It takes about 8 minutes the first time and about 6 minutes once the image exists. It refuses by name
+a genesis whose chain id differs from `rendered/chain-id.env` (`ChainIdMismatch`) and a genesis with more than
+one funded account (`GenesisFundedAccountLimit`). The programVK in `vkey.json` is computed with the ZisK proving
+keys, which the command mounts read-only from `ZISK_HOME` (about 36 GB of memory, about 40 seconds); without
+`ZISK_HOME`, or with `--skip-program-vk`, `vkey.json` has no programVK, the command says `ProgramVkNotComputed`,
+and the prover refuses the file until the programVK is added. Set `ELF_DIR` to `rendered/guest` and `VKEY_JSON`
+to `rendered/guest/vkey.json`. Without that guest, your chain cannot post a root.
 
 The prover needs one NVIDIA GPU with more than 30 GB of memory and the ZisK proving keys on the host: about 26 GB to
 download, about 81 GB once installed (measured on a CPU host; a GPU host generates its own files, not measured yet).

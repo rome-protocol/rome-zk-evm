@@ -212,8 +212,33 @@ git clone --branch v0.2.0 https://github.com/rome-protocol/rome-zk-guest.git .fo
 cd .fork && git submodule update --init --recursive
 ```
 
-Git prints submodule checkout progress as needed. Building the guest for your `rendered/genesis.json`
-is not automated yet. Without that guest, your chain cannot post a root.
+Git prints submodule checkout progress as needed. You do not need that checkout to build the guest: the
+next command does it for you.
+
+Build the guest for your chain with one command:
+
+```sh
+./rollup guest-build
+```
+
+The guest contains your genesis, so every chain has its own guest program. The command builds an image with the
+ZisK toolchain, clones the two public sources at the tags this guide names, builds the guest from your
+`rendered/genesis.json` and checks that it carries your chain id from `rendered/chain-id.env`. It writes
+`rendered/guest/<sha256>.elf` and `rendered/guest/vkey.json`, and prints the ELF's sha256. Two machines that run
+it for the same genesis get the same sha256. The first run takes about 8 minutes, two of them for the image; a run
+with the image already built takes about 6 minutes (on a 32-core machine).
+
+It refuses by name a genesis whose `chainId` differs from your chain's id (`ChainIdMismatch`) and a genesis
+that gives more than one account a balance (`GenesisFundedAccountLimit`).
+
+`vkey.json` holds the ELF's sha256, your chain id and the programVK, the verification key of this guest.
+The programVK needs the ZisK proving keys and about 36 GB of memory, about 40 seconds. Set `ZISK_HOME` in
+`.env` to the directory that holds them (see the [prover host setup](PROVER-HOST.md)) and the command computes it. Without
+`ZISK_HOME`, or with `--skip-program-vk`, it writes `vkey.json` without the programVK and says
+`ProgramVkNotComputed`. The prover refuses that file: add the programVK from a machine with the keys, or ask
+Rome for it, before you start the prover.
+
+Point `ELF_DIR` at `rendered/guest` and `VKEY_JSON` at `rendered/guest/vkey.json` in `.env`.
 
 Once your key is registered and you have the matching guest and proving keys, follow the
 [prover setup](../deploy/rollup/README.md#the-prover-is-required-for-settlement).
@@ -238,7 +263,7 @@ Your node, RPC service and prover have their own running costs.
   exactly the next batch id and needs that id's batch finalized, and an abandoned id can be neither reopened
   nor skipped. If the batcher stops mid-batch, just start it again: it finishes the open batch under the same
   id. If it stops with `ResumeImpossible`, rerun it with the build and config that opened the batch.
-- Building a guest for your chain's genesis is not automated yet.
+- The guest build needs Docker and, for the programVK, the ZisK proving keys and about 36 GB of memory on the machine that runs `./rollup guest-build`.
 - A new chain has no gas: its genesis has no balances, and deposits are not available yet. Until they are, it cannot send a transaction.
 - The prover needs one NVIDIA GPU with more than 30 GB of memory and about 81 GB of disk for the installed ZisK
   proving keys (about 26 GB downloaded; measured on a CPU host).

@@ -299,6 +299,7 @@ impl Rig {
             accounts: vec![
                 AccountMeta::new_readonly(self.config.as_ref().unwrap().0, false),
                 AccountMeta::new(self.queue.0, false),
+                AccountMeta::new_readonly(self.fee_recipient.0, false),
             ],
             data: to_vec(&BridgeIx::ActivateDepositParams(
                 ActivateDepositParamsArgs {
@@ -1025,6 +1026,28 @@ bound_tests!(
     BridgeError::FeeRecipientNotRentExempt
 );
 
+bound_tests!(
+    init_deposit_queue_refuses_an_executable_fee_recipient,
+    propose_deposit_params_refuses_an_executable_fee_recipient,
+    |r| {
+        let mut a = fee_recipient_account(1_000_000);
+        a.executable = true;
+        a.owner = solana_sdk_ids::bpf_loader::id();
+        r.fee_recipient.1 = a;
+    },
+    BridgeError::FeeRecipientNotPlain
+);
+bound_tests!(
+    init_deposit_queue_refuses_a_sysvar_fee_recipient,
+    propose_deposit_params_refuses_a_sysvar_fee_recipient,
+    |r| {
+        let mut a = fee_recipient_account(1_000_000);
+        a.owner = solana_sdk_ids::sysvar::id();
+        r.fee_recipient.1 = a;
+    },
+    BridgeError::FeeRecipientNotPlain
+);
+
 // ------------------------------------------------------------------------------------------------
 // ProposeDepositParams
 // ------------------------------------------------------------------------------------------------
@@ -1232,6 +1255,62 @@ async fn activate_deposit_params_is_refused_before_its_slot_and_applied_after_it
     );
 }
 
+/// A proposal passed the fee-recipient check when it was made; the account can change before it activates.
+async fn activation_refused_with_fee_recipient(account: Account, want: BridgeError) {
+    let mut rig = Rig::with_queue();
+    rig.set_queue(Some((&new_params(), 200)));
+    let mut ctx = rig.start().await;
+    ctx.set_account(&rig.fee_recipient.0, &account.into());
+    ctx.warp_to_slot(200).unwrap();
+    let r = rig
+        .send(
+            &mut ctx,
+            rig.activate_ix(),
+            "ActivateDepositParams (refused)",
+        )
+        .await;
+    assert_custom(r, want);
+    let f = read_queue(&mut ctx, rig.queue.0).await;
+    assert_eq!(f.params, to_layout(&default_params()));
+    assert_eq!(
+        f.activation_slot, 200,
+        "a refused activation changes nothing"
+    );
+}
+
+#[tokio::test]
+async fn activate_deposit_params_refuses_a_fee_recipient_that_fell_under_rent() {
+    activation_refused_with_fee_recipient(
+        fee_recipient_account(rome_zk_testkit::rent_exempt(0) - 1),
+        BridgeError::FeeRecipientNotRentExempt,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn activate_deposit_params_refuses_a_fee_recipient_that_became_executable() {
+    let mut a = fee_recipient_account(1_000_000);
+    a.executable = true;
+    a.owner = solana_sdk_ids::bpf_loader::id();
+    activation_refused_with_fee_recipient(a, BridgeError::FeeRecipientNotPlain).await;
+}
+
+#[tokio::test]
+async fn activate_deposit_params_refuses_a_fee_recipient_account_that_is_not_the_proposed_one() {
+    let mut rig = Rig::with_queue();
+    rig.set_queue(Some((&new_params(), 200)));
+    let mut ctx = rig.start().await;
+    let other = Pubkey::new_unique();
+    ctx.set_account(&other, &fee_recipient_account(1_000_000).into());
+    ctx.warp_to_slot(200).unwrap();
+    let mut ix = rig.activate_ix();
+    ix.accounts[2] = AccountMeta::new_readonly(other, false);
+    let r = rig
+        .send(&mut ctx, ix, "ActivateDepositParams (refused)")
+        .await;
+    assert_custom(r, BridgeError::FeeRecipientNotRentExempt);
+}
+
 #[tokio::test]
 async fn activate_deposit_params_refuses_when_nothing_is_pending() {
     let rig = Rig::with_queue();
@@ -1368,23 +1447,4 @@ async fn config_queue_propose_and_activate_work_end_to_end() {
         .unwrap();
     let f = read_queue(&mut ctx, rig.queue.0).await;
     assert_eq!(f.params, to_layout(&new_params()));
-}
-
-#[tokio::test]
-async fn the_held_tag_for_the_deposit_instruction_is_refused() {
-    let rig = Rig::new();
-    let mut ctx = rig.start().await;
-    let ix = Instruction {
-        program_id: bridge_program_id(),
-        accounts: vec![],
-        data: to_vec(&BridgeIx::DepositNotYetAvailable).unwrap(),
-    };
-    let r = rig.send(&mut ctx, ix, "tag 3").await;
-    match r {
-        Err(TransactionError::InstructionError(
-            _,
-            solana_sdk::instruction::InstructionError::InvalidInstructionData,
-        )) => {}
-        other => panic!("tag 3 must be refused with InvalidInstructionData, got {other:?}"),
-    }
 }

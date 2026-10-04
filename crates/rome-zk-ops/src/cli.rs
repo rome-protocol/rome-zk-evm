@@ -60,6 +60,8 @@ pub enum Command {
     Vault(VaultCommand),
     /// Release a proved exit from the bridge vault to its recipient.
     ReleaseExit(ReleaseExitArgs),
+    /// Deposit into a chain: lock tokens in the bridge vault and queue a credit to an address on the chain.
+    Deposit(DepositArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -129,6 +131,28 @@ pub struct ReleaseExitArgs {
     /// The fee payer's keypair file.
     #[arg(long)]
     pub payer_keypair: PathBuf,
+}
+
+#[derive(Args, Debug)]
+pub struct DepositArgs {
+    #[arg(long)]
+    pub settlement: Pubkey,
+    #[arg(long)]
+    pub bridge: Pubkey,
+    #[arg(long)]
+    pub chain_id: u64,
+    /// Raw units of the vault's mint (lamports when the vault holds wrapped SOL).
+    #[arg(long)]
+    pub amount: u64,
+    /// The address credited on the chain, 20 bytes of hex.
+    #[arg(long, value_parser = parse_hex20)]
+    pub recipient: [u8; 20],
+    /// Wrap `--amount` lamports of the depositor's SOL first, in the same transaction.
+    #[arg(long)]
+    pub wrap_sol: bool,
+    /// The depositor's keypair file; it signs and pays the record's rent and the fee.
+    #[arg(long)]
+    pub keypair: PathBuf,
 }
 
 #[derive(Args, Debug)]
@@ -467,6 +491,22 @@ pub async fn execute<C: Chain>(
             )
             .await
         }
+        Command::Deposit(a) => {
+            bridge::deposit(
+                chain,
+                bridge::DepositRequest {
+                    settlement: a.settlement,
+                    bridge: a.bridge,
+                    chain_id: a.chain_id,
+                    amount: a.amount,
+                    l2_recipient: a.recipient,
+                    wrap_sol: a.wrap_sol,
+                    keypair: a.keypair,
+                },
+                mode,
+            )
+            .await
+        }
     }
 }
 
@@ -714,6 +754,44 @@ mod tests {
             "5"
         ])
         .is_ok());
+    }
+
+    #[test]
+    fn the_deposit_subcommand_parses() {
+        let recipient = format!("0x{}", "ab".repeat(20));
+        assert!(parse(&[
+            "deposit",
+            "--keypair",
+            "k",
+            "--amount",
+            "7",
+            "--recipient",
+            &recipient,
+            "--wrap-sol",
+            "--settlement",
+            SETTLEMENT,
+            "--bridge",
+            SETTLEMENT,
+            "--chain-id",
+            "5"
+        ])
+        .is_ok());
+        assert!(parse(&[
+            "deposit",
+            "--keypair",
+            "k",
+            "--amount",
+            "7",
+            "--recipient",
+            "0x12",
+            "--settlement",
+            SETTLEMENT,
+            "--bridge",
+            SETTLEMENT,
+            "--chain-id",
+            "5"
+        ])
+        .is_err());
     }
 
     #[test]
