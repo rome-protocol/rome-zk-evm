@@ -75,7 +75,10 @@ pub enum InboxIx {
     /// batch pda stays at account index 0, unchanged for every existing reader). `step` = 0 means "all
     /// remaining".
     FinalizeBatch { step: u32 },
-    /// accounts: [authority (signer, writable), batch pda (writable), root pda (read-only)]
+    /// accounts: [authority (signer, writable), batch pda (writable), root pda (read-only), cursor pda
+    /// (writable)]. After the covering-root check, a v3 batch moves a v2 cursor's `deposit_final` up to
+    /// the batch's `deposit_to` when that is higher; a v1 cursor or a v2 batch is left alone, since
+    /// nothing was credited. A missing or wrong cursor is refused.
     CloseBatch,
     /// accounts: [authority (signer, writable), batch pda (writable)] — authority-only, only while
     /// `finalized == 0` (a finalized batch can only leave via `CloseBatch`, which requires the covering
@@ -94,7 +97,8 @@ pub enum InboxIx {
     /// accounts: [payer (signer, writable), cursor pda (writable), root pda (read-only), system_program
     /// (read-only)] — authority-gated (same check `OpenBatch` uses: signer must be the chain's
     /// `authority` per the settlement root account). Bootstraps the per-chain `batch_cursor` PDA at
-    /// `next_batch`; fails (`CursorAlreadyInitialized`) if the cursor already holds real data for this
+    /// `next_batch` as a v2 cursor (69 bytes: `deposit_next` 0, `deposit_hash` the queue's seed hash, `deposit_final`
+    /// 0); fails (`CursorAlreadyInitialized`) if the cursor already holds real data for this
     /// chain (checked by owner + `data_len`, not by `create_account`'s own error: a merely pre-funded,
     /// still-empty PDA must still bootstrap normally) — run once per chain. Initialise it at exactly
     /// `root.head_pending_batch + 1` of the chain's settlement root: settlement posts only that id next,

@@ -43,8 +43,8 @@ pub fn batch_account_index(ix: &InboxIx) -> Option<usize> {
         InboxIx::OpenBatch { .. } => Some(1), // open_batch_ix: [payer, batch_pda, root, cursor, system_program]
         InboxIx::GrowBatch { .. } => Some(1), // grow_batch_ix: [payer, batch_pda, system_program]
         InboxIx::AbandonBatch => Some(1),     // abandon_batch_ix: [authority, batch_pda]
-        InboxIx::CloseBatch => Some(1),       // close_batch_ix: [authority, batch_pda, root]
-        InboxIx::SealLeaf { .. } => Some(0),  // seal_leaf_ix: [batch_acct, chunk]
+        InboxIx::CloseBatch => Some(1), // close_batch_ix: [authority, batch_pda, root, cursor]
+        InboxIx::SealLeaf { .. } => Some(0), // seal_leaf_ix: [batch_acct, chunk]
         InboxIx::FinalizeBatch { .. } => Some(0), // finalize_batch_ix: [batch_acct, authority]
         _ => None,
     }
@@ -389,12 +389,14 @@ pub fn close_batch_ix(
 ) -> solana_program::instruction::Instruction {
     let (batch_acct, _) = batch_pda(program_id, settlement_program, chain_id, batch);
     let (root, _) = root_pda(settlement_program, chain_id);
+    let (cursor, _) = cursor_pda(program_id, settlement_program, chain_id);
     ix(
         program_id,
         vec![
             AccountMeta::new(*authority, true),
             AccountMeta::new(batch_acct, false),
             AccountMeta::new_readonly(root, false),
+            AccountMeta::new(cursor, false),
         ],
         InboxIx::CloseBatch,
     )

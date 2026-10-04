@@ -4,6 +4,27 @@ This changelog describes the system as built on `main`, grouped by component. It
 release-tag cadence yet — see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for what each component does
 and how they fit together.
 
+## Inbox cursor v2
+
+- `InitBatchCursor` creates the batch cursor as a 69-byte version-2 account: `deposit_next` 0, `deposit_hash`
+  the deposit queue's seed hash for the chain, `deposit_final` 0. It takes no new argument.
+- `CloseBatch` takes the chain's cursor as a fourth, writable account. After the final-root check it raises a
+  version-2 cursor's `deposit_final` to a version-3 batch's `deposit_to` when that is higher, and never lowers
+  it; a version-1 cursor or a version-2 batch is left alone. `close_batch_ix` in `zk-inbox-client` passes the
+  cursor.
+
+## Bridge deposit queue setup
+
+- `zk-bridge` gains `InitBridgeConfig` (4), `InitDepositQueue` (5), `ProposeDepositParams` (6) and
+  `ActivateDepositParams` (7). Tag 3 is held for the deposit instruction. The bridge config names the one
+  settlement program and the one inbox every deposit queue is bound to, and is written once by the bridge's own
+  upgrade authority. A queue is created by the chain authority, only for a chain whose root and registry belong
+  to the config's settlement program and whose registry names the config's inbox. Parameter bounds (deadline 1 to
+  24 hours, at most 256 per batch, a minimum of at least 1 base unit, a fee of at most 0.01 SOL) are fixed in the
+  program. Parameter changes take a proposal and an activation at least one challenge window later. `InitVault`,
+  `Fund` and `ReleaseExit` are unchanged. `zk-bridge` now depends on `solana-sdk-ids` and
+  `solana-loader-v3-interface`.
+
 ## Prover input: deposits
 
 - `build_batch_input` fills `deposit_from`, `deposit_hash_from` and `deposits` from a v3 batch header's range and its

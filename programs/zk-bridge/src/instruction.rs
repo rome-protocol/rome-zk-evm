@@ -1,5 +1,7 @@
-//! `BridgeIx` — the three instructions this program dispatches. Borsh-serialized, discriminant
-//! = the enum's own variant order (`InitVault` = 0, `Fund` = 1, `ReleaseExit` = 2) — pinned by
+//! `BridgeIx` — the instructions this program dispatches. Borsh-serialized, discriminant
+//! = the enum's own variant order (`InitVault` = 0, `Fund` = 1, `ReleaseExit` = 2, tag 3 held for the
+//! deposit instruction, `InitBridgeConfig` = 4, `InitDepositQueue` = 5, `ProposeDepositParams` = 6,
+//! `ActivateDepositParams` = 7) — pinned by
 //! `discriminants_are_pinned` below, the same "never let a refactor silently renumber a shipped wire
 //! format" rule `zk-settlement::SettleIx` follows.
 
@@ -28,6 +30,45 @@ pub struct ReleaseExitArgs {
     pub message_hash: [u8; 32],
 }
 
+/// `InitBridgeConfig`: the two programs every deposit queue is bound to, written once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct InitBridgeConfigArgs {
+    pub settlement_program: Pubkey,
+    pub inbox_program: Pubkey,
+}
+
+/// The six parameters a deposit queue runs on (the layout's `DepositParams`, with the fee recipient as a
+/// `Pubkey`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct DepositParamsArgs {
+    pub inclusion_deadline_secs: u32,
+    pub max_per_batch: u16,
+    pub max_per_block: u16,
+    pub min_amount: u64,
+    pub fee_lamports: u64,
+    pub fee_recipient: Pubkey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct InitDepositQueueArgs {
+    pub chain_id: u64,
+    /// Must equal the settlement program in the bridge config; named here the way `InitVaultArgs` names it.
+    pub settlement_program: Pubkey,
+    pub params: DepositParamsArgs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct ProposeDepositParamsArgs {
+    pub chain_id: u64,
+    pub activation_slot: u64,
+    pub params: DepositParamsArgs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct ActivateDepositParamsArgs {
+    pub chain_id: u64,
+}
+
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub enum BridgeIx {
     /// accounts: `[payer (signer, writable), vault_config (writable, NEW), mint (read-only), vault_token
@@ -45,6 +86,24 @@ pub enum BridgeIx {
     /// vault_authority (read-only), recipient_ata (writable), token_program]`. Permissionless — funds
     /// always land at `record.sol_recipient`'s ATA regardless of who submits the transaction.
     ReleaseExit(ReleaseExitArgs),
+    /// Tag 3 is held for the deposit instruction, which a later change adds. Until then it is refused
+    /// with `InvalidInstructionData`, and nothing else may take the number.
+    DepositNotYetAvailable,
+    /// accounts: `[payer (signer, writable), authority (signer — the bridge program's upgrade authority),
+    /// bridge_config (writable, NEW, the `["bridge_config"]` PDA), program_data (read-only — this program's
+    /// own `ProgramData` account), system_program]`. Written once.
+    InitBridgeConfig(InitBridgeConfigArgs),
+    /// accounts: `[payer (signer, writable), chain_authority (signer — must equal `root.authority`),
+    /// bridge_config (read-only), root (read-only, at the config's settlement program), registry
+    /// (read-only, at the config's settlement program), vault_config (read-only), fee_recipient
+    /// (read-only), deposit_queue (writable, NEW), system_program]`. Gated by the chain authority.
+    InitDepositQueue(InitDepositQueueArgs),
+    /// accounts: `[chain_authority (signer — must equal `root.authority`), bridge_config (read-only), root
+    /// (read-only, at the config's settlement program), deposit_queue (writable), fee_recipient
+    /// (read-only)]`. Writes only the pending parameters and the activation slot.
+    ProposeDepositParams(ProposeDepositParamsArgs),
+    /// accounts: `[bridge_config (read-only), deposit_queue (writable)]`. Permissionless.
+    ActivateDepositParams(ActivateDepositParamsArgs),
 }
 
 #[cfg(test)]
@@ -73,6 +132,38 @@ mod tests {
         assert_eq!(borsh::to_vec(&init).unwrap()[0], 0);
         assert_eq!(borsh::to_vec(&fund).unwrap()[0], 1);
         assert_eq!(borsh::to_vec(&release).unwrap()[0], 2);
+        assert_eq!(
+            borsh::to_vec(&BridgeIx::DepositNotYetAvailable).unwrap()[0],
+            3
+        );
+        let params = DepositParamsArgs {
+            inclusion_deadline_secs: 43_200,
+            max_per_batch: 256,
+            max_per_block: 16,
+            min_amount: 1,
+            fee_lamports: 0,
+            fee_recipient: Pubkey::new_from_array([4u8; 32]),
+        };
+        let cfg = BridgeIx::InitBridgeConfig(InitBridgeConfigArgs {
+            settlement_program: Pubkey::new_from_array([5u8; 32]),
+            inbox_program: Pubkey::new_from_array([6u8; 32]),
+        });
+        let queue = BridgeIx::InitDepositQueue(InitDepositQueueArgs {
+            chain_id: 1 << 32,
+            settlement_program: Pubkey::new_from_array([5u8; 32]),
+            params,
+        });
+        let propose = BridgeIx::ProposeDepositParams(ProposeDepositParamsArgs {
+            chain_id: 1 << 32,
+            activation_slot: 9,
+            params,
+        });
+        let activate =
+            BridgeIx::ActivateDepositParams(ActivateDepositParamsArgs { chain_id: 1 << 32 });
+        assert_eq!(borsh::to_vec(&cfg).unwrap()[0], 4);
+        assert_eq!(borsh::to_vec(&queue).unwrap()[0], 5);
+        assert_eq!(borsh::to_vec(&propose).unwrap()[0], 6);
+        assert_eq!(borsh::to_vec(&activate).unwrap()[0], 7);
     }
 
     #[test]

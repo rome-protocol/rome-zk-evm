@@ -38,6 +38,66 @@ pub enum BridgeError {
     /// `mint` account — refuses an operator typo before it can mis-scale every future `ReleaseExit`
     /// payout (`release.rs` uses `cfg.mint_decimals` verbatim).
     MintDecimalsMismatch = 9,
+    /// `InitBridgeConfig`: the signer is not the bridge program's own upgrade authority, or the
+    /// `program_data` account is not the bridge's real `ProgramData` account, or the program is immutable.
+    NotUpgradeAuthority = 10,
+    /// `InitBridgeConfig` called a second time: the config is written once and never changed.
+    BridgeConfigAlreadyInitialized = 11,
+    /// `InitBridgeConfig`: the settlement program or the inbox program is the all-zero key. The config is
+    /// written once, so a zero value would leave every chain without a queue for good.
+    BridgeConfigProgramZero = 12,
+    /// The `bridge_config` account is not the bridge's `["bridge_config"]` PDA, is not owned by this
+    /// program, or does not hold a config.
+    WrongBridgeConfig = 13,
+    /// `InitDepositQueue`: `args.settlement_program` is not the settlement program in the bridge config.
+    WrongSettlementProgram = 14,
+    /// `InitDepositQueue`: the chain id is below 2^32, a reserved id. Reserved chains take no deposits.
+    ReservedChainId = 15,
+    /// The `root` account is not at `root::pda(bridge_config.settlement_program, chain_id)`, or is not
+    /// owned by that settlement program.
+    RootNotCanonical = 16,
+    /// `InitDepositQueue`: the `registry` account is not at
+    /// `registry::pda(bridge_config.settlement_program, chain_id)`, is not owned by that program, or does
+    /// not hold a registry for this chain.
+    RegistryNotCanonical = 17,
+    /// `InitDepositQueue`: the chain's registry names an inbox other than the one in the bridge config.
+    WrongInboxProgram = 18,
+    /// The `vault_config` account is not at `vault_config_pda(bridge, settlement_program, chain_id)`, is
+    /// not owned by this program, or does not hold a vault config. A queue needs the chain's vault first.
+    WrongVaultConfig = 19,
+    /// `InitDepositQueue`: the vault's mint has more than 9 decimals, so a deposit would not convert to
+    /// whole gwei.
+    MintTooManyDecimals = 20,
+    /// `inclusion_deadline_secs` is below the 1 hour floor.
+    DeadlineBelowFloor = 21,
+    /// `inclusion_deadline_secs` is above the 24 hour ceiling.
+    DeadlineAboveCeiling = 22,
+    /// `max_per_batch` is above 256.
+    MaxPerBatchTooLarge = 23,
+    /// `max_per_block` is 0 or above `max_per_batch`.
+    MaxPerBlockOutOfRange = 24,
+    /// `min_amount` is 0.
+    MinAmountZero = 25,
+    /// `fee_lamports` is above 0.01 SOL.
+    FeeTooHigh = 26,
+    /// The `fee_recipient` account is not the key in the parameters, or holds less than the rent-exempt
+    /// minimum for an empty account.
+    FeeRecipientNotRentExempt = 27,
+    /// `InitDepositQueue`: this chain already has a queue.
+    QueueAlreadyInitialized = 28,
+    /// The `deposit_queue` account is not at `["deposit_queue", settlement_program, chain_id]` under this
+    /// program, is not owned by it, or does not hold a queue.
+    WrongDepositQueue = 29,
+    /// `ProposeDepositParams`: the chain's `root.challenge_window_slots` is 0.
+    ChallengeWindowZero = 30,
+    /// `ProposeDepositParams`: `activation_slot` is less than one challenge window from the current slot.
+    ActivationTooSoon = 31,
+    /// `ProposeDepositParams`: a proposal is already pending. Activate it first.
+    PendingParamsExist = 32,
+    /// `ActivateDepositParams`: no proposal is pending.
+    NoPendingParams = 33,
+    /// `ActivateDepositParams`: the proposal's activation slot has not been reached.
+    ActivationNotReached = 34,
 }
 
 impl From<BridgeError> for ProgramError {

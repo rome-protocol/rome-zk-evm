@@ -249,8 +249,8 @@ the genesis root written at registration. Withdrawals need a final root, so no w
 Proofs are checked against your chain's verification key. Ask Rome to register it after registering your chain,
 as described above. `VKEY_JSON` must describe that registered key, and `ELF_DIR` must contain the matching guest
 program built for your chain's genesis. The batch guest source is published at
-[`rome-protocol/rome-zk-guest`](https://github.com/rome-protocol/rome-zk-guest), tag `v0.1.1`. From the root of
-this repository, run `git clone --branch v0.1.1 https://github.com/rome-protocol/rome-zk-guest.git .fork`,
+[`rome-protocol/rome-zk-guest`](https://github.com/rome-protocol/rome-zk-guest), tag `v0.2.0`. From the root of
+this repository, run `git clone --branch v0.2.0 https://github.com/rome-protocol/rome-zk-guest.git .fork`,
 then `cd .fork && git submodule update --init --recursive`. The guest uses crates from this repository.
 Building it for your `rendered/genesis.json` is not automated yet. Without that guest, your chain cannot
 post a root.
@@ -286,9 +286,9 @@ To keep the manifest somewhere else, set `PROVER_KEYS_MANIFEST` in `.env` to its
 
 ## The node image
 
-The compose file runs the published node image `ghcr.io/rome-protocol/rome-zk-evm:v0.1.3`. Public tags are
+The compose file runs the published node image `ghcr.io/rome-protocol/rome-zk-evm:v0.2.1`. Public tags are
 pinned to the commit of the source export they were built from, so a tag names exactly one tree and never
-moves. Set `ROME_ZK_TAG=v0.1.3` in `.env`. `./rollup up` stops with `ImageTagNotSet` until you do. To run an
+moves. Set `ROME_ZK_TAG=v0.2.1` in `.env`. `./rollup up` stops with `ImageTagNotSet` until you do. To run an
 image you built from this tree yourself, set `ROME_ZK_IMAGE` to its full reference instead.
 
 ## Exits

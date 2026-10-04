@@ -5,7 +5,8 @@
 
 use rome_zk_layouts::batch::{account_len_for, header_len, leaves_offset_for};
 use rome_zk_testkit::{
-    cursor_account, funded_keypair, prefund_pda, rent_exempt, root_account_with_authority,
+    cursor_account, cursor_account_for, funded_keypair, prefund_pda, rent_exempt,
+    root_account_with_authority,
 };
 use solana_program::{keccak, pubkey::Pubkey};
 use solana_sdk::{
@@ -1921,6 +1922,10 @@ async fn close_batch_before_final_root_errors() {
         root_account(fixture.chain_id, fixture.batch - 1, settlement_program),
     ); // not yet final
     pt.add_account(
+        client::cursor_pda(&program_id, &settlement_program, fixture.chain_id).0,
+        cursor_account_for(2, program_id, fixture.chain_id, fixture.batch + 1),
+    );
+    pt.add_account(
         authority.pubkey(),
         Account {
             lamports: 10_000_000_000,
@@ -1975,6 +1980,10 @@ async fn close_batch_with_root_owned_by_wrong_program_errors() {
         root_account(fixture.chain_id, fixture.batch, wrong_program),
     );
     pt.add_account(
+        client::cursor_pda(&program_id, &settlement_program, fixture.chain_id).0,
+        cursor_account_for(2, program_id, fixture.chain_id, fixture.batch + 1),
+    );
+    pt.add_account(
         authority.pubkey(),
         Account {
             lamports: 10_000_000_000,
@@ -2025,6 +2034,10 @@ async fn close_batch_succeeds_once_root_is_final_and_returns_rent() {
         root,
         root_account(fixture.chain_id, fixture.batch, settlement_program),
     ); // final
+    pt.add_account(
+        client::cursor_pda(&program_id, &settlement_program, fixture.chain_id).0,
+        cursor_account_for(2, program_id, fixture.chain_id, fixture.batch + 1),
+    );
     pt.add_account(
         authority.pubkey(),
         Account {

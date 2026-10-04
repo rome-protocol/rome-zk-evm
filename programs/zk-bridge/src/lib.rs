@@ -1,5 +1,6 @@
 //! `zk-bridge`: THE VAULT — the minimal SPL escrow program that releases a proved settlement exit to
-//! `record.sol_recipient`. Three instructions: `InitVault`, `Fund`, `ReleaseExit`. Custody lives here;
+//! `record.sol_recipient`. Instructions: `InitVault`, `Fund`, `ReleaseExit`, and the deposit setup:
+//! `InitBridgeConfig`, `InitDepositQueue`, `ProposeDepositParams`, `ActivateDepositParams`. Custody lives here;
 //! verification (`ProveExit`/`ConsumeExit`) lives in `programs/zk-settlement`, which this program never
 //! modifies — it only CPIs `ConsumeExit`, signed by its own `["exit_consumer", chain_id]` PDA
 //! (`rome_zk_layouts::exit::exit_consumer_pda`), which is the entire mechanism by which "only the
@@ -12,6 +13,8 @@
 //! v1 scope: native asset only, one mint per chain, no deposit path (`InitVault`/`Fund`
 //! stand in for a real bridge-in until one exists) — see `README.md` for the full fund-safety writeup.
 
+pub mod bridge_config;
+pub mod deposit_queue;
 pub mod errors;
 pub mod fund;
 pub mod init_vault;
@@ -20,7 +23,10 @@ pub mod release;
 pub mod state;
 pub mod token;
 
-pub use instruction::{BridgeIx, FundArgs, InitVaultArgs, ReleaseExitArgs};
+pub use instruction::{
+    ActivateDepositParamsArgs, BridgeIx, DepositParamsArgs, FundArgs, InitBridgeConfigArgs,
+    InitDepositQueueArgs, InitVaultArgs, ProposeDepositParamsArgs, ReleaseExitArgs,
+};
 pub use state::{vault_authority_pda, vault_config_pda, vault_token_pda};
 
 use borsh::BorshDeserialize;
@@ -43,5 +49,15 @@ pub fn process_instruction(
         BridgeIx::InitVault(args) => init_vault::init_vault(program_id, it, args),
         BridgeIx::Fund(args) => fund::fund(program_id, it, args),
         BridgeIx::ReleaseExit(args) => release::release_exit(program_id, it, args),
+        // Tag 3 is held for the deposit instruction; refused until it exists.
+        BridgeIx::DepositNotYetAvailable => Err(ProgramError::InvalidInstructionData),
+        BridgeIx::InitBridgeConfig(args) => bridge_config::init_bridge_config(program_id, it, args),
+        BridgeIx::InitDepositQueue(args) => deposit_queue::init_deposit_queue(program_id, it, args),
+        BridgeIx::ProposeDepositParams(args) => {
+            deposit_queue::propose_deposit_params(program_id, it, args)
+        }
+        BridgeIx::ActivateDepositParams(args) => {
+            deposit_queue::activate_deposit_params(program_id, it, args)
+        }
     }
 }

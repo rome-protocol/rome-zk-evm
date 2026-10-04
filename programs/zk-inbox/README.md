@@ -22,6 +22,13 @@ side; this program's batch accumulator is what makes root posting a fixed-size, 
   program-owned sequential cursor's current value (bootstrapped once via `InitBatchCursor`) and advances
   that cursor atomically as part of opening — an abandoned batch's id can never be reopened, so a later
   batch can never accidentally include a stale, mismatched set of chunks under an old id.
+- **The batch cursor carries the deposit cursor, and a closed batch advances it.** `InitBatchCursor` creates
+  the cursor as a 69-byte version-2 account: the version-1 fields, then `deposit_next` (0),
+  `deposit_hash` (the deposit queue's seed hash for the chain) and `deposit_final` (0). `CloseBatch` takes the
+  cursor as its fourth, writable account; once the covering root is final, a version-3 batch raises a
+  version-2 cursor's `deposit_final` to the batch's `deposit_to` when that is higher, and never lowers it. A
+  version-1 cursor, or a batch that carries no deposit range, is left alone. A missing, wrong-owner,
+  wrong-address or read-only cursor is refused.
 - **Only the batch's own authority can open it, open a chunk under it, or finalize it.** `OpenBatch`'s
   signer must be the chain's registered authority (read from the settlement program's root account);
   `Open` (a chunk) and `FinalizeBatch` both require the signer to match that same batch's stored

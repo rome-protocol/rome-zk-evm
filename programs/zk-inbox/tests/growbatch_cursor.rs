@@ -520,7 +520,7 @@ async fn init_batch_cursor_succeeds_even_when_an_attacker_prefunds_its_pda() {
         .unwrap()
         .expect("cursor account must exist");
     assert_eq!(acct.owner, program_id);
-    assert_eq!(acct.data.len(), rome_zk_layouts::cursor::LEN);
+    assert_eq!(acct.data.len(), rome_zk_layouts::cursor::LEN_V2);
     assert!(acct.lamports >= donated_lamports);
     let decoded = client::decode_batch_cursor(&acct.data).unwrap();
     assert_eq!(decoded.chain_id, chain_id);

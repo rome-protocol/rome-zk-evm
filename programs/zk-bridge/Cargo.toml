@@ -18,6 +18,9 @@ default = []
 borsh = { version = "1.5.1", features = ["derive"] }
 solana-program.workspace = true
 solana-system-interface = { workspace = true, features = ["bincode"] }
+# `InitBridgeConfig` reads this program's own `ProgramData` account, as settlement's `InitGlobalConfig` does.
+solana-sdk-ids.workspace = true
+solana-loader-v3-interface.workspace = true
 # NO `spl-token`/`spl-token-interface`/`spl-associated-token-account-interface` Cargo dependency.
 # Before the workspace moved to `solana-program = "=4.1.0"` it sat on `"=2.1.6"`, and the SPL crates of that day
 # needed a newer `solana-pubkey`/`solana-instruction`, which put two different `Pubkey` types in one

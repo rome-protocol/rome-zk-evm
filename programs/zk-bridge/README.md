@@ -50,6 +50,29 @@ authorise a release for that chain — see `rome_zk_layouts::exit::exit_consumer
 - **`Fund { chain_id, amount }`** — a permissionless SPL transfer into the vault. Anyone may top it up;
   nothing about who funds it is trusted, only where the tokens land (the vault's own PDA-derived account).
 - **`ReleaseExit { chain_id, message_hash }`** — the core instruction. See "Fund-safety invariants" below.
+- **`InitBridgeConfig { settlement_program, inbox_program }`** — writes the bridge's one config account
+  (`["bridge_config"]`) once. The signer must be this program's own upgrade authority: the instruction reads
+  the program's real `ProgramData` account and refuses a wrong address, a wrong owner, an immutable program or
+  a signer that is not the stored authority. It also refuses a zero program id and a second write. A
+  pre-funded config address is adopted, not refused.
+- **`InitDepositQueue { chain_id, settlement_program, params }`** — creates a chain's deposit queue at
+  `["deposit_queue", settlement_program, chain_id]`, empty and with its hash chain at the seed value. The chain
+  authority signs, proved the way `InitVault` proves it: `root` must be the config's settlement program's
+  `["root", chain_id]` account, owned by that program, and `root.authority` must sign. It refuses a settlement
+  program other than the config's, a reserved chain id, a registry that is not at the config's settlement
+  program's registry address, not owned by it, for another chain, or naming an inbox other than the config's, a
+  vault whose mint has more than 9 decimals, and any parameter outside the bounds below. A pre-funded queue
+  address is adopted, and a queue that already holds data is refused.
+- **`ProposeDepositParams { chain_id, activation_slot, params }`** and **`ActivateDepositParams { chain_id }`**
+  — the chain authority proposes new parameters (same root check, same bounds), with an activation slot at least
+  one `root.challenge_window_slots` away; anyone may activate them once that slot is reached. A proposal is
+  refused while another is pending.
+
+Instruction tag 3 is reserved for the deposit instruction and is refused until that instruction exists.
+
+**Parameter bounds, fixed in the program (an upgrade changes them):** an inclusion deadline of 1 to 24 hours;
+`1 <= max_per_block <= max_per_batch <= 256`; `min_amount >= 1` base unit; a fee of at most 0.01 SOL; and a fee
+recipient account that holds the rent-exempt minimum for an empty account.
 
 ## Fund-safety invariants
 
@@ -181,6 +204,11 @@ repeated runs of the same binary (verified: 3 consecutive `cargo test` runs, ide
   mint_decimals check): **30,753 CU** (39,998 before the crate bump). `Fund` (incl. the SPL `Transfer`
   CPI): **8,902 CU** (7,354 before the crate bump, measured against a random mint, so not comparable).
 
+Deposit setup (same tests, `programs/zk-bridge/tests/deposit_setup.rs`; printed by each test):
+`InitBridgeConfig` **12,718 CU** (4,948 to 5,014 for the refusals, 14,271 when the address was pre-funded and
+adopted), `InitDepositQueue` **19,881 CU** (it computes the queue's seed hash with the keccak syscall),
+`ProposeDepositParams` **12,906 CU**, `ActivateDepositParams` **6,686 CU**.
+
 (Re-key note: promoting `settlement_program` into the vault PDA seeds shifts every PDA's own
 bump-seed search depth, so these figures moved from their earlier values — down, in this measurement,
 though the direction is not guaranteed in general — without any change in what each instruction does; still
@@ -193,6 +221,8 @@ bit-exact across repeated runs on the same binary.)
 | Vault config | `["vault_config", settlement_program, chain_id]` | this program |
 | Vault token account | `["vault", settlement_program, chain_id, mint]` | the SPL Token program |
 | Vault authority | `["vault_authority", settlement_program, chain_id]` | none (never holds data; a pure signer identity) |
+| Bridge config | `["bridge_config"]` | this program |
+| Deposit queue | `["deposit_queue", settlement_program, chain_id]` | this program |
 | Exit consumer | `["exit_consumer", chain_id]` | none (the identity this program CPI-signs `ConsumeExit` as) |
 
 Keying the first three by `settlement_program` is what makes the real chain authority's vault address
@@ -201,7 +231,7 @@ program to `zk-settlement`, not a settlement program to this one.
 
 ## What this program does not do
 
-No deposit path — `InitVault`/`Fund` stand in for a real bridge-in until a later step (the first live
+No deposit path yet (the queue and its parameters exist, the deposit instruction does not) — `InitVault`/`Fund` stand in for a real bridge-in until a later step (the first live
 release is from an operator-funded devnet SPL vault; deposits come later). No multi-asset vault (one
 mint per `(settlement_program, chain_id)` in v1; the `["vault", settlement_program, chain_id, mint]`
 seed already leaves room for more). No recipient-ATA auto-creation — `ReleaseExit` requires the

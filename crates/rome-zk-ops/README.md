@@ -66,8 +66,8 @@ the same V1 path.
 
 The root `Dockerfile` builds `rome-zk-ops` next to the sequencer, batcher and derive binaries and installs it at
 `/usr/local/bin/rome-zk-ops`, so `docker run --entrypoint rome-zk-ops <image> --help` works on an image built
-from this tree. The image runs as uid and gid 999. Published node images up to `v0.1.3` do not include it; the
-first tag after `v0.1.3` will. Until then, build it with `cargo build --release -p rome-zk-ops`.
+from this tree. The image runs as uid and gid 999. Published node images include it from `v0.2.1`;
+earlier images do not.
 
 ## Tests
 

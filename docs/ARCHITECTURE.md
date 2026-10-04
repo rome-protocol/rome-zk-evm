@@ -102,7 +102,7 @@ Each linked directory has a README with the component's configuration and tests.
 | Prover input generator | [`crates/rome-zk-prover-input`](../crates/rome-zk-prover-input) | Fetches inbox data, blocks and execution witnesses and writes the guest's two input files. Available as a library and CLI. | Inside the prover, or invoked separately |
 | Batch guest | `rome-protocol/rome-zk-guest`, `crates/clients/rome/guest` (`guest-rome`) | Checks that blocks match inbox data and execute correctly, then commits the batch's public values. The chain's genesis and fee recipient are compiled into the guest. | Executed by ZisK during proving |
 | Settlement watcher | [`crates/rome-zk-settlement-watcher`](../crates/rome-zk-settlement-watcher) | Reads inbox and settlement transaction history into Postgres and derives batch and exit status. Never writes to Solana. | Chain operator or an independent observer |
-| Operator CLI | [`crates/rome-zk-ops`](../crates/rome-zk-ops) | One binary for operator actions on a chain's Solana accounts: chain id, registration, deposit refund, exit configuration, the one-time migration, creating the batch cursor (`init-cursor`), the bridge vault (`vault init`, `vault fund`, `vault show`) and `release-exit`. A dry run unless `--confirm`; every transaction goes out as a V1 transaction through `rome-zk-solana-sender`. The registry-authority commands (global configuration, verifier registry) are not in this binary; they stay in the `governance` example of `zk-settlement-client`. The root `Dockerfile` builds it into the node image; published images up to `v0.1.3` do not include it. | Chain operator |
+| Operator CLI | [`crates/rome-zk-ops`](../crates/rome-zk-ops) | One binary for operator actions on a chain's Solana accounts: chain id, registration, deposit refund, exit configuration, the one-time migration, creating the batch cursor (`init-cursor`), the bridge vault (`vault init`, `vault fund`, `vault show`) and `release-exit`. A dry run unless `--confirm`; every transaction goes out as a V1 transaction through `rome-zk-solana-sender`. The registry-authority commands (global configuration, verifier registry) are not in this binary; they stay in the `governance` example of `zk-settlement-client`. The root `Dockerfile` builds it into the node image; published images include it from `v0.2.1`. | Chain operator |
 | Rollup runner | [`deploy/rollup`](../deploy/rollup) | `./rollup init`, `register`, `up` and `check`: renders a chain's configuration and genesis, registers the chain, and runs the node image, reth-verifier and, with `PROVER=on`, the prover under Docker Compose. | Chain operator |
 | Exit portal | [`contracts/exit-portal`](../contracts/exit-portal) | `RomeExitPortal` records a native-asset withdrawal message and emits `ExitInitiated`. | Contract deployed on the rollup |
 | Exit prover | [`crates/rome-zk-exit-prover`](../crates/rome-zk-exit-prover) | Watches portal events, obtains and locally checks an Ethereum storage proof, and sends `ProveExit` against a final batch root. | Chain operator |
@@ -152,8 +152,8 @@ image is published as `ghcr.io/rome-protocol/rome-zk-evm`. Building the guest fo
 automated yet, and no prover image is published. [Run on Solana devnet](RUN-ON-DEVNET.md) walks through
 starting a chain against those programs.
 
-The node image contains `rome-zk-sequencer`, `rome-zk-batcher` and `rome-zk-derive`, and, from the first
-tag after `v0.1.3`, `rome-zk-ops`. The prover, the exit prover and the settlement watcher are not in it.
+The node image contains `rome-zk-sequencer`, `rome-zk-batcher` and `rome-zk-derive`, and, from `v0.2.1`,
+`rome-zk-ops`. The prover, the exit prover and the settlement watcher are not in it.
 `deploy/rollup` builds the prover image from this repository the first time the prover starts.
 
 The component READMEs document each service's configuration and commands. The public release is
@@ -437,7 +437,9 @@ never a real batch id. Settlement's own continuity check (`PostRootProved`/`Post
 1`, so initialize a new chain's inbox cursor at 1. The inbox program's `InitBatchCursor` handler accepts
 any starting value, but settlement cannot accept a first batch of 0. On a chain with batch history, initialize
 the cursor at `head_pending_batch + 1`, never above it: settlement posts only that id next, so a higher
-cursor halts the chain.
+cursor halts the chain. `InitBatchCursor` creates the cursor as a 69-byte version-2 account that also holds the
+deposit cursor (`deposit_next`, `deposit_hash`, `deposit_final`), and `CloseBatch` raises `deposit_final` to the
+closed batch's deposit range end when that batch is final.
 
 ## Data formats
 

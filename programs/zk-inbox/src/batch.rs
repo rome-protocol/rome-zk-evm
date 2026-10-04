@@ -562,12 +562,13 @@ fn close_batch_inner<'a, 'b: 'a>(
     let authority = next_account_info(it)?;
     let batch_pda = next_account_info(it)?;
     let root_pda = next_account_info(it)?;
+    let cursor_pda = next_account_info(it)?;
     if batch_pda.owner != program_id {
         return Err(ProgramError::IncorrectProgramId);
     }
     let (chain_id, batch, _expected_count) = {
         let d = batch_pda.try_borrow_data()?;
-        let (_version, chain_id, batch, expected_count) = read_header(&d)?;
+        let (version, chain_id, batch, expected_count) = read_header(&d)?;
         if !authority.is_signer || *authority.key != pubkey_at(&d, OFF_AUTHORITY) {
             return Err(ProgramError::MissingRequiredSignature);
         }
@@ -576,6 +577,24 @@ fn close_batch_inner<'a, 'b: 'a>(
         }
         let settlement_program = pubkey_at(&d, OFF_SETTLEMENT_PROGRAM);
         check_final_root(root_pda, &settlement_program, chain_id, batch)?;
+        // Only a v3 batch carries a deposit range; a v2 batch credited nothing.
+        let deposit_to = (version == rome_zk_layouts::batch::VERSION_V3)
+            .then(|| u64_at(&d, rome_zk_layouts::batch::OFF_DEPOSIT_TO));
+        // The cursor must be this chain's own (owner, PDA and chain id), whatever its version.
+        let cursor = load_cursor(program_id, cursor_pda, &settlement_program, chain_id)?;
+        if !cursor_pda.is_writable {
+            return Err(ProgramError::InvalidArgument);
+        }
+        // `deposit_final` only moves up, and only on a v2 cursor: closing batch 3 and then batch 2 keeps
+        // 3's value, and a v1 cursor has nothing to advance.
+        if let (Some(to), Some(dep)) = (deposit_to, cursor.deposit) {
+            if to > dep.final_ {
+                let mut cd = cursor_pda.try_borrow_mut_data()?;
+                cd[rome_zk_layouts::cursor::OFF_DEPOSIT_FINAL
+                    ..rome_zk_layouts::cursor::OFF_DEPOSIT_FINAL + 8]
+                    .copy_from_slice(&to.to_le_bytes());
+            }
+        }
         (chain_id, batch, expected_count)
     };
     let lamports = batch_pda.lamports();
@@ -814,7 +833,9 @@ fn init_batch_cursor_inner<'a, 'b: 'a>(
     if cursor_pda.owner == program_id && cursor_pda.data_len() != 0 {
         return Err(BatchError::CursorAlreadyInitialized.into());
     }
-    let space = rome_zk_layouts::cursor::LEN;
+    // The cursor is born as v2 (69 bytes): the deposit cursor starts at index 0, at the queue's seed hash
+    // `h_0(settlement_program, chain_id)`, with nothing yet final.
+    let space = rome_zk_layouts::cursor::LEN_V2;
     rome_zk_pda::create_or_adopt_pda(
         payer,
         cursor_pda,
@@ -823,14 +844,22 @@ fn init_batch_cursor_inner<'a, 'b: 'a>(
         space,
         &[&sd[0], &sd[1], &sd[2], &[bump]],
     )?;
-    let mut d = cursor_pda.try_borrow_mut_data()?;
-    d[rome_zk_layouts::cursor::OFF_MAGIC..rome_zk_layouts::cursor::OFF_MAGIC + 4]
-        .copy_from_slice(&rome_zk_layouts::cursor::MAGIC.to_le_bytes());
-    d[rome_zk_layouts::cursor::OFF_VERSION] = rome_zk_layouts::cursor::VERSION;
-    d[rome_zk_layouts::cursor::OFF_CHAIN_ID..rome_zk_layouts::cursor::OFF_CHAIN_ID + 8]
-        .copy_from_slice(&chain_id.to_le_bytes());
-    d[rome_zk_layouts::cursor::OFF_NEXT_BATCH..rome_zk_layouts::cursor::OFF_NEXT_BATCH + 8]
-        .copy_from_slice(&next_batch.to_le_bytes());
+    let h = rome_zk_merkle::keccak256;
+    let bytes = rome_zk_layouts::cursor::write_v2(&rome_zk_layouts::cursor::CursorFields {
+        chain_id,
+        next_batch,
+        deposit: Some(rome_zk_layouts::cursor::CursorDeposit {
+            next: 0,
+            hash: rome_zk_layouts::deposit::queue_seed_hash(
+                &h,
+                &settlement_program.to_bytes(),
+                chain_id,
+            ),
+            final_: 0,
+        }),
+    })
+    .ok_or(ProgramError::InvalidAccountData)?;
+    cursor_pda.try_borrow_mut_data()?.copy_from_slice(&bytes);
     msg!(
         "batch cursor initialised for chain {}, next_batch = {}",
         chain_id,
