@@ -49,6 +49,7 @@
 
 pub mod admission;
 pub mod config;
+pub mod deposits;
 pub mod executor;
 pub mod header;
 pub mod log;

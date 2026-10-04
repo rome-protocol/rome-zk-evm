@@ -438,6 +438,8 @@ pub async fn replay_into_executor<E: Executor>(
     let mut first_ts_in_block = 0u64;
     let mut prev_sub_block_ts_us = 0u64;
     let mut prev_block_timestamp_secs = 0u64;
+    // One past the last deposit any record credited: the next block that credits deposits starts here.
+    let mut deposits_end = 0u64;
 
     // Captured once, before the loop — see this function's doc.
     let already_persisted = executor.last_persisted_block();
@@ -579,6 +581,10 @@ pub async fn replay_into_executor<E: Executor>(
             }
         }
 
+        if let Some(end) = record.header.deposits_end {
+            deposits_end = end;
+        }
+
         let header_hash = record.header.hash();
         sub_block_hashes_in_block.push(header_hash);
         gas_in_block += record.header.gas_used;
@@ -631,6 +637,7 @@ pub async fn replay_into_executor<E: Executor>(
             gas_in_block: 0,
             prev_sub_block_ts_us,
             prev_block_timestamp_secs,
+            deposits_end,
         },
         Some(r) => crate::sealer::ResumePoint {
             next_block: r.header.block,
@@ -641,6 +648,7 @@ pub async fn replay_into_executor<E: Executor>(
             gas_in_block,
             prev_sub_block_ts_us,
             prev_block_timestamp_secs,
+            deposits_end,
         },
     };
     Ok(resume)

@@ -311,6 +311,7 @@ mod tests {
                 fee_recipient: Address::ZERO,
                 sub_blocks_per_block: crate::sealer::SUB_BLOCKS_PER_BLOCK,
                 empty_block_interval_secs: 0,
+                deposits: None,
             },
         )
         .unwrap();
@@ -440,6 +441,7 @@ mod tests {
                 fee_recipient: Address::ZERO,
                 sub_blocks_per_block: crate::sealer::SUB_BLOCKS_PER_BLOCK,
                 empty_block_interval_secs: 0,
+                deposits: None,
             },
         )
         .unwrap();
@@ -517,6 +519,7 @@ mod tests {
                 fee_recipient: Address::ZERO,
                 sub_blocks_per_block: crate::sealer::SUB_BLOCKS_PER_BLOCK,
                 empty_block_interval_secs: 0,
+                deposits: None,
             },
         )
         .unwrap();

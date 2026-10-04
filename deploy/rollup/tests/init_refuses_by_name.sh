@@ -19,7 +19,7 @@ s = open(p).read()
 val = "200101" if key == "chain_id" else '"/tmp/x"'
 open(p, "w").write(s.replace("[profile]\n", f"[profile]\n{key} = {val}\n", 1))
 PY
-  : > "$WORK/cargo_calls"
+  : > "$WORK/ops_calls"
   if out="$("$ROLLUP" init 2>&1)"; then fail "init refuses [profile] $key" "exited 0"
   elif grep -q "^ProfileKeyReserved.*$key" <<<"$out"; then pass "init refuses by name (ProfileKeyReserved) a [profile] $key"; else fail "ProfileKeyReserved for $key" "$out"; fi
   [[ ! -e "$ROLLUP_OUT/genesis.json" ]] || fail "nothing rendered after ProfileKeyReserved ($key)" "genesis.json exists"

@@ -102,3 +102,12 @@ datadir = "/var/lib/rome-zk-sequencer/reth"
 genesis_path = "/etc/rome-zk-sequencer/genesis.json"
 http_addr = "0.0.0.0:8545"
 ws_addr = "0.0.0.0:8546"
+
+# Optional. Leave it out and the sequencer runs without deposits. With it, the sequencer reads the chain's
+# deposit queue from Solana (finalized commitment, through this one RPC; it sends nothing) and puts each
+# finalized deposit in a block as an EIP-4895 withdrawal, oldest first, up to the queue's per-block cap. The
+# bridge program is not set here: it comes from the chain's exit_config account.
+# [deposits]
+# solana_rpc_url = "http://127.0.0.1:8899"
+# settlement_program = "<the chain's settlement program, base58>"
+# poll_interval_ms = 1000

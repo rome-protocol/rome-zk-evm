@@ -4,9 +4,27 @@
 //! pre-confirmation latency, admission queue depth, sub-block seal lateness (against the 50 ms
 //! deadline), and txs per sub-block.
 
-use prometheus::{Encoder, Histogram, HistogramOpts, IntCounter, IntGauge, Registry, TextEncoder};
+use prometheus::{
+    Encoder, Gauge, Histogram, HistogramOpts, IntCounter, IntGauge, Registry, TextEncoder,
+};
 use std::net::SocketAddr;
 use std::sync::Arc;
+
+/// The deposit metrics. Registered only when the sequencer runs with a `[deposits]` section
+/// ([`Metrics::register_deposit_metrics`]), so a sequencer without one exposes exactly the series it always did.
+#[derive(Clone)]
+pub struct DepositMetrics {
+    /// Seconds since the oldest finalized deposit that no block has credited yet was enqueued; 0 when none waits.
+    pub oldest_waiting_age_seconds: Gauge,
+    /// The queue's finalized deposit count, as last read.
+    pub finalized_count: IntGauge,
+    /// Deposits put into blocks.
+    pub credited_total: IntCounter,
+    /// Seconds from a deposit's enqueue to the close of the block that credits it (its balance is visible then).
+    pub deposit_to_balance_seconds: Histogram,
+    /// Polls of the queue that failed (the RPC, or an account that did not decode); the next poll retries.
+    pub poll_errors_total: IntCounter,
+}
 
 pub struct Metrics {
     registry: Registry,
@@ -204,6 +222,57 @@ impl Metrics {
             block_gas_used,
             block_timestamp_ahead_seconds,
         })
+    }
+
+    /// Registers the deposit series and returns their handles. Called once, when the sequencer starts with a
+    /// `[deposits]` section.
+    pub fn register_deposit_metrics(&self) -> DepositMetrics {
+        let oldest_waiting_age_seconds = Gauge::new(
+            "rome_zk_sequencer_deposit_oldest_waiting_age_seconds",
+            "Age of the oldest finalized deposit no block has credited yet (0 when none waits)",
+        )
+        .unwrap();
+        let finalized_count = IntGauge::new(
+            "rome_zk_sequencer_deposit_finalized_count",
+            "The deposit queue's finalized count, as last read",
+        )
+        .unwrap();
+        let credited_total = IntCounter::new(
+            "rome_zk_sequencer_deposits_credited_total",
+            "Deposits put into blocks",
+        )
+        .unwrap();
+        let deposit_to_balance_seconds = Histogram::with_opts(
+            HistogramOpts::new(
+                "rome_zk_sequencer_deposit_to_balance_seconds",
+                "Seconds from a deposit's enqueue to the close of the block that credits it",
+            )
+            .buckets(vec![
+                0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0,
+            ]),
+        )
+        .unwrap();
+        let poll_errors_total = IntCounter::new(
+            "rome_zk_sequencer_deposit_poll_errors_total",
+            "Polls of the deposit queue that failed",
+        )
+        .unwrap();
+        for c in [
+            Box::new(oldest_waiting_age_seconds.clone()) as Box<dyn prometheus::core::Collector>,
+            Box::new(finalized_count.clone()),
+            Box::new(credited_total.clone()),
+            Box::new(deposit_to_balance_seconds.clone()),
+            Box::new(poll_errors_total.clone()),
+        ] {
+            self.registry.register(c).unwrap();
+        }
+        DepositMetrics {
+            oldest_waiting_age_seconds,
+            finalized_count,
+            credited_total,
+            deposit_to_balance_seconds,
+            poll_errors_total,
+        }
     }
 
     fn render(&self) -> Vec<u8> {

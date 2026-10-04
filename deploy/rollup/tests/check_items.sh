@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # deploy/rollup/tests/check_items.sh — `rollup check` items against stubbed docker and curl: services, chain id,
-# sequencer head (advancing, or idle by its own counter), batcher cursor and backlog, inbox batches, roots and
-# settlement lag (only meaningful with a prover), derive lag, verifier peers. One world file per knob; every item has a green and a
-# red case, and the red ones name what is wrong.
+# sequencer head (advancing, or idle by its own counter), batcher cursor, inbox batches, roots and settlement lag
+# (only meaningful with a prover), derive lag, verifier peers. One world file per knob; every item has a green and a
+# red case, and the red ones name what is wrong. The items that read Solana through rome-zk-ops or judge a window
+# (batches finalized, verification key, payer floor, reclaim deadline, exit config) are in check_new_items.sh.
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/fixtures/common.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/fixtures/check_stubs.sh"
@@ -19,7 +20,7 @@ for svc in sequencer batcher reth-verifier derive; do expect "$out" "^PASS: serv
 expect "$out" '^PASS: chain id' "chain id matches chain.toml"
 expect "$out" '^PASS: sequencer head' "sequencer head advances"
 expect "$out" '^PASS: batcher cursor .*next_batch=7' "batcher cursor decoded"
-expect "$out" '^PASS: batcher backlog' "batcher backlog within bound"
+expect "$out" '^SKIP: batches finalized — no sample from at least' "batches finalized has no baseline on a first run"
 expect "$out" '^PASS: inbox batches .*6' "inbox batches posted (next_batch - 1)"
 expect "$out" '^PASS: roots .*head_final_batch=5' "root decoded"
 expect "$out" '^SKIP: settlement lag — no prover' "settlement lag is skipped without a prover"
@@ -35,10 +36,6 @@ echo 1 > "$S/idle_step"; out="$(run)"
 expect "$out" '^PASS: sequencer head .*idle' "an idle chain (ticks, no blocks) is healthy"
 echo 1 > "$S/seq_step"; echo 0 > "$S/idle_step"
 
-echo 500 > "$S/oldest_age"; out="$(run)"
-expect "$out" '^FAIL: batcher backlog — .*500' "an unposted block older than the bound fails"
-echo 3 > "$S/oldest_age"
-
 echo missing > "$S/cursor_next"; out="$(run)"
 expect "$out" '^FAIL: batcher cursor — CursorUnreadable' "an absent cursor account fails by name"
 echo 7 > "$S/cursor_next"
@@ -47,11 +44,14 @@ expect "$out" '^FAIL: batcher cursor — PdasMissing' "no pdas.env fails by name
 expect "$out" 'rollup register' "the PdasMissing line points at rollup register"
 printf 'CURSOR_PDA=CursorPdaFixture111111111111111111111111112\nROOT_PDA=RootPdaFixture1111111111111111111111111111112\n' > "$ROLLUP_OUT/pdas.env"
 
-echo 1 > "$S/cursor_next"; out="$(run)"
-expect "$out" '^PASS: inbox batches .*0 posted' "nothing posted yet is fine inside the close-after window"
-echo 500 > "$S/oldest_age"; out="$(run)"
-expect "$out" '^FAIL: inbox batches — NoBatchPosted' "nothing posted and a stale block fails by name"
-echo 3 > "$S/oldest_age"; echo 7 > "$S/cursor_next"
+# Inbox batches judge the sequencer's head against what the posted batches could hold (blocks_per_batch = 30 in the fixture).
+echo 1 > "$S/cursor_next"; echo 10 > "$S/seq_block"; out="$(run)"
+expect "$out" '^PASS: inbox batches .*0 posted' "nothing posted yet is fine while the sequencer is under two batches"
+echo 100 > "$S/seq_block"; out="$(run)"
+expect "$out" '^FAIL: inbox batches — NoBatchPosted' "nothing posted and the sequencer two batches ahead fails by name"
+echo 2 > "$S/cursor_next"; echo 100 > "$S/seq_block"; out="$(run)"
+expect "$out" '^FAIL: inbox batches — BatcherBehind' "a posted batch that cannot hold the sequencer's blocks fails by name"
+echo 7 > "$S/cursor_next"; echo 120 > "$S/seq_block"
 
 echo 40 > "$S/ver_block"; out="$(run)"
 expect "$out" '^FAIL: derive lag — DeriveBehind' "a verifier far behind the sequencer fails by name"

@@ -126,6 +126,59 @@ pub struct Config {
     /// selected; the mock stays default (`bin/rome-zk-sequencer.rs`'s `--executor` flag).
     #[serde(default)]
     pub reth: Option<RethSettings>,
+    /// Optional `[deposits]` section. Absent, the sequencer runs without deposits, exactly as it always did.
+    /// Present, it reads the chain's deposit queue from Solana and puts finalized deposits in blocks.
+    #[serde(default)]
+    pub deposits: Option<DepositSettings>,
+}
+
+/// `[deposits]` section: where the deposit queue lives and how often to read it. The bridge program is not
+/// configured here: it is read from the chain's `exit_config` account (the settlement program's), so the
+/// sequencer cannot disagree with the settlement program about which bridge the chain uses.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DepositSettings {
+    /// The one Solana RPC every deposit read goes to, at finalized commitment. The sequencer sends nothing to it.
+    pub solana_rpc_url: String,
+    /// The chain's settlement program, base58.
+    pub settlement_program: String,
+    /// How often to read the queue, in milliseconds.
+    #[serde(default = "default_deposit_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+}
+
+fn default_deposit_poll_interval_ms() -> u64 {
+    1_000
+}
+
+impl DepositSettings {
+    /// The settlement program as a key.
+    pub fn settlement_program_id(&self) -> Result<solana_program::pubkey::Pubkey, ConfigError> {
+        self.settlement_program.parse().map_err(|e| {
+            ConfigError::InvalidDeposits(format!(
+                "settlement_program {:?} is not a base58 program id: {e}",
+                self.settlement_program
+            ))
+        })
+    }
+
+    pub fn poll_interval(&self) -> Duration {
+        Duration::from_millis(self.poll_interval_ms)
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        self.settlement_program_id()?;
+        if self.solana_rpc_url.trim().is_empty() {
+            return Err(ConfigError::InvalidDeposits(
+                "solana_rpc_url is empty".into(),
+            ));
+        }
+        if self.poll_interval_ms == 0 {
+            return Err(ConfigError::InvalidDeposits(
+                "poll_interval_ms must be above 0".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// `[reth]` section: where `RethExecutor` keeps its MDBX store and which genesis JSON it was bred
@@ -209,6 +262,9 @@ pub enum ConfigError {
          move it to [profile].{key} — refusing to start rather than silently ignore it"
     )]
     LegacyTopLevelProfileKey { key: &'static str },
+    /// The `[deposits]` section is present but unusable.
+    #[error("invalid [deposits]: {0}")]
+    InvalidDeposits(String),
 }
 
 impl Config {
@@ -227,6 +283,9 @@ impl Config {
         // Validate the profile after env overrides so an override that pushes gas/s
         // past the declared budgets is caught too, not just the file's own value.
         config.profile.validate()?;
+        if let Some(d) = &config.deposits {
+            d.validate()?;
+        }
         Ok(config)
     }
 
@@ -609,5 +668,72 @@ mod tests {
         let config_path = write(dir.path(), "config.toml", &toml);
         let config = Config::load(&config_path).unwrap();
         assert_eq!(config.profile.sub_block_gas_limit, 1_234_567);
+    }
+    /// A config file with the usual keys and `extra` appended (the `[deposits]` tests' fixture).
+    fn load_with(extra: &str) -> Result<Config, ConfigError> {
+        let dir = tempdir().unwrap();
+        let key_path = write(dir.path(), "key.hex", &hex::encode([7u8; 32]));
+        let toml = format!(
+            r#"
+            chain_id = 200101
+            rpc_addr = "127.0.0.1:9944"
+            metrics_addr = "127.0.0.1:9945"
+            log_dir = "{}"
+            sequencer_key_path = "{}"
+            {extra}
+            "#,
+            dir.path().join("log").display(),
+            key_path.display(),
+        );
+        let config_path = write(dir.path(), "config.toml", &toml);
+        Config::load(&config_path)
+    }
+
+    #[test]
+    fn without_a_deposits_section_there_are_no_deposits() {
+        assert!(load_with("").unwrap().deposits.is_none());
+    }
+
+    #[test]
+    fn deposits_section_parses_with_a_default_poll_interval() {
+        let config = load_with(
+            r#"
+            [deposits]
+            solana_rpc_url = "http://127.0.0.1:8899"
+            settlement_program = "11111111111111111111111111111111"
+            "#,
+        )
+        .unwrap();
+        let d = config.deposits.unwrap();
+        assert_eq!(d.solana_rpc_url, "http://127.0.0.1:8899");
+        assert_eq!(d.poll_interval(), Duration::from_secs(1));
+        assert_eq!(
+            d.settlement_program_id().unwrap(),
+            solana_program::pubkey::Pubkey::default()
+        );
+    }
+
+    #[test]
+    fn a_bad_deposits_section_is_refused_at_load() {
+        for bad in [
+            // Not a program id.
+            r#"[deposits]
+            solana_rpc_url = "http://127.0.0.1:8899"
+            settlement_program = "not-a-key""#,
+            // No RPC to read from.
+            r#"[deposits]
+            solana_rpc_url = ""
+            settlement_program = "11111111111111111111111111111111""#,
+            // A poll interval of zero would spin.
+            r#"[deposits]
+            solana_rpc_url = "http://127.0.0.1:8899"
+            settlement_program = "11111111111111111111111111111111"
+            poll_interval_ms = 0"#,
+        ] {
+            assert!(
+                matches!(load_with(bad), Err(ConfigError::InvalidDeposits(_))),
+                "{bad}"
+            );
+        }
     }
 }

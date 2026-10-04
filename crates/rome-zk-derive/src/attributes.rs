@@ -9,6 +9,7 @@
 //! what the sequencer commits and what this node derives, exactly the kind of divergence the strict
 //! validity checks exist to catch.
 
+use alloy_eips::eip4895::Withdrawal;
 use alloy_primitives::{Address, Bytes};
 use rome_zk_channel::Block;
 use rome_zk_executor_api::BlockEnv;
@@ -33,8 +34,15 @@ pub struct Attributes {
 /// sequencer's `SealerState`/`replay_into_executor` read from their own loaded genesis — `Address::ZERO`
 /// on Tiber, never a hardcoded literal here), passed in rather than re-read by this function so callers
 /// own where their genesis comes from. `base_fee: None` lets the engine derive EIP-1559 base fee from its own parent
-/// header, exactly as the design specifies.
-pub fn attributes_for_block(chain_id: u64, fee_recipient: Address, block: &Block) -> Attributes {
+/// header, exactly as the design specifies. `withdrawals` are the block's deposit credits, already verified
+/// against the batch header ([`crate::deposits`]) and each built with
+/// `rome_zk_executor_api::deposit_withdrawal`; empty for a block without deposits.
+pub fn attributes_for_block(
+    chain_id: u64,
+    fee_recipient: Address,
+    block: &Block,
+    withdrawals: Vec<Withdrawal>,
+) -> Attributes {
     Attributes {
         chain_id,
         env: BlockEnv {
@@ -44,7 +52,7 @@ pub fn attributes_for_block(chain_id: u64, fee_recipient: Address, block: &Block
             coinbase: fee_recipient,
             prev_randao: rome_zk_executor_api::prev_randao(chain_id, block.number),
             base_fee: None,
-            withdrawals: vec![],
+            withdrawals,
         },
         txs: block.txs.clone(),
     }
@@ -63,7 +71,7 @@ mod tests {
             txs: vec![Bytes::from_static(b"tx")],
             deposits_end: None,
         };
-        let attrs = attributes_for_block(200_101, Address::ZERO, &block);
+        let attrs = attributes_for_block(200_101, Address::ZERO, &block, vec![]);
         assert_eq!(attrs.chain_id, 200_101);
         assert_eq!(attrs.env.number, 5);
         assert_eq!(attrs.env.timestamp_secs, 1_757_000_005);
@@ -76,6 +84,25 @@ mod tests {
             "must reuse the shared formula, not recompute an equivalent one"
         );
         assert_eq!(attrs.txs, block.txs);
+        assert!(attrs.env.withdrawals.is_empty());
+    }
+
+    /// The block's withdrawals reach the env as given, in order.
+    #[test]
+    fn the_blocks_withdrawals_reach_the_env() {
+        let block = Block {
+            number: 5,
+            timestamp: 1_757_000_005,
+            gas_limit: 100_000_000,
+            txs: vec![],
+            deposits_end: Some(2),
+        };
+        let w = vec![
+            rome_zk_executor_api::deposit_withdrawal(0, Address::repeat_byte(1), 10),
+            rome_zk_executor_api::deposit_withdrawal(1, Address::repeat_byte(2), 20),
+        ];
+        let attrs = attributes_for_block(200_101, Address::ZERO, &block, w.clone());
+        assert_eq!(attrs.env.withdrawals, w);
     }
 
     /// A non-zero `fee_recipient` (a chain other than Tiber) must flow
@@ -93,7 +120,7 @@ mod tests {
             deposits_end: None,
         };
         let fee_recipient = Address::repeat_byte(0x77);
-        let attrs = attributes_for_block(200_101, fee_recipient, &block);
+        let attrs = attributes_for_block(200_101, fee_recipient, &block, vec![]);
         assert_eq!(attrs.env.coinbase, fee_recipient);
     }
 }

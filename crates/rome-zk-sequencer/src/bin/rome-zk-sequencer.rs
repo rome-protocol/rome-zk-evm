@@ -163,6 +163,37 @@ async fn replay<E: Executor>(
     }
 }
 
+/// The deposit feed and its poller, when the config has a `[deposits]` section; `None` otherwise (the sequencer
+/// then runs without deposits).
+fn start_deposits(
+    config: &rome_zk_sequencer::config::Config,
+    metrics: &Metrics,
+    resume: &ResumePoint,
+) -> Result<Option<rome_zk_sequencer::deposits::DepositFeed>, ExitCode> {
+    let Some(settings) = &config.deposits else {
+        return Ok(None);
+    };
+    match rome_zk_sequencer::deposits::start(
+        settings,
+        config.chain_id,
+        metrics,
+        resume.deposits_end,
+    ) {
+        Ok(feed) => {
+            // The URL is not logged: an RPC URL often carries a key.
+            tracing::info!(
+                "deposits on: reading the queue every {:?}",
+                settings.poll_interval()
+            );
+            Ok(Some(feed))
+        }
+        Err(e) => {
+            tracing::error!("failed to start deposits: {e}");
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
 /// Everything from "spawn the sequencer" to "exit with the right code", generic over the executor
 /// so `--executor mock` and `--executor reth` share one startup tail (this binary's
 /// startup sequence does not change when the executor is swapped behind the trait).
@@ -176,6 +207,11 @@ async fn run<E: Executor + 'static>(
     let metrics_addr = spawn_metrics(config.metrics_addr, metrics.clone()).await;
 
     let fee_recipient = match fee_recipient_from_config(&config) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+
+    let deposits = match start_deposits(&config, &metrics, &resume) {
         Ok(v) => v,
         Err(code) => return code,
     };
@@ -200,6 +236,7 @@ async fn run<E: Executor + 'static>(
             sub_blocks_per_block: config.profile.sub_blocks_per_block,
             // 0 (Tiber default) = never seal a block with no transactions.
             empty_block_interval_secs: config.profile.empty_block_interval_secs,
+            deposits,
         },
     ) {
         Ok(v) => v,
@@ -302,6 +339,11 @@ async fn run_with_node_rpc(
         Err(code) => return code,
     };
 
+    let deposits = match start_deposits(&config, &metrics, &resume) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+
     let (handle, sequencer_join) = match spawn(
         executor,
         SpawnConfig {
@@ -319,6 +361,7 @@ async fn run_with_node_rpc(
             sub_blocks_per_block: config.profile.sub_blocks_per_block,
             // 0 (Tiber default) = never seal a block with no transactions.
             empty_block_interval_secs: config.profile.empty_block_interval_secs,
+            deposits,
         },
     ) {
         Ok(v) => v,

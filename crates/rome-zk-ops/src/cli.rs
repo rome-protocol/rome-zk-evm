@@ -3,7 +3,7 @@
 
 use crate::chain::{Chain, OfflineChain, RpcChain};
 use crate::commands::{
-    bridge, chain_id, exit_config, init_cursor, migrate, refund_deposit,
+    bridge, chain_id, chain_status, exit_config, init_cursor, migrate, pdas, refund_deposit,
     register::{self, RegisterRequest},
 };
 use crate::error::{Mode, OpsError, Report};
@@ -40,6 +40,10 @@ pub struct Cli {
 pub enum Command {
     /// Print the chain id the next permissionless registration of an authority will get.
     ChainId(ChainIdArgs),
+    /// Print what a chain's settlement accounts say about its health (batch heads, reclaim deadline, verification keys).
+    ChainStatus(ChainStatusArgs),
+    /// Print the addresses of a chain's accounts. Reads nothing.
+    Pdas(PdasArgs),
     /// Register a chain in the settlement program.
     Register(RegisterArgs),
     /// Give a chain's registration deposit back to its authority.
@@ -136,6 +140,24 @@ pub struct ChainIdArgs {
     pub keypair: Option<PathBuf>,
     #[arg(long)]
     pub authority: Option<Pubkey>,
+}
+
+#[derive(Args, Debug)]
+pub struct ChainStatusArgs {
+    #[arg(long)]
+    pub settlement: Pubkey,
+    #[arg(long)]
+    pub chain_id: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct PdasArgs {
+    #[arg(long)]
+    pub inbox: Pubkey,
+    #[arg(long)]
+    pub settlement: Pubkey,
+    #[arg(long)]
+    pub chain_id: u64,
 }
 
 #[derive(Args, Debug)]
@@ -311,6 +333,8 @@ pub async fn execute<C: Chain>(
             report.line(id.to_string());
             Ok(report)
         }
+        Command::ChainStatus(a) => chain_status::run(chain, &a.settlement, a.chain_id).await,
+        Command::Pdas(a) => Ok(pdas::run(&a.inbox, &a.settlement, a.chain_id)),
         Command::Register(a) => {
             let req = RegisterRequest {
                 keypair: a.keypair,

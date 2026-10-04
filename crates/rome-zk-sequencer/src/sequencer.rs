@@ -12,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::admission::{Admission, AdmissionConfig, AdmissionError, AdmitOutcome};
+use crate::deposits::DepositFeed;
 use crate::executor::{Executor, Reason, SubBlockLimits};
 use crate::log::LogWriter;
 use crate::metrics::Metrics;
@@ -184,6 +185,8 @@ struct Actor<E: Executor> {
     /// The actor's write handle onto the same shared structure every
     /// [`SequencerHandle`] reads directly — see [`RecentPreconfs`]'s doc.
     recent_preconfs: RecentPreconfs,
+    /// The deposit feed, for the deposit metrics only: the sealer holds its own handle and decides the credits.
+    deposits: Option<DepositFeed>,
 }
 
 impl<E: Executor> Actor<E> {
@@ -284,6 +287,14 @@ impl<E: Executor> Actor<E> {
             .sealer
             .seal_sub_block(txs, timestamp_us, limits)
             .await?;
+        if let Some(feed) = &self.deposits {
+            // Read after the tick, so a deposit this tick credited is no longer counted as waiting.
+            let now_secs = (timestamp_us / 1_000_000) as i64;
+            feed.metrics().oldest_waiting_age_seconds.set(
+                feed.oldest_waiting_enqueue_ts()
+                    .map_or(0.0, |ts| (now_secs - ts).max(0) as f64),
+            );
+        }
         let result = match tick {
             Tick::Idle { .. } => {
                 // Nothing to touch — no log record was written, the executor was
@@ -297,6 +308,18 @@ impl<E: Executor> Actor<E> {
         self.metrics
             .log_fsync_duration_seconds
             .observe(result.log_fsync_seconds);
+        if let Some(feed) = &self.deposits {
+            feed.metrics()
+                .credited_total
+                .inc_by(result.deposits_credited as u64);
+            // The block this sub-block closed is the moment its deposits' balances become visible.
+            let now_secs = (timestamp_us / 1_000_000) as i64;
+            for ts in &result.closed_block_deposit_enqueue_ts {
+                feed.metrics()
+                    .deposit_to_balance_seconds
+                    .observe((now_secs - ts).max(0) as f64);
+            }
+        }
 
         let attempted_len = drained.len() - result.outcome.not_executed.len();
 
@@ -480,6 +503,9 @@ pub struct SpawnConfig {
     /// This chain's `[profile].empty_block_interval_secs` — 0 (never seal a block with
     /// no transactions) or a nonzero cadence, in seconds (`rome_zk_profile::Profile`'s own field).
     pub empty_block_interval_secs: u64,
+    /// The deposit queue's view, when the sequencer runs with a `[deposits]` section. `None` is the sequencer
+    /// without deposits: no deposit is ever credited and nothing about a tick changes.
+    pub deposits: Option<DepositFeed>,
 }
 
 /// Spawn a running sequencer: opens (or resumes) the ordered log, spawns the actor task, and returns a
@@ -508,6 +534,10 @@ pub fn spawn<E: Executor + 'static>(
         config.resume,
     )
     .with_empty_block_interval_secs(config.empty_block_interval_secs);
+    let sealer = match config.deposits.clone() {
+        Some(feed) => sealer.with_deposits(feed),
+        None => sealer,
+    };
     let admission = Admission::new(config.admission);
     let (tx, rx) = mpsc::channel(1_024);
     // Shared between the actor (writer) and every `SequencerHandle`
@@ -523,6 +553,7 @@ pub fn spawn<E: Executor + 'static>(
         seal_period: config.seal_period,
         sub_block_gas_limit: config.sub_block_gas_limit,
         recent_preconfs: recent_preconfs.clone(),
+        deposits: config.deposits,
     };
     let join = tokio::spawn(actor.run(rx));
 
@@ -627,6 +658,7 @@ mod tests {
                 fee_recipient: Address::ZERO,
                 sub_blocks_per_block: profile.sub_blocks_per_block,
                 empty_block_interval_secs: profile.empty_block_interval_secs,
+                deposits: None,
             },
         )
         .unwrap();
@@ -740,6 +772,7 @@ mod tests {
                 fee_recipient: Address::ZERO,
                 sub_blocks_per_block: crate::sealer::SUB_BLOCKS_PER_BLOCK,
                 empty_block_interval_secs: 0,
+                deposits: None,
             },
         )
         .unwrap();
@@ -786,6 +819,7 @@ mod tests {
                 fee_recipient: Address::ZERO,
                 sub_blocks_per_block: crate::sealer::SUB_BLOCKS_PER_BLOCK,
                 empty_block_interval_secs: 0,
+                deposits: None,
             },
         )
         .unwrap();
@@ -836,6 +870,7 @@ mod tests {
                 fee_recipient: Address::ZERO,
                 sub_blocks_per_block: crate::sealer::SUB_BLOCKS_PER_BLOCK,
                 empty_block_interval_secs: 0,
+                deposits: None,
             },
         )
         .unwrap();
@@ -887,6 +922,7 @@ mod tests {
                 fee_recipient: Address::ZERO,
                 sub_blocks_per_block: crate::sealer::SUB_BLOCKS_PER_BLOCK,
                 empty_block_interval_secs: 0,
+                deposits: None,
             },
         )
         .unwrap();
@@ -924,6 +960,7 @@ mod tests {
                 fee_recipient: Address::ZERO,
                 sub_blocks_per_block: crate::sealer::SUB_BLOCKS_PER_BLOCK,
                 empty_block_interval_secs: 0,
+                deposits: None,
             },
         )
         .unwrap();
@@ -980,6 +1017,7 @@ mod tests {
                 fee_recipient: Address::ZERO,
                 sub_blocks_per_block: crate::sealer::SUB_BLOCKS_PER_BLOCK,
                 empty_block_interval_secs: 0,
+                deposits: None,
             },
         )
         .unwrap();
@@ -1019,6 +1057,7 @@ mod tests {
                 fee_recipient: Address::ZERO,
                 sub_blocks_per_block: crate::sealer::SUB_BLOCKS_PER_BLOCK,
                 empty_block_interval_secs: 0,
+                deposits: None,
             },
         )
         .unwrap();
@@ -1119,6 +1158,7 @@ mod tests {
                 fee_recipient: Address::ZERO,
                 sub_blocks_per_block: crate::sealer::SUB_BLOCKS_PER_BLOCK,
                 empty_block_interval_secs: 0,
+                deposits: None,
             },
         )
         .unwrap();
@@ -1207,6 +1247,7 @@ mod tests {
                 fee_recipient: Address::ZERO,
                 sub_blocks_per_block: crate::sealer::SUB_BLOCKS_PER_BLOCK,
                 empty_block_interval_secs: 0,
+                deposits: None,
             },
         )
         .unwrap();
@@ -1264,6 +1305,7 @@ mod tests {
                 fee_recipient: Address::ZERO,
                 sub_blocks_per_block: crate::sealer::SUB_BLOCKS_PER_BLOCK,
                 empty_block_interval_secs: 0,
+                deposits: None,
             },
         )
         .unwrap();

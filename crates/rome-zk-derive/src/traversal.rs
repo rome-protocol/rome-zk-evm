@@ -39,6 +39,9 @@ pub struct BatchRef {
     /// `keccak(chain_id ‖ batch ‖ open_slot ‖ expected_count ‖ root ‖ forced_root)` — the
     /// one value that pins every other field together.
     pub acc: [u8; 32],
+    /// The batch's deposit range `[from, to)` and the queue's hash-chain values at its ends (header v3).
+    /// `None` for a v2 header, which carries no range and behaves exactly as an empty one.
+    pub deposit: Option<rome_zk_layouts::batch::BatchDeposit>,
 }
 
 /// Walks batch ids `0, 1, 2, ...` (batch ids are sequential per chain, never
@@ -137,6 +140,7 @@ impl<R: AccountReader> SolanaTraversal<R> {
                 root: decoded.root,
                 forced_root: decoded.forced_root,
                 acc: decoded.acc,
+                deposit: decoded.deposit,
             }));
         }
     }
@@ -308,6 +312,7 @@ mod tests {
                 root: [0u8; 32],
                 forced_root: [0u8; 32],
                 acc: [0u8; 32],
+                deposit: None,
             }
         );
 
@@ -319,7 +324,7 @@ mod tests {
     }
 
     /// A v3 batch account (290-byte header, deposit range set) is read at the v3 offsets: the batch ref
-    /// matches what the same batch gives as v2.
+    /// matches what the same batch gives as v2, plus the header's deposit range.
     #[tokio::test]
     async fn a_v3_batch_account_gives_the_same_batch_ref_as_a_v2_one() {
         let program_id = Pubkey::new_unique();
@@ -346,6 +351,12 @@ mod tests {
                 root: [0u8; 32],
                 forced_root: [0u8; 32],
                 acc: [0u8; 32],
+                deposit: Some(rome_zk_layouts::batch::BatchDeposit {
+                    from: 4,
+                    to: 9,
+                    hash_from: [0xAA; 32],
+                    hash_to: [0xBB; 32],
+                }),
             }
         );
     }

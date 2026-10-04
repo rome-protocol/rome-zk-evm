@@ -611,10 +611,24 @@ where
                 FollowerError::Input("chain_config has no v2 max_drift_secs".to_string())
             })?;
 
+            // The records are read under the bridge program that `exit_config` names on the chain.
+            let deposits =
+                match rome_zk_prover_input::inbox::fetch_deposit_records(fetch, &batch_account) {
+                    Ok(v) => v,
+                    Err(rome_zk_prover_input::inbox::InboxError::Fetch(e)) => {
+                        return Ok(Err(Outcome::Retry {
+                            batches_behind: batches_behind_now,
+                            reason: RetryReason::TransientFetchError(e.0),
+                        }));
+                    }
+                    Err(e) => return Err(FollowerError::Input(e.to_string())),
+                };
+
             let started = Instant::now();
             let (public, witness, expected) = match rome_zk_prover_input::build::build_batch_input(
                 batch_account,
                 chunk_bodies,
+                deposits,
                 max_drift_secs,
                 verifier,
             ) {
@@ -1879,7 +1893,18 @@ mod tests {
     /// `(last_block, state_root, status, parent_hash, last_block_hash)`.
     type PendingEntry = (u64, [u8; 32], u8, [u8; 32], [u8; 32]);
 
+    /// One inbox batch whose header names a deposit range: the range, the bridge program the chain's
+    /// `exit_config` names and the record accounts at their derived addresses.
+    #[derive(Clone)]
+    struct DepositFx {
+        batch: u64,
+        range: rome_zk_layouts::batch::BatchDeposit,
+        bridge: Pubkey,
+        records: Vec<(Pubkey, Vec<u8>)>,
+    }
+
     struct Inner {
+        deposits: Option<DepositFx>,
         head_pending_batch: u64,
         head_final_batch: u64,
         number: u64,
@@ -1949,6 +1974,7 @@ mod tests {
                 authority,
                 treasury,
                 state: Mutex::new(Inner {
+                    deposits: None,
                     head_pending_batch: 0,
                     head_final_batch: 0,
                     number: 0,
@@ -1992,6 +2018,61 @@ mod tests {
             let mut st = self.0.state.lock().unwrap();
             st.inbox_batches.insert(batch);
             st.cursor_next_batch = st.cursor_next_batch.max(batch + 1);
+        }
+
+        /// Makes inbox batch `batch` (open it separately) carry a v3 header with two deposits `[0, 2)`, whose
+        /// records sit under a bridge program that only the chain's `exit_config` names.
+        fn give_batch_deposits(&self, batch: u64) {
+            let settlement = self.0.settlement_program.to_bytes();
+            let bridge = Pubkey::new_unique();
+            let keccak = rome_zk_merkle::keccak256 as fn(&[&[u8]]) -> [u8; 32];
+            let hash_from =
+                rome_zk_layouts::deposit::queue_seed_hash(&keccak, &settlement, GATE_CHAIN_ID);
+            let mut hash = hash_from;
+            let mut records = Vec::new();
+            for (index, amount_gwei) in [(0u64, 1_000u64), (1, 2_000)] {
+                let (sender, recipient) = ([7u8; 32], [9u8; 20]);
+                let leaf = rome_zk_layouts::deposit::leaf(
+                    &keccak,
+                    &settlement,
+                    GATE_CHAIN_ID,
+                    index,
+                    &sender,
+                    &recipient,
+                    amount_gwei,
+                );
+                hash = rome_zk_layouts::deposit::chain_next(&keccak, &hash, &leaf);
+                let mut data = vec![0u8; rome_zk_layouts::deposit_queue::deposit_record::LEN];
+                rome_zk_layouts::deposit_queue::deposit_record::write(
+                    &mut data,
+                    &rome_zk_layouts::deposit_queue::deposit_record::DepositRecordFields {
+                        index,
+                        enqueue_unix_ts: 1,
+                        sender,
+                        recipient,
+                        amount_gwei,
+                        hash_after: hash,
+                    },
+                );
+                let (pda, _) = rome_zk_layouts::deposit_queue::deposit_record::pda(
+                    &bridge,
+                    &settlement,
+                    GATE_CHAIN_ID,
+                    index,
+                );
+                records.push((pda, data));
+            }
+            self.0.state.lock().unwrap().deposits = Some(DepositFx {
+                batch,
+                range: rome_zk_layouts::batch::BatchDeposit {
+                    from: 0,
+                    to: 2,
+                    hash_from,
+                    hash_to: hash,
+                },
+                bridge,
+                records,
+            });
         }
 
         /// Simulates an `AbandonBatch` run by hand: the id is neither present nor ever will
@@ -2249,13 +2330,24 @@ mod tests {
                 .iter()
                 .map(|b| rome_zk_merkle::keccak256(&[b]))
                 .collect();
-            let (root, forced_root, acc) = zk_inbox_client::reference_commitment(
+            let range = st
+                .deposits
+                .as_ref()
+                .filter(|d| d.batch == batch)
+                .map(|d| d.range);
+            let (root, forced_root, acc) = zk_inbox_client::reference_commitment_with_deposits(
                 GATE_CHAIN_ID,
                 batch,
                 fx.open_slot,
                 &chunk_hashes,
+                &range.unwrap_or(rome_zk_layouts::batch::BatchDeposit {
+                    from: 0,
+                    to: 0,
+                    hash_from: [0; 32],
+                    hash_to: [0; 32],
+                }),
             );
-            rome_zk_layouts::batch::write_header(&rome_zk_layouts::batch::BatchFields {
+            let fields = rome_zk_layouts::batch::BatchFields {
                 chain_id: GATE_CHAIN_ID,
                 batch,
                 open_slot: fx.open_slot,
@@ -2269,9 +2361,14 @@ mod tests {
                 acc,
                 finalize_cursor: fx.chunk_bodies.len() as u32,
                 open_unix_ts: Self::open_unix_ts_for(st, batch),
-                deposit: None,
-            })
-            .to_vec()
+                deposit: range,
+            };
+            match range {
+                Some(_) => rome_zk_layouts::batch::write_header_v3(&fields)
+                    .expect("v3 header")
+                    .to_vec(),
+                None => rome_zk_layouts::batch::write_header(&fields).to_vec(),
+            }
         }
 
         /// The real reset-6 batch-1 chunk body at `idx`, wrapped in a real chunk header — identical for
@@ -2432,6 +2529,33 @@ mod tests {
             pubkey: &Pubkey,
         ) -> Result<Option<Vec<u8>>, rome_zk_prover_input::inbox::FetchError> {
             let st = self.0.state.lock().unwrap();
+            if let Some(dep) = &st.deposits {
+                let (exit_config_pda, _) = rome_zk_layouts::exit::exit_config::pda(
+                    &self.0.settlement_program,
+                    GATE_CHAIN_ID,
+                );
+                if *pubkey == exit_config_pda {
+                    return Ok(Some(
+                        rome_zk_layouts::exit::exit_config::write(
+                            &rome_zk_layouts::exit::exit_config::ExitConfigFields {
+                                chain_id: GATE_CHAIN_ID,
+                                exit_portal: [0; 20],
+                                bridge_program: dep.bridge.to_bytes(),
+                                pending_exit_portal: [0; 20],
+                                pending_bridge_program: [0; 32],
+                                pending_exit_cap: 0,
+                                pending_poster_bond: 0,
+                                activation_slot: 0,
+                                pending_mask: 0,
+                            },
+                        )
+                        .to_vec(),
+                    ));
+                }
+                if let Some((_, data)) = dep.records.iter().find(|(pda, _)| pda == pubkey) {
+                    return Ok(Some(data.clone()));
+                }
+            }
             let chunk_count = gate_fixture().chunk_bodies.len() as u32;
             Ok((1..=200u64).find_map(|batch| {
                 if !st.inbox_batches.contains(&batch) {
@@ -3276,6 +3400,82 @@ mod tests {
             "the refused batch is never recorded as posted"
         );
         assert_eq!(chain.send_calls(), 1, "zero further sends after the halt");
+
+        let _ = std::fs::remove_dir_all(&work_dir);
+    }
+
+    // ===================== a batch with deposits builds its input =====================
+
+    /// A [`Prover`] that keeps a copy of the input file it was given, then answers like [`FakeProver`].
+    struct CapturingProver {
+        input: Arc<Mutex<Vec<u8>>>,
+    }
+    impl Prover for CapturingProver {
+        fn prove(
+            &self,
+            elf: &Path,
+            input_bin: &Path,
+            out_file: &Path,
+        ) -> Result<crate::prover::ProofFile, ProveError> {
+            *self.input.lock().unwrap() = std::fs::read(input_bin).unwrap();
+            FakeProver {
+                calls: Arc::new(AtomicU32::new(0)),
+            }
+            .prove(elf, input_bin, out_file)
+        }
+    }
+
+    /// A batch whose header names deposits builds its input in the follower: the bridge program comes
+    /// from the chain's `exit_config`, the two records are read under it and the input handed to the prover
+    /// carries them with the header's range. (The reused gate proof does not commit that range, so the
+    /// job fails after the input is built; the input is what this test is about.)
+    #[tokio::test]
+    async fn a_batch_with_deposits_builds_its_input_from_the_chains_exit_config() {
+        let chain = FakeChain::new();
+        chain.open_and_finalize_inbox_batch(1);
+        chain.give_batch_deposits(1);
+        let work_dir = temp_work_dir("deposits-input");
+        let cfg = run_config(&chain, &work_dir);
+        let store = RecordingStore::new();
+        let input = Arc::new(Mutex::new(Vec::new()));
+        let mut deps = Deps {
+            fetch: chain.clone(),
+            prover: CapturingProver {
+                input: input.clone(),
+            },
+            sender: chain.clone(),
+            verifier: chain.verifier(),
+            store: store.clone(),
+        };
+        let metrics = Metrics::new();
+
+        let _ = run(
+            &mut deps,
+            &cfg,
+            RunUntil::Iterations(1),
+            &NeverStop,
+            &metrics,
+            noop_sleep,
+        )
+        .await;
+
+        assert!(
+            store.statuses().contains(&"input_built"),
+            "the input was not built: {:?}",
+            store.statuses()
+        );
+        let raw = input.lock().unwrap().clone();
+        assert!(!raw.is_empty(), "the prover was never handed an input");
+        let len = u64::from_le_bytes(raw[0..8].try_into().unwrap()) as usize;
+        let (public, _): (rome_zk_prover_input::RomePublicInput, usize) =
+            bincode::serde::decode_from_slice(&raw[8..8 + len], bincode::config::standard())
+                .unwrap();
+        let dep = chain.0.state.lock().unwrap().deposits.clone().unwrap();
+        assert_eq!(public.deposit_from, 0);
+        assert_eq!(public.deposit_hash_from, dep.range.hash_from);
+        assert_eq!(public.deposits.len(), 2);
+        assert_eq!(public.deposits[0].amount_gwei, 1_000);
+        assert_eq!(public.deposits[1].amount_gwei, 2_000);
 
         let _ = std::fs::remove_dir_all(&work_dir);
     }

@@ -197,6 +197,7 @@ async fn chunks_written_via_the_real_program_read_back_through_inbox_retrieval_m
         root: decoded.root,
         forced_root: decoded.forced_root,
         acc: decoded.acc,
+        deposit: decoded.deposit,
     };
     let chunk_bodies = retrieval.chunks(batch_ref).await.unwrap();
     assert_eq!(chunk_bodies.len(), frames.len());
@@ -338,6 +339,7 @@ async fn a_chunk_body_tampered_after_finalization_is_critical_acc_mismatch() {
         root: decoded.root,
         forced_root: decoded.forced_root,
         acc: decoded.acc,
+        deposit: decoded.deposit,
     };
     let err = retrieval.chunks(batch_ref).await.unwrap_err();
     assert!(

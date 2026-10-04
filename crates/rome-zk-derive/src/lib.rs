@@ -25,6 +25,7 @@ pub mod batch_queue;
 pub mod chain_bound;
 pub mod channel_bank;
 pub mod config;
+pub mod deposits;
 pub mod engine;
 pub mod frame_queue;
 pub mod inbox;

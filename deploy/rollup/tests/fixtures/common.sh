@@ -23,35 +23,73 @@ PAYER_KEYPAIR_PATH=$WORK/keys/payer.json
 ENVEOF
   mkdir -p "$WORK/keys" "$WORK/initbin"
   echo '[1,2,3]' > "$WORK/keys/payer.json"   # init reads the payer's public key through the stub below; the content is never parsed
-  make_chain_id_stub
+  make_docker_stub
+  export ROME_ZK_IMAGE="${ROME_ZK_IMAGE:-stub/rome-zk-evm:test}"
   export ROLLUP_ENV="$WORK/rollup.env" CHAIN_TOML="$WORK/chain.toml" ROLLUP_OUT="$WORK/out"
 }
 
-# A stub `cargo` for the init and register tests. `register_chain chain-id` answers like the real command with a fixed
-# authority and the nonce in $STUB_NONCE (default 0); the id is 4295391538 + nonce (a stand-in: the real derivation is
-# unit-tested in crates/zk-settlement-client). Every call is appended to $WORK/cargo_calls. Registration reports the
-# id of $STUB_REGISTERED_ID when set, otherwise the derived one. $STUB_CHAIN_ID_FAIL makes chain-id fail like an RPC
-# error, $STUB_AUTHORITY changes the payer's public key, and init_cursor fails while the file $WORK/init_cursor_fail exists.
-make_chain_id_stub() {
-  cat > "$WORK/initbin/cargo" <<STUB
+# A stub `docker` for every test that runs ./rollup. `docker run ... --entrypoint rome-zk-ops IMAGE ARGS` answers like
+# rome-zk-ops: the call (the arguments after the image, without --rpc-url) is appended to $WORK/ops_calls, the image to
+# $WORK/ops_images and the bind mounts to $WORK/ops_mounts. `chain-id` answers with a fixed authority and the nonce in
+# $STUB_NONCE (default 0); the id is 4295391538 + nonce (a stand-in: the real derivation is unit-tested in
+# crates/zk-settlement-client). `register` reports the id of $STUB_REGISTERED_ID when set, otherwise the derived one.
+# $STUB_CHAIN_ID_FAIL makes chain-id fail like an RPC error, $STUB_AUTHORITY changes the payer's public key, and
+# `init-cursor` fails while the file $WORK/init_cursor_fail exists. `pdas`, `chain-status` and `exit-config show` answer
+# from the files under $WORK/state when they exist (see check_stubs.sh), `chain-status` and `exit-config show` fail while
+# $WORK/state/chain_status_fail or exit_config_fail exists. Every `docker compose` call is appended to $WORK/docker_calls;
+# `compose ps --services --status running` prints $WORK/state/running when that file exists. `up -d sequencer` makes the
+# sequencer answer 0x100067932 when $WORK/start_answers exists (the register tests).
+make_docker_stub() {
+  mkdir -p "$WORK/initbin" "$WORK/state"
+  cat > "$WORK/initbin/docker" <<STUB
 #!/usr/bin/env bash
-echo "cargo \$*" >> "$WORK/cargo_calls"
-nonce="\${STUB_NONCE:-0}"
+W="$WORK"
+if [ "\${1:-}" = run ]; then
+  shift; image=""; mounts=""
+  while [ \$# -gt 0 ]; do
+    case "\$1" in
+      --rm|--network) [ "\$1" = --network ] && shift; shift ;;
+      --mount) mounts="\$mounts \$2"; shift 2 ;;
+      --entrypoint) shift 2 ;;
+      -*) shift ;;
+      *) image="\$1"; shift; break ;;
+    esac
+  done
+  echo "\$image" >> "\$W/ops_images"; echo "\$mounts" >> "\$W/ops_mounts"
+  args=()
+  while [ \$# -gt 0 ]; do case "\$1" in --rpc-url) shift 2 ;; *) args+=("\$1"); shift ;; esac; done
+  echo "\${args[*]}" >> "\$W/ops_calls"
+  nonce="\${STUB_NONCE:-0}"
+  case " \${args[*]} " in
+    *" chain-id "*)
+      [ -z "\${STUB_CHAIN_ID_FAIL:-}" ] || { echo "NonceLookupFailed: stub RPC error" >&2; exit 1; }
+      echo "authority=\${STUB_AUTHORITY:-StubAuthority1111111111111111111111111111111}"
+      echo "nonce=\$nonce"
+      echo "chain_id=\${STUB_ID:-\$((4295391538 + nonce))}" ;;
+    *" register "*)
+      case " \${args[*]} " in *" --confirm "*) echo "chain \${STUB_REGISTERED_ID:-\$((4295391538 + nonce))} registered (permissionless): root StubRoot" ;; *) echo "  would register chain; pass --confirm to send" ;; esac ;;
+    *" init-cursor "*) [ ! -f "\$W/init_cursor_fail" ] || { echo "stub init-cursor failure" >&2; exit 1; }; echo "cursor initialised" ;;
+    *" pdas "*) echo "root=StubRootPda"; echo "cursor=StubCursorPda" ;;
+    *" chain-status "*)
+      [ ! -f "\$W/state/chain_status_fail" ] || { echo "RootLookupFailed: stub RPC error" >&2; exit 1; }
+      if [ -f "\$W/state/chain_status" ]; then cat "\$W/state/chain_status"; else
+        echo "chain_id=4295391538"; echo "slot=1000"; echo "reclaim_slots_left=none"; echo "vkey_entries=1"; echo "vkey_active=yes"; fi ;;
+    *" exit-config show "*)
+      [ ! -f "\$W/state/exit_config_fail" ] || { echo "ExitConfigLookupFailed: stub RPC error" >&2; exit 1; }
+      echo "exit_config StubEc (chain 4295391538):"; echo "  exit_portal (current)      0x4200000000000000000000000000000000000016"
+      echo "  pending_mask                0 (none)"; echo "  activation_slot             n/a (nothing pending)" ;;
+    *) echo "stub rome-zk-ops ok: \${args[*]}" ;;
+  esac
+  exit 0
+fi
+echo "docker \$*" >> "\$W/docker_calls"
+if [ -f "\$W/start_answers" ]; then echo 0x100067932 > "\$W/chain_answer"; fi
 case " \$* " in
-  *" chain-id "*)
-    [ -z "\${STUB_CHAIN_ID_FAIL:-}" ] || { echo "NonceLookupFailed: stub RPC error" >&2; exit 1; }
-    echo "authority=\${STUB_AUTHORITY:-StubAuthority1111111111111111111111111111111}"
-    echo "nonce=\$nonce"
-    echo "chain_id=\${STUB_ID:-\$((4295391538 + nonce))}" ;;
-  *" --example register_chain "*) echo "chain \${STUB_REGISTERED_ID:-\$((4295391538 + nonce))} registered (permissionless): root StubRoot" ;;
-  *" --example init_cursor "*) [ ! -f "$WORK/init_cursor_fail" ] || { echo "stub init_cursor failure" >&2; exit 1; }; echo "cursor initialised" ;;
-  *" --example print_pdas "*)
-    echo '| batch cursor | zk-inbox | \`StubCursorPda\` |'
-    echo '| root | zk-settlement | \`StubRootPda\` |' ;;
-  *) exit 1 ;;
+  *" ps "*) [ ! -f "\$W/state/running" ] || tr ' ' '\n' < "\$W/state/running" | grep -v '^\$' ;;
 esac
+exit 0
 STUB
-  chmod +x "$WORK/initbin/cargo"
+  chmod +x "$WORK/initbin/docker"
   export PATH="$WORK/initbin:$PATH"
 }
 
@@ -61,15 +99,9 @@ STUB
 #           every read is recorded in $WORK/getinfo_calls), and fails while
 #           $WORK/solana_down exists, or for every read after the Nth when $WORK/fail_after_n holds N; any other request is the sequencer's eth_chainId and answers what $WORK/chain_answer
 #           holds (a hex id, or "none" for a sequencer that does not answer). curl_stub HEX|none sets that.
-#   docker: records every call in $WORK/docker_calls; `up -d sequencer` makes the sequencer answer 0x100067932 when
-#           $WORK/start_answers exists.
+#   docker: the stub above (setup_fixture installs it).
 make_register_stubs() {
   mkdir -p "$WORK/bin"
-  cat > "$WORK/bin/docker" <<STUB
-#!/bin/sh
-echo "docker \$*" >> "$WORK/docker_calls"
-if [ -f "$WORK/start_answers" ]; then echo 0x100067932 > "$WORK/chain_answer"; fi
-STUB
   cat > "$WORK/bin/curl" <<STUB
 #!/bin/sh
 case "\$*" in
@@ -93,9 +125,71 @@ a="\$(cat "$WORK/chain_answer")"
 [ "\$a" != none ] || exit 7
 echo '{"jsonrpc":"2.0","id":1,"result":"'"\$a"'"}'
 STUB
-  chmod +x "$WORK/bin/docker" "$WORK/bin/curl"
+  chmod +x "$WORK/bin/curl"
   curl_stub 0x100067932
   export PATH="$WORK/bin:$PATH"
 }
 curl_stub() { echo "$1" > "$WORK/chain_answer"; }
-sends() { grep -c 'example register_chain -- --keypair' "$WORK/cargo_calls" 2>/dev/null || true; }
+sends() { grep -c '^register .*--confirm' "$WORK/ops_calls" 2>/dev/null || true; }
+
+# ---- the operator commands (refund-deposit, exit-config, vault, release-exit, migrate, logs, down, status) ----------------
+# Every one of them runs rome-zk-ops from the node image through the docker stub above, so a test reads what was run from
+# $WORK/ops_calls (the arguments after the image), the bind mounts from $WORK/ops_mounts and the compose calls from
+# $WORK/docker_calls. The payer key's content is a marker no output may ever contain.
+KEY_MARK="KEYBYTES-MUST-NOT-APPEAR-7731"
+prepare_ops() { # $1=test name
+  setup_fixture
+  echo "$KEY_MARK" > "$WORK/keys/payer.json"
+  "$ROLLUP" init >/dev/null 2>&1 || { fail "test setup: rollup init" "failed"; finish "$1"; }
+  : > "$WORK/ops_calls"; : > "$WORK/ops_mounts"; : > "$WORK/ops_images"; : > "$WORK/docker_calls"
+}
+ops_reset_logs() { : > "$WORK/ops_calls"; : > "$WORK/ops_mounts"; : > "$WORK/docker_calls"; }
+# run_ops LABEL ARGS... -> runs ./rollup, sets OUT_TEXT, passes when it exits 0; the output joins a log the key check reads
+run_ops() {
+  local label="$1"; shift
+  OUT_TEXT="$("$ROLLUP" "$@" 2>&1)"; RC=$?
+  printf '%s\n' "$OUT_TEXT" >> "$WORK/all_output"
+  [[ $RC -eq 0 ]] && pass "$label: exits 0" || fail "$label: exits 0" "exit $RC: $OUT_TEXT"
+}
+# A command that sends is a dry run until --confirm: the call reaches rome-zk-ops without it, and with it ends in --confirm.
+# $1=label $2=a pattern the rome-zk-ops call starts with (a grep -E on the whole line) $3..=the ./rollup arguments, without --confirm
+dry_run_then_confirm() {
+  local label="$1" pat="$2"; shift 2
+  ops_reset_logs; run_ops "$label" "$@"
+  [[ "$(grep -cE -- "$pat" "$WORK/ops_calls")" == 1 ]] && pass "$label: runs one rome-zk-ops call from the node image" || fail "$label: runs one rome-zk-ops call" "$(cat "$WORK/ops_calls")"
+  grep -q -- '--confirm' "$WORK/ops_calls" && fail "$label: sends nothing without --confirm" "$(cat "$WORK/ops_calls")" || pass "$label: sends nothing without --confirm (the call carries no --confirm)"
+  grep -qx 'stub/rome-zk-evm:test' "$WORK/ops_images" && pass "$label: runs from the image the .env names" || fail "$label: runs from the image the .env names" "$(cat "$WORK/ops_images")"
+  ops_reset_logs
+  if out="$("$ROLLUP" "$@" --confirm --dry-run 2>&1)"; then fail "$label: --confirm with --dry-run refuses" "exited 0"
+  elif grep -q '^ConfirmAndDryRun' <<<"$out"; then pass "$label: --confirm with --dry-run refuses by name (ConfirmAndDryRun)"; else fail "$label: ConfirmAndDryRun" "$out"; fi
+  [[ ! -s "$WORK/ops_calls" ]] && pass "$label: the refusal ran nothing" || fail "$label: the refusal ran nothing" "$(cat "$WORK/ops_calls")"
+  # Last, so the logs a caller reads afterwards (mounts, calls) are those of the call that sent.
+  ops_reset_logs; run_ops "$label --confirm" "$@" --confirm
+  grep -E -- "$pat" "$WORK/ops_calls" | grep -q -- ' --confirm$' && pass "$label: --confirm is passed on to rome-zk-ops" || fail "$label: --confirm is passed on" "$(cat "$WORK/ops_calls")"
+}
+# $1=label $2..=the host paths of the key files that must be mounted (each once, read-only, at /keys/<name>)
+keys_mounted_read_only() {
+  local label="$1" host n
+  shift
+  n=0
+  for host in "$@"; do
+    grep -q "type=bind,source=$host,target=/keys/[a-z]*,readonly" "$WORK/ops_mounts" && n=$((n+1))
+  done
+  [[ $n -eq $# ]] && pass "$label: every key is a read-only bind mount by its path" || fail "$label: every key is a read-only bind mount by its path" "$(cat "$WORK/ops_mounts")"
+  grep -hE 'source=' "$WORK/ops_mounts" | grep -vq ',readonly$' && fail "$label: no mount is writable" "$(cat "$WORK/ops_mounts")" || pass "$label: no mount is writable"
+}
+# A key's content is in no output and on no command line.
+no_key_content_anywhere() {
+  if grep -rqF "$KEY_MARK" "$WORK/all_output" "$WORK/ops_calls" "$WORK/ops_mounts" "$WORK/docker_calls" 2>/dev/null; then fail "$1: a key's content was printed or passed on a command line" "found $KEY_MARK"
+  else pass "$1: a key's content is never printed or passed on a command line"; fi
+}
+# refuses_by_name NAME COMMAND... -> the command exits non-zero, its first line starts with NAME, and rome-zk-ops ran nothing
+refuses_by_name() {
+  local name="$1" out rc; shift
+  ops_reset_logs
+  out="$("$@" 2>&1)"; rc=$?
+  if [[ $rc -eq 0 ]]; then fail "refuses by name ($name): ${*:2}" "exited 0"
+  elif ! grep -q "^$name" <<<"$out"; then fail "refuses by name ($name): ${*:2}" "$out"
+  elif [[ -s "$WORK/ops_calls" ]]; then fail "refuses by name ($name): ${*:2}" "rome-zk-ops ran: $(cat "$WORK/ops_calls")"
+  else pass "refuses by name ($name): ${*:2}"; fi
+}

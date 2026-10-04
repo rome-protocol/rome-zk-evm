@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # deploy/rollup/tests/up_and_images.sh — what an outsider can pull or build. The node image is a pinned tag (never
-# `main`), `./rollup up` refuses by name while no tag is set, and the prover service builds from this tree, mounts
+# `main`), `./rollup init` and `./rollup up` refuse by name while no tag is set, and the prover service builds from this tree, mounts
 # what its own entrypoint requires, and relies on no file from the private deploy tree.
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/fixtures/common.sh"
@@ -13,18 +13,23 @@ grep -nE '^\s*image:' "$COMPOSE" | grep -qE ':main\b|:latest\b' && fail "no floa
 grep -qE 'rome-zk-evm:\$\{ROME_ZK_TAG' "$COMPOSE" && pass "the node image is the public package with a tag variable" || fail "the node image is the public package with a tag variable" "$(grep -n 'image:' "$COMPOSE" | head -3)"
 grep -q 'ROME_ZK_TAG' "$ROLLUP_DIR/.env.example" && pass ".env.example documents ROME_ZK_TAG" || fail ".env.example documents ROME_ZK_TAG" "missing"
 
-# 2. `up` refuses by name without a tag, and starts with one.
+# 2. Every operator action runs from the node image, so `init` and `up` both refuse by name while no image or tag is set,
+# and `up` starts with one.
 setup_fixture
-mkdir -p "$WORK/bin"; printf '#!/bin/sh\necho "docker $*" >> "%s/docker_calls"\n' "$WORK" > "$WORK/bin/docker"; chmod +x "$WORK/bin/docker"
 printf 'ab%.0s' $(seq 32) > "$WORK/keys/sequencer.key"
-export PATH="$WORK/bin:$PATH"
+: > "$WORK/docker_calls"
+if out="$(env -u ROME_ZK_IMAGE "$ROLLUP" init 2>&1)"; then fail "init refuses without an image tag" "exited 0"
+elif grep -q '^ImageTagNotSet' <<<"$out"; then pass "init refuses by name (ImageTagNotSet) while no image or tag is set"; else fail "init refuses by name (ImageTagNotSet)" "$out"; fi
+[[ ! -s "$WORK/ops_calls" ]] && pass "init ran no rome-zk-ops command without an image" || fail "init ran no rome-zk-ops command without an image" "$(cat "$WORK/ops_calls")"
 "$ROLLUP" init >/dev/null 2>&1
+grep -v '^ROME_ZK_IMAGE=\|^ROME_ZK_TAG=' "$WORK/out/compose.env" > "$WORK/compose.env.bare"; cp "$WORK/compose.env.bare" "$WORK/out/compose.env"
 : > "$WORK/docker_calls"
 if out="$("$ROLLUP" up sequencer 2>&1)"; then fail "up refuses without an image tag" "exited 0"
 elif grep -q '^ImageTagNotSet' <<<"$out"; then pass "up refuses by name (ImageTagNotSet) while no tag is set"; else fail "up refuses by name (ImageTagNotSet)" "$out"; fi
 [[ ! -s "$WORK/docker_calls" ]] && pass "nothing was started without a tag" || fail "nothing was started without a tag" "$(cat "$WORK/docker_calls")"
-rm -rf "$WORK/out"; ROME_ZK_TAG=abc123 "$ROLLUP" init >/dev/null 2>&1
+rm -rf "$WORK/out"; env -u ROME_ZK_IMAGE ROME_ZK_TAG=abc123 "$ROLLUP" init >/dev/null 2>&1
 grep -q '^ROME_ZK_TAG=abc123$' "$WORK/out/compose.env" && pass "init passes ROME_ZK_TAG to compose.env" || fail "init passes ROME_ZK_TAG to compose.env" "$(cat "$WORK/out/compose.env")"
+grep -q '^ghcr.io/rome-protocol/rome-zk-evm:abc123$' "$WORK/ops_images" && pass "init ran rome-zk-ops from the tagged public image" || fail "init ran rome-zk-ops from the tagged public image" "$(cat "$WORK/ops_images")"
 if out="$("$ROLLUP" up sequencer 2>&1)" && grep -q 'compose .*up -d sequencer' "$WORK/docker_calls"; then pass "up starts with a tag set"; else fail "up starts with a tag set" "$out"; fi
 
 # 3. The prover: built from this tree, mounts what its entrypoint needs.

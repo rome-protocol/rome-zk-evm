@@ -170,6 +170,8 @@ fn main() -> anyhow::Result<()> {
         hex::encode(batch_account.acc)
     );
 
+    let deposits = rome_zk_prover_input::inbox::fetch_deposit_records(&mut fetch, &batch_account)?;
+
     let (chain_config_pda, _) =
         zk_settlement_client::chain_config_pda(&settlement_program, chain_id);
     let chain_config_data = fetch
@@ -188,6 +190,7 @@ fn main() -> anyhow::Result<()> {
     let (public, witness, expected) = rome_zk_prover_input::build::build_batch_input(
         batch_account,
         chunk_bodies,
+        deposits,
         max_drift_secs,
         &mut verifier_fetch,
     )?;

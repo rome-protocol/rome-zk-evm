@@ -13,6 +13,8 @@ rome-zk-ops [--rpc-url URL] [--confirm | --dry-run | --offline] <command>
 | --- | --- |
 | `chain-id --settlement P (--keypair F \| --authority K)` | Prints the chain id the next permissionless registration of that authority will get, as `authority=`, `nonce=` and `chain_id=` lines. Sends nothing. |
 | `register --keypair F --settlement P --inbox P --evm-rpc URL [--reserved ...]` | Registers a chain. Permissionless by default (the id comes from the authority's nonce and the configured deposit is locked). `--reserved` needs `--chain-id`, `--registry-keypair` and both verifier-key files. |
+| `chain-status --settlement P --chain-id N` | Prints `key=value` lines from the chain's settlement accounts: authority, current slot, batch heads, posted count, the reclaim deadline and the slots left (`none` once the chain has posted), the deposit, and whether a verification key for the proving layout is active now (or the slot a pending one activates at). Read-only; a failed read is refused by name. |
+| `pdas --inbox P --settlement P --chain-id N` | Prints the addresses of the chain's root, batch cursor, global config, reserved-allow marker and chain config as `name=address` lines. Reads nothing. |
 | `refund-deposit --settlement P --chain-id N --keypair F` | Sends the registration deposit back to the chain authority recorded on chain. Anyone funded can pay the fee; the lamports go only to the authority. |
 | `exit-config propose ...` | The chain authority proposes an exit portal, bridge program, exit cap or poster bond, with `--activation-slot` or `--activation-delay-slots`. |
 | `exit-config activate ...` | Copies a pending proposal into effect once its activation slot has passed. Anyone can send it. |

@@ -31,9 +31,8 @@ Rome verified the program addresses and settlement settings on chain. The progra
 ## What you need
 
 - An x86-64 Linux machine with bash 4 or newer, Git, Docker Engine 28 or newer with the Compose plugin,
-  curl, jq, openssl, the Solana CLI, Python 3.11 or newer, a C compiler, and rustup with cargo. The repository pins
-  the Rust toolchain; rustup installs it on the first build. On Debian or Ubuntu, install the compiler
-  with `sudo apt install build-essential`.
+  curl, jq, openssl, the Solana CLI and Python 3.11 or newer. You do not need Rust or a compiler: every command that
+  talks to Solana runs inside the node image.
 - A Solana devnet RPC endpoint. A provider endpoint is more reliable under load.
 - A Solana payer keypair in a JSON file, funded with about 6 SOL on devnet. It is also your chain authority.
 - A sequencer signing key: 64 hex characters in a file. Both key files must be readable by container user 999.
@@ -94,9 +93,9 @@ If you need gas before deposits are available, you can declare one backed balanc
 `1_500_000_000` for 1.5 SOL). Your chain gets that amount at genesis, 1 lamport as 1 gwei. You then lock the same
 amount in your chain's vault with the bridge program's `Fund`, and Rome checks the vault before it registers your
 verification key. `init` prints the exact amount to lock. The shared zk-bridge program is deployed on devnet (see the
-table above). After `register`, your chain authority creates the chain's vault for wrapped SOL with the bridge client's
-`vault` example (`init-vault`), then locks the amount with `fund`. The deployment guide's
-[Your chain's vault](../deploy/rollup/README.md#your-chains-vault) gives both commands.
+table above). After `register`, your chain authority creates the chain's vault for wrapped SOL with
+`./rollup vault init --confirm`, then locks the amount with `./rollup vault fund --amount <lamports> --confirm`. The
+deployment guide's [Your chain's vault](../deploy/rollup/README.md#your-chains-vault) has the details.
 
 Set `genesis.fee_recipient` to an address you control as well. It receives the priority fees (tips) of the chain's
 transactions; the base fee is burned, as on Ethereum. Like the rest of the genesis, it cannot be changed after you
@@ -115,8 +114,8 @@ Solana, so you can check the id before you fund the key.
 ./rollup init
 ```
 
-The first run compiles the client, which can take a few minutes. It reads your chain id from Solana
-and writes the genesis and service configs to `rendered/`. Its summary starts with `rendered under`
+It runs `rome-zk-ops` from the node image to read your chain id from Solana (the first run pulls the image, so
+`ROME_ZK_TAG` must be set) and writes the genesis and service configs to `rendered/`. Its summary starts with `rendered under`
 and includes the authority, nonce, chain id, gas limit, blocks per batch and cluster.
 Your chain id is saved in `rendered/chain-id.env`.
 
@@ -157,9 +156,26 @@ and finishes the cursor step without registering another chain.
 `up` prints Docker Compose startup output. It starts the sequencer, reth-verifier, derive and batcher.
 The sequencer's HTTP RPC is at `http://127.0.0.1:8545`; its WebSocket port is 8546.
 
-`check` prints `PASS`, `FAIL` or `SKIP` for each item and ends with
-`== rollup check :: ALL PASS ==` when the checks pass.
-With no prover configured, settlement lag and prover lag are skipped.
+`check` prints `PASS`, `FAIL`, `WARN` or `SKIP` for each item and ends with
+`== rollup check :: ALL PASS ==` when no item failed. A failure starts with its name. Besides the services, heads and
+roots, it checks:
+
+- **batches finalized**: blocks were sealed and the batcher finalized a batch over the window. A stuck batcher fails
+  with `BatchesNotFinalizing`. Run `check` every few minutes; the first run only records a sample.
+- **payer balance**: the payer holds at least `PAYER_FLOOR_LAMPORTS` (1 SOL by default), or `PayerBelowFloor`.
+- **reclaim deadline**: a chain that has not posted a root can be reclaimed by anyone after the window. `check` fails
+  with `ReclaimDeadlineNear` below `RECLAIM_MARGIN_SLOTS` (about 12 hours), so a timer acts while there is still time to
+  post a root, and with `ReclaimDeadlinePassed` once the window is over.
+- **verification key** (prover on): fails with `VkeyNotActive` until Rome has registered a key for your chain.
+- **exit config**: shows the exit portal, the bridge program and any pending change.
+
+With no prover configured, settlement lag, prover lag and the verification key are skipped. The deployment guide's
+[What `check` looks at](../deploy/rollup/README.md#what-check-looks-at) lists every item and setting.
+
+The same guide lists the other commands: `./rollup status` (services and what Solana says about the chain),
+`./rollup logs`, `./rollup down`, `./rollup refund-deposit`, `./rollup exit-config`, `./rollup vault`,
+`./rollup release-exit` and `./rollup migrate`. Those that send a transaction print it and send nothing until you add
+`--confirm`.
 
 For remote RPC access and other settings, see the [deployment guide](../deploy/rollup/README.md).
 

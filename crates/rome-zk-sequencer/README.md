@@ -127,6 +127,38 @@ own chain anchor (see its README) — so a 0-based log is unconstructable as eit
 just the sequencer's. A 0-based log (from before block numbering started at 1) is not migratable at all:
 bring up a fresh chain instead (on Tiber, a chain reset); never restart the old log in place.
 
+## Deposits
+
+Optional. Add a `[deposits]` section to the config (see [`config.example.toml`](config.example.toml)) and the
+sequencer credits the chain's bridge deposits in blocks. Leave it out and the sequencer runs exactly as it did
+before: no poller, no extra metrics, no `deposits_end` in any header, and an idle chain still seals nothing.
+
+- **What it reads.** A poller reads the chain's `exit_config` (which names the bridge program), the deposit
+  queue and its records from Solana, at finalized commitment, through the one RPC URL in the section. It
+  sends nothing. Records are fetched in `getMultipleAccounts` calls of at most 100, and only records below
+  the queue's finalized count are ever requested. A failed poll is counted and logged, and the next one
+  retries; sealing never waits on Solana. The sequencer has no peer-to-peer of any kind.
+- **Hash chain check.** Before a record is credited, its `hash_after` is checked against the previous
+  record's hash and the record itself, with the same chain functions the program, derive and the prover use.
+  The check starts at the settlement cursor's deposit hash (the queue's first hash when no batch has taken a
+  deposit yet), so on a restart the records between the cursor and the log's resume point are read again
+  only to carry the chain forward. A record that does not chain stops the poll with an error naming it, and
+  nothing at or after it is credited. Errors carry no RPC URL.
+- **What a block credits.** The first sub-block of a block takes every finalized deposit not yet included,
+  oldest first, up to the queue's `max_per_block` (the stricter of the current and the pending value), and
+  never one at or past the finalized count. Each credit is a withdrawal built with
+  `rome_zk_executor_api::deposit_withdrawal`, logged with the record (`append_with_withdrawals`), and that
+  record's header carries `deposits_end`, one past the last credit. The sealer moves past the credits only
+  after the record is durable.
+- **Idle rule.** A finalized deposit that is waiting makes a tick non-idle, so an otherwise quiet chain seals a
+  block to credit it.
+- **Restart.** `deposits_end` is rebuilt from the log (the last header that carries one), so the next block
+  continues from there: nothing is credited twice and nothing is skipped.
+- **Metrics** (registered only with the section): `rome_zk_sequencer_deposit_oldest_waiting_age_seconds`,
+  `rome_zk_sequencer_deposit_finalized_count`, `rome_zk_sequencer_deposits_credited_total`,
+  `rome_zk_sequencer_deposit_to_balance_seconds` (from enqueue to the close of the crediting block) and
+  `rome_zk_sequencer_deposit_poll_errors_total`.
+
 ## How to test
 
 ```sh

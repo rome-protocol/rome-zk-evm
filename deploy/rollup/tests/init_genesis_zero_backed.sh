@@ -37,8 +37,8 @@ s = open(src).read()
 open(dst, "w").write(s.replace("[genesis]\n", "[genesis]\n" + "".join(l + "\n" for l in lines), 1))
 PY
 }
-run_init() { # $1=output dir; chain.toml is $WORK/t.toml; prints init's output; leaves the stub's call log in $WORK/cargo_calls
-  : > "$WORK/cargo_calls"; rm -rf "$1"
+run_init() { # $1=output dir; chain.toml is $WORK/t.toml; prints init's output; leaves the stub's call log in $WORK/ops_calls
+  : > "$WORK/ops_calls"; rm -rf "$1"
   CHAIN_TOML="$WORK/t.toml" ROLLUP_OUT="$1" "$ROLLUP" init 2>&1
 }
 refuses() { # $1=label $2=expected name $3=text the message must also contain (a key name or the replacement), rest = genesis lines
@@ -48,7 +48,7 @@ refuses() { # $1=label $2=expected name $3=text the message must also contain (a
   elif grep -q "^$name" <<<"$out" && grep -q -- "$must" <<<"$out"; then pass "init refuses by name ($name): $label"
   else fail "init refuses by name ($name): $label" "$out"; fi
   [[ ! -e "$WORK/o-r/genesis.json" ]] || fail "nothing rendered after $name ($label)" "genesis.json exists"
-  grep -q 'chain-id' "$WORK/cargo_calls" && fail "no network call after $name ($label)" "$(cat "$WORK/cargo_calls")"
+  grep -q 'chain-id' "$WORK/ops_calls" && fail "no network call after $name ($label)" "$(cat "$WORK/ops_calls")"
 }
 
 # ---- the default: zero balances ------------------------------------------------------------------------------------

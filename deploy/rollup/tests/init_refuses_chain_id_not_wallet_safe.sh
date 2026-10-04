@@ -15,7 +15,7 @@ elif grep -q '^ChainIdNotWalletSafe' <<<"$out"; then pass "init refuses by name 
 grep -q "$((MAX + 1))" <<<"$out" && grep -q 'MetaMask' <<<"$out" && grep -q 'solana-keygen new' <<<"$out" && grep -q 'nothing has been sent' <<<"$out" \
   && pass "the message names the id and MetaMask, says to run solana-keygen new, and says nothing was sent" || fail "the refusal message" "$out"
 [[ ! -e "$ROLLUP_OUT/genesis.json" && ! -e "$ROLLUP_OUT/chain-id.env" ]] && pass "nothing was rendered or recorded after the refusal" || fail "nothing was rendered or recorded after the refusal" "$(ls "$ROLLUP_OUT" 2>&1)"
-[[ "$(sends)" == 0 ]] && pass "no registration was sent" || fail "no registration was sent" "$(cat "$WORK/cargo_calls")"
+[[ "$(sends)" == 0 ]] && pass "no registration was sent" || fail "no registration was sent" "$(cat "$WORK/ops_calls")"
 
 # The id at the bound is accepted; the largest id the program can derive (2^53 - 1) is refused.
 if out="$(STUB_ID=$MAX ROLLUP_OUT="$WORK/o-max" "$ROLLUP" init 2>&1)"; then pass "init accepts a derived id exactly at $MAX"; else fail "init accepts an id exactly at $MAX" "$out"; fi

@@ -44,6 +44,25 @@ impl<R: AccountReader> InboxRetrieval<R> {
         &self.reader
     }
 
+    /// Every block's withdrawals for `batch`, verified against the batch header's deposit range (see
+    /// [`crate::deposits`]): reads the deposit records at the same finalized commitment as the chunks. A
+    /// batch without a deposit range reads nothing and gives an empty list per block.
+    pub async fn deposit_withdrawals(
+        &mut self,
+        batch: &BatchRef,
+        blocks: &[rome_zk_channel::Block],
+    ) -> Result<Vec<Vec<alloy_eips::eip4895::Withdrawal>>, PipelineError> {
+        crate::deposits::batch_withdrawals(
+            &mut self.reader,
+            &self.settlement_program,
+            batch.chain_id,
+            batch.batch,
+            batch.deposit.as_ref(),
+            blocks,
+        )
+        .await
+    }
+
     /// "Only sealed chunks of finalized batches" — a chunk missing, unsealed, or
     /// mismatched (wrong `chain_id`/`batch`/`idx`) is [`PipelineError::Critical`]: [`crate::traversal::SolanaTraversal`]
     /// already confirmed the covering batch account is `finalized`, so every one of its
@@ -141,11 +160,22 @@ impl<R: AccountReader> InboxRetrieval<R> {
             .iter()
             .map(|body| alloy_primitives::keccak256(body).0)
             .collect();
-        let (root, forced_root, acc) = zk_inbox_client::reference_commitment(
+        // A v3 header's deposit range changes the forced lane, so the recomputation uses it; a v2 header
+        // carries none and is the empty range.
+        let range = batch
+            .deposit
+            .unwrap_or(rome_zk_layouts::batch::BatchDeposit {
+                from: 0,
+                to: 0,
+                hash_from: [0; 32],
+                hash_to: [0; 32],
+            });
+        let (root, forced_root, acc) = zk_inbox_client::reference_commitment_with_deposits(
             batch.chain_id,
             batch.batch,
             batch.open_slot,
             &chunk_hashes,
+            &range,
         );
         if root != batch.root || forced_root != batch.forced_root || acc != batch.acc {
             return Err(PipelineError::Critical(format!(
@@ -238,6 +268,7 @@ mod tests {
             root,
             forced_root,
             acc,
+            deposit: None,
         }
     }
 
@@ -253,6 +284,7 @@ mod tests {
             root: [0u8; 32],
             forced_root: [0u8; 32],
             acc: [0u8; 32],
+            deposit: None,
         }
     }
 
@@ -275,6 +307,57 @@ mod tests {
             got,
             vec![bodies[0].to_vec(), bodies[1].to_vec(), bodies[2].to_vec()]
         );
+    }
+
+    /// A v3 batch whose range names deposits has the two-lane forced root, and `chunks` recomputes it from
+    /// the header's range: the honest batch reads, and the same batch with its range swapped for another one
+    /// (the commitment no longer matches) is Critical.
+    #[tokio::test]
+    async fn chunks_recomputes_the_commitment_with_the_headers_deposit_range() {
+        let program_id = Pubkey::new_unique();
+        let settlement_program = Pubkey::new_unique();
+        let bodies: [&[u8]; 2] = [b"chunk-0-body", b"chunk-1-body"];
+        let range = rome_zk_layouts::batch::BatchDeposit {
+            from: 3,
+            to: 5,
+            hash_from: [0xA1; 32],
+            hash_to: [0xA2; 32],
+        };
+        let hashes: Vec<[u8; 32]> = bodies
+            .iter()
+            .map(|b| alloy_primitives::keccak256(b).0)
+            .collect();
+        let (root, forced_root, acc) =
+            zk_inbox_client::reference_commitment_with_deposits(7, 3, 1, &hashes, &range);
+        assert_ne!(
+            forced_root,
+            batch_ref_for(7, 3, 1, &bodies).forced_root,
+            "a range with deposits changes the forced lane"
+        );
+        let honest = BatchRef {
+            deposit: Some(range),
+            root,
+            forced_root,
+            acc,
+            ..batch_ref(7, 3, 2)
+        };
+        let mut reader = FakeReader::default();
+        for (idx, body) in bodies.iter().enumerate() {
+            let (pda, _) =
+                zk_inbox_client::chunk_pda(&program_id, &settlement_program, 7, 3, idx as u32);
+            reader
+                .accounts
+                .insert(pda, chunk_account(7, 3, idx as u32, true, body));
+        }
+        let mut r = InboxRetrieval::new(reader, program_id, settlement_program);
+        assert_eq!(r.chunks(honest).await.unwrap().len(), 2);
+
+        let swapped = BatchRef {
+            deposit: Some(rome_zk_layouts::batch::BatchDeposit { to: 6, ..range }),
+            ..honest
+        };
+        let err = r.chunks(swapped).await.unwrap_err();
+        assert!(matches!(err, PipelineError::Critical(_)), "got {err:?}");
     }
 
     /// 250 chunks must read in exactly

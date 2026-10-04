@@ -1,4 +1,4 @@
-# Sourced by the check tests. Stubs `docker` and `curl` on PATH; every answer comes from a file under $S, so a test
+# Sourced by the check tests. Stubs `curl` on PATH (the shared `docker` stub is in common.sh and reads $S/running too); every answer comes from a file under $S, so a test
 # sets the world by writing files. `jq` and `python3` are the real ones. Nothing here touches a network.
 S="$WORK/state"; mkdir -p "$S" "$WORK/stubbin"
 
@@ -12,17 +12,12 @@ set_world() { # healthy by default; callers overwrite single files
   echo 7 > "$S/cursor_next"; echo 5 > "$S/root_final"
   echo 0 > "$S/prover_behind"; echo 12 > "$S/prover_lag"
   echo 0 > "$S/ver_peers"
+  echo 700 > "$S/sealed_total"; echo 0 > "$S/sealed_step"; echo 40 > "$S/finalized_total"; echo 0 > "$S/finalized_step"
+  echo 5000000000 > "$S/payer_lamports"
+  rm -f "$S/chain_status" "$S/chain_status_fail" "$S/exit_config_fail"
 }
 
 make_stubs() {
-cat > "$WORK/stubbin/docker" <<STUB
-#!/usr/bin/env bash
-echo "docker \$*" >> "$S/calls"
-case " \$* " in
-  *" ps "*) tr ' ' '\n' < "$S/running" | grep -v '^\$' ;;
-  *) exit 1 ;;
-esac
-STUB
 cat > "$WORK/stubbin/curl" <<STUB
 #!/usr/bin/env bash
 url=""; body=""
@@ -42,11 +37,15 @@ case "\$url" in
       net_peerCount) printf '{"jsonrpc":"2.0","id":1,"result":"0x%x"}\n' "\$(cat "\$S/ver_peers")" ;;
       *) printf '{"jsonrpc":"2.0","id":1,"result":"0x%x"}\n' "\$(bump ver_block ver_step)" ;;
     esac ;;
-  http://127.0.0.1:9001/metrics) printf '# TYPE x counter\nrome_zk_sequencer_idle_ticks_total %s\n' "\$(bump idle_ticks idle_step)" ;;
-  http://127.0.0.1:9002/metrics) printf 'rome_zk_batcher_oldest_unposted_block_age_seconds %s\n' "\$(cat "\$S/oldest_age")" ;;
+  http://127.0.0.1:9001/metrics) printf '# TYPE x counter\nrome_zk_sequencer_idle_ticks_total %s\nrome_zk_sequencer_blocks_sealed_total %s\n' "\$(bump idle_ticks idle_step)" "\$(bump sealed_total sealed_step)" ;;
+  http://127.0.0.1:9002/metrics) printf 'rome_zk_batcher_oldest_unposted_block_age_seconds %s\nrome_zk_batcher_batches_finalized_total %s\n' "\$(cat "\$S/oldest_age")" "\$(bump finalized_total finalized_step)" ;;
   http://127.0.0.1:9004/metrics) printf 'rome_zk_prover_batches_behind %s\nrome_zk_prover_lag_seconds %s\n' "\$(cat "\$S/prover_behind")" "\$(cat "\$S/prover_lag")" ;;
   https://rpc.example.invalid*)
     pk="\$(jq -r '.params[0]' <<<"\$body")"
+    if [[ "\$(jq -r .method <<<"\$body")" == getBalance ]]; then
+      v="\$(cat "\$S/payer_lamports")"; [[ "\$v" == missing ]] && exit 7
+      printf '{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":%s}}\n' "\$v"; exit 0
+    fi
     case "\$pk" in
       CursorPdaFixture*) kind=cursor; val="\$(cat "\$S/cursor_next")" ;;
       RootPdaFixture*) kind=root; val="\$(cat "\$S/root_final")" ;;
@@ -64,7 +63,7 @@ PY
   *) exit 1 ;;
 esac
 STUB
-chmod +x "$WORK/stubbin/docker" "$WORK/stubbin/curl"
+chmod +x "$WORK/stubbin/curl"
 export PATH="$WORK/stubbin:$PATH"
 }
 

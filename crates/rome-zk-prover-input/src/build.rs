@@ -3,9 +3,11 @@
 //! `ZiskStdin::write_slice`-framed, written to a file; and the expected public values, printed as hex so
 //! a ziskemu run's committed output can be compared field by field.
 //!
-//! **Wire v3 deposit fields, empty for now:** `build_batch_input` writes the deposit-free range (the
-//! batch's settlement program, `deposit_from` 0, `deposit_hash_from` = `h_0` of that program and chain,
-//! no deposits). Real ranges come with the batch header v3 in the deposit build.
+//! **Wire v3 deposit fields:** a v3 batch header names the batch's deposit range `[from, to)`, and
+//! `build_batch_input` writes `deposit_from` and `deposit_hash_from` from it, with the range's records
+//! (read by [`crate::inbox::fetch_deposit_records`]) as `deposits`. A v2 header has no range, and its
+//! batch keeps the deposit-free fields: the batch's settlement program, `deposit_from` 0,
+//! `deposit_hash_from` = `h_0` of that program and chain, no deposits.
 //!
 //! **No `chain_config` here any more (wire v2):** the chain's rules are baked
 //! into the guest ELF at compile time, not supplied by the host — `--genesis` (the CLI's own arg) is
@@ -15,7 +17,7 @@
 use std::path::Path;
 
 use crate::inbox::BatchAccount;
-use crate::wire::{write_slice_frame, RomePublicInput, RomeWitnessInput};
+use crate::wire::{write_slice_frame, DepositInput, RomePublicInput, RomeWitnessInput};
 
 /// `h_0` for `(settlement_program, chain_id)`: the deposit queue's hash chain before any deposit, and
 /// the value a batch with an empty deposit range carries as `deposit_hash_from` (an empty range uses
@@ -23,6 +25,46 @@ use crate::wire::{write_slice_frame, RomePublicInput, RomeWitnessInput};
 fn empty_range_hash(settlement_program: &[u8; 32], chain_id: u64) -> [u8; 32] {
     let keccak = rome_zk_merkle::keccak256 as fn(&[&[u8]]) -> [u8; 32];
     rome_zk_layouts::deposit::queue_seed_hash(&keccak, settlement_program, chain_id)
+}
+
+/// The records are the header's range: `to - from` of them, chaining from `hash_from` to `hash_to`.
+fn check_deposits(
+    settlement_program: &[u8; 32],
+    chain_id: u64,
+    range: &rome_zk_layouts::batch::BatchDeposit,
+    deposits: &[DepositInput],
+) -> Result<(), BuildError> {
+    let expected = range.to.saturating_sub(range.from);
+    if deposits.len() as u64 != expected {
+        return Err(BuildError::DepositCount {
+            expected,
+            got: deposits.len(),
+        });
+    }
+    let keccak = rome_zk_merkle::keccak256 as fn(&[&[u8]]) -> [u8; 32];
+    let records: Vec<rome_zk_layouts::deposit::DepositRecord> = deposits
+        .iter()
+        .map(|d| rome_zk_layouts::deposit::DepositRecord {
+            sender: d.sender,
+            recipient: d.recipient,
+            amount_gwei: d.amount_gwei,
+        })
+        .collect();
+    let end = rome_zk_layouts::deposit::chain_through(
+        &keccak,
+        settlement_program,
+        chain_id,
+        range.from,
+        &range.hash_from,
+        &records,
+    );
+    if end != range.hash_to {
+        return Err(BuildError::DepositHashTo {
+            recomputed: hex::encode(end),
+            on_chain: hex::encode(range.hash_to),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -33,6 +75,16 @@ pub enum BuildError {
     Genesis(#[from] crate::genesis::GenesisError),
     #[error(transparent)]
     Verifier(#[from] crate::verifier::VerifierError),
+    /// The records handed in are not the header's range: a v2 header takes none, a v3 header exactly
+    /// `to - from`.
+    #[error("batch header has {expected} deposits but {got} records were given")]
+    DepositCount { expected: u64, got: usize },
+    /// The records' hash chain does not end at the header's `deposit_hash_to`.
+    #[error("deposit records end at hash {recomputed}, the header says {on_chain}")]
+    DepositHashTo {
+        recomputed: String,
+        on_chain: String,
+    },
     #[error("write {path}: {source}")]
     Write {
         path: String,
@@ -115,12 +167,42 @@ pub struct Sidecar {
 /// own `tokio::runtime::Runtime` exists only for the Solana RPC client), abstracted behind
 /// [`crate::verifier::VerifierFetch`] so a follower loop can drive this whole function
 /// against a fake in its own tests, never a live reth node.
+///
+/// `deposits` are the header's deposit records `[from, to)` in queue order, as
+/// [`crate::inbox::fetch_deposit_records`] returns them: empty for a v2 header or an empty range. Their
+/// count and their hash chain are checked against the header before anything else is read.
 pub fn build_batch_input(
     batch_account: BatchAccount,
     chunk_bodies: Vec<Vec<u8>>,
+    deposits: Vec<DepositInput>,
     max_drift_secs: u64,
     verifier: &mut impl crate::verifier::VerifierFetch,
 ) -> Result<(RomePublicInput, RomeWitnessInput, ExpectedPublicValues), BuildError> {
+    let settlement_program = batch_account.settlement_program.to_bytes();
+    let (deposit_from, deposit_hash_from) = match &batch_account.deposit {
+        Some(range) => {
+            check_deposits(
+                &settlement_program,
+                batch_account.chain_id,
+                range,
+                &deposits,
+            )?;
+            (range.from, range.hash_from)
+        }
+        None => {
+            if !deposits.is_empty() {
+                return Err(BuildError::DepositCount {
+                    expected: 0,
+                    got: deposits.len(),
+                });
+            }
+            (
+                0,
+                empty_range_hash(&settlement_program, batch_account.chain_id),
+            )
+        }
+    };
+
     let (first, last) = crate::inbox::decode_block_range(&chunk_bodies)?;
 
     let parent_header = verifier.header(first - 1)?;
@@ -136,7 +218,6 @@ pub fn build_batch_input(
 
     let parent_hash = crate::header_hash(&parent_header);
 
-    let settlement_program = batch_account.settlement_program.to_bytes();
     let public = RomePublicInput {
         chain_id: batch_account.chain_id,
         batch: batch_account.batch,
@@ -148,9 +229,9 @@ pub fn build_batch_input(
         parent_header,
         blocks,
         settlement_program,
-        deposit_from: 0,
-        deposit_hash_from: empty_range_hash(&settlement_program, batch_account.chain_id),
-        deposits: vec![],
+        deposit_from,
+        deposit_hash_from,
+        deposits,
     };
     let witness = RomeWitnessInput { witnesses };
 
@@ -368,59 +449,84 @@ mod tests {
         }
     }
 
-    /// `build_batch_input` writes the empty deposit range: the batch account's settlement program,
-    /// `deposit_from` 0, `h_0` of (that program, the chain id), no deposits, and every other field as
-    /// before. Run against the committed batch-3930 fixture, it reproduces that file's public and witness
-    /// frames byte for byte, which also ties the fixture's migrated tail to what the builder writes.
-    #[test]
-    fn build_batch_input_writes_the_empty_deposit_range_and_reproduces_the_fixture() {
-        use std::str::FromStr;
+    const FIXTURE_SETTLEMENT: &str = "6yWj1Az1JmHBmt1654bFx2UdPMWd6Aak2QqBDPQxpj56";
 
+    /// The committed batch-3930 fixture: its public bytes, its witness frame, the decoded inputs and a
+    /// batch account for it with the given deposit range.
+    struct Fixture {
+        public_bytes: Vec<u8>,
+        witness_frame: Vec<u8>,
+        public: RomePublicInput,
+        witness: RomeWitnessInput,
+    }
+
+    fn load_fixture() -> Fixture {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../fixtures/prover-input/txv1-dev-batch-3930.bin"
         );
         let raw = std::fs::read(path).unwrap();
         let public_len = u64::from_le_bytes(raw[0..8].try_into().unwrap()) as usize;
-        let public_bytes = &raw[8..8 + public_len];
-        let witness_frame = &raw[8 + public_len + ((8 - public_len % 8) % 8)..];
-        let (fixture_public, _): (RomePublicInput, usize) =
-            bincode::serde::decode_from_slice(public_bytes, bincode::config::standard()).unwrap();
+        let public_bytes = raw[8..8 + public_len].to_vec();
+        let witness_frame = raw[8 + public_len + ((8 - public_len % 8) % 8)..].to_vec();
+        let (public, _): (RomePublicInput, usize) =
+            bincode::serde::decode_from_slice(&public_bytes, bincode::config::standard()).unwrap();
         let witness_len = u64::from_le_bytes(witness_frame[0..8].try_into().unwrap()) as usize;
-        let (fixture_witness, _): (RomeWitnessInput, usize) = bincode::serde::decode_from_slice(
+        let (witness, _): (RomeWitnessInput, usize) = bincode::serde::decode_from_slice(
             &witness_frame[8..8 + witness_len],
             bincode::config::standard(),
         )
         .unwrap();
+        Fixture {
+            public_bytes,
+            witness_frame,
+            public,
+            witness,
+        }
+    }
 
-        let settlement_program = solana_program::pubkey::Pubkey::from_str(
-            "6yWj1Az1JmHBmt1654bFx2UdPMWd6Aak2QqBDPQxpj56",
-        )
-        .unwrap();
-        let batch_account = BatchAccount {
-            chain_id: fixture_public.chain_id,
-            batch: fixture_public.batch,
-            open_slot: fixture_public.open_slot,
-            expected_count: fixture_public.expected_count,
-            leaves_present: fixture_public.expected_count,
+    fn fixture_account(
+        f: &Fixture,
+        deposit: Option<rome_zk_layouts::batch::BatchDeposit>,
+    ) -> BatchAccount {
+        use std::str::FromStr;
+        BatchAccount {
+            chain_id: f.public.chain_id,
+            batch: f.public.batch,
+            open_slot: f.public.open_slot,
+            expected_count: f.public.expected_count,
+            leaves_present: f.public.expected_count,
             finalized: true,
-            settlement_program,
+            settlement_program: solana_program::pubkey::Pubkey::from_str(FIXTURE_SETTLEMENT)
+                .unwrap(),
             authority: solana_program::pubkey::Pubkey::new_unique(),
             root: [0; 32],
             forced_root: [0; 32],
             acc: [0; 32],
             finalize_cursor: 0,
-            open_unix_ts: fixture_public.open_unix_ts,
-            deposit: None,
-        };
+            open_unix_ts: f.public.open_unix_ts,
+            deposit,
+        }
+    }
+
+    /// `build_batch_input` writes the empty deposit range: the batch account's settlement program,
+    /// `deposit_from` 0, `h_0` of (that program, the chain id), no deposits, and every other field as
+    /// before. Run against the committed batch-3930 fixture, it reproduces that file's public and witness
+    /// frames byte for byte, which also ties the fixture's migrated tail to what the builder writes.
+    #[test]
+    fn build_batch_input_writes_the_empty_deposit_range_and_reproduces_the_fixture() {
+        let f = load_fixture();
+        let batch_account = fixture_account(&f, None);
+        let settlement_program = batch_account.settlement_program;
         let mut verifier = FixtureVerifier {
-            public: fixture_public.clone(),
-            witness: fixture_witness,
+            public: f.public.clone(),
+            witness: f.witness.clone(),
         };
         let (public, witness, _expected) = build_batch_input(
             batch_account,
-            fixture_public.chunk_bodies.clone(),
-            fixture_public.max_drift_secs,
+            f.public.chunk_bodies.clone(),
+            vec![],
+            f.public.max_drift_secs,
             &mut verifier,
         )
         .unwrap();
@@ -433,9 +539,40 @@ mod tests {
         );
         assert!(public.deposits.is_empty());
 
-        assert_eq!(public.serialize(), public_bytes);
+        assert_eq!(public.serialize(), f.public_bytes);
         let mut witness_out = Vec::new();
         write_slice_frame(&mut witness_out, &witness.serialize());
-        assert_eq!(witness_out, witness_frame);
+        assert_eq!(witness_out, f.witness_frame);
+    }
+
+    /// A v3 header whose range is empty but not at the start of the queue (`from == to > 0`): the input
+    /// takes `deposit_from` and `deposit_hash_from` from the header, not the v2 constants, and has no
+    /// deposits.
+    #[test]
+    fn build_batch_input_takes_an_empty_v3_range_from_the_header() {
+        let f = load_fixture();
+        let hash = [0xabu8; 32];
+        let range = rome_zk_layouts::batch::BatchDeposit {
+            from: 7,
+            to: 7,
+            hash_from: hash,
+            hash_to: hash,
+        };
+        let batch_account = fixture_account(&f, Some(range));
+        let mut verifier = FixtureVerifier {
+            public: f.public.clone(),
+            witness: f.witness.clone(),
+        };
+        let (public, _witness, _expected) = build_batch_input(
+            batch_account,
+            f.public.chunk_bodies.clone(),
+            vec![],
+            f.public.max_drift_secs,
+            &mut verifier,
+        )
+        .unwrap();
+        assert_eq!(public.deposit_from, 7);
+        assert_eq!(public.deposit_hash_from, hash);
+        assert!(public.deposits.is_empty());
     }
 }

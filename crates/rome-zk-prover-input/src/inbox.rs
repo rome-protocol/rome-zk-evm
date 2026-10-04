@@ -47,6 +47,45 @@ pub enum InboxError {
     },
     #[error("channel decode failed: {0}")]
     ChannelDecode(String),
+    /// The header names deposits but the chain has no `exit_config` for the chain at its derived address.
+    #[error("batch has deposits but exit_config is missing at {pda} for chain {chain_id}")]
+    ExitConfigMissing { pda: Pubkey, chain_id: u64 },
+    #[error("exit_config at {pda}: decode failed: {reason}")]
+    ExitConfigDecode { pda: Pubkey, reason: String },
+    /// The `exit_config` at the address derived for this chain reports another chain.
+    #[error("exit_config at {pda} reports chain {got}, expected chain {expected}")]
+    ExitConfigChainMismatch {
+        pda: Pubkey,
+        got: u64,
+        expected: u64,
+    },
+    /// The `exit_config` has no bridge program set, so the records cannot be located.
+    #[error("exit_config at {pda} has no bridge program set")]
+    ExitConfigBridgeZero { pda: Pubkey },
+    /// The header's range is backwards or larger than any queue's `max_per_batch` could allow.
+    #[error("batch deposit range [{from}, {to}) is not a valid range")]
+    DepositRangeInvalid { from: u64, to: u64 },
+    #[error("deposit record {index} at {pda} is missing")]
+    DepositRecordMissing { index: u64, pda: Pubkey },
+    #[error("deposit record {index}: decode failed: {reason}")]
+    DepositRecordDecode { index: u64, reason: String },
+    #[error("deposit record {index} reports index {got_index}")]
+    DepositRecordIndexMismatch { index: u64, got_index: u64 },
+    /// A record's own `hash_after` is not the chain value its predecessor and its fields give.
+    #[error("deposit record {index}: hash_after {on_chain} does not follow the hash chain (expected {recomputed})")]
+    DepositRecordChainMismatch {
+        index: u64,
+        recomputed: String,
+        on_chain: String,
+    },
+    /// The records' chain does not end at the header's `deposit_hash_to`.
+    #[error("deposit records [{from}, {to}) end at hash {recomputed}, the header says {on_chain}")]
+    DepositRangeHashMismatch {
+        from: u64,
+        to: u64,
+        recomputed: String,
+        on_chain: String,
+    },
     /// An [`AccountFetch`] call itself failed — transport-level, never
     /// a decoded on-chain fact (that stays `Ok(None)` for a genuinely missing account, see
     /// [`AccountFetch`]'s own doc). Callers retry the same batch on this rather than halting.
@@ -176,11 +215,22 @@ pub fn fetch_and_verify_batch(
         .iter()
         .map(|body| rome_zk_merkle::keccak256(&[body]))
         .collect();
-    let (root, forced_root, acc) = zk_inbox_client::reference_commitment(
+    // A v3 header's deposit range is part of `forced_root`, hence of `acc`; a v2 header has none, which
+    // is the empty range.
+    let range = batch_account
+        .deposit
+        .unwrap_or(rome_zk_layouts::batch::BatchDeposit {
+            from: 0,
+            to: 0,
+            hash_from: [0; 32],
+            hash_to: [0; 32],
+        });
+    let (root, forced_root, acc) = zk_inbox_client::reference_commitment_with_deposits(
         chain_id,
         batch,
         batch_account.open_slot,
         &chunk_hashes,
+        &range,
     );
     if root != batch_account.root
         || forced_root != batch_account.forced_root
@@ -193,6 +243,139 @@ pub fn fetch_and_verify_batch(
     }
 
     Ok((batch_account, chunk_bodies))
+}
+
+/// The most deposits one batch can carry: a queue's `max_per_batch` is a `u16`.
+const MAX_DEPOSITS_PER_BATCH: u64 = u16::MAX as u64;
+
+/// Reads the deposit records `[from, to)` of a v3 batch header, the way [`fetch_and_verify_batch`] reads
+/// the chunks: the record PDAs (`rome_zk_layouts::deposit_queue::deposit_record`, under the bridge
+/// program) in one paged `get_multiple_accounts`, each decoded through the layout and never by hand.
+/// Every record's own `hash_after` is checked against the chain (the header's `deposit_hash_from`, then
+/// each record's leaf), and the last one against the header's `deposit_hash_to`.
+///
+/// The bridge program is read from the chain, never given by the caller: `exit_config.bridge_program` at
+/// the PDA `rome_zk_layouts::exit::exit_config::pda(settlement_program, chain_id)`, read through `fetch`
+/// (the caller's commitment, finalized for every real one). A missing `exit_config`, one for another chain
+/// and one with a zero bridge program are each refused by name. The owners of the `exit_config` and of the
+/// records are not checked: only the bridge program can create an account at its derived addresses, the
+/// layout reads check magic, version and length, and the hash chain binds every record to the `acc` the
+/// proof covers.
+///
+/// A v2 header, or an empty range, has no records and reads nothing: the result is empty.
+pub fn fetch_deposit_records(
+    fetch: &mut impl AccountFetch,
+    batch_account: &BatchAccount,
+) -> Result<Vec<crate::wire::DepositInput>, InboxError> {
+    let Some(range) = batch_account.deposit else {
+        return Ok(vec![]);
+    };
+    if range.from == range.to {
+        return Ok(vec![]);
+    }
+    if range.to < range.from || range.to - range.from > MAX_DEPOSITS_PER_BATCH {
+        return Err(InboxError::DepositRangeInvalid {
+            from: range.from,
+            to: range.to,
+        });
+    }
+
+    let settlement_program = batch_account.settlement_program.to_bytes();
+    let chain_id = batch_account.chain_id;
+    let (exit_config_pda, _) =
+        rome_zk_layouts::exit::exit_config::pda(&batch_account.settlement_program, chain_id);
+    let exit_config_data = fetch
+        .get_account(&exit_config_pda)?
+        .filter(|d| !d.is_empty())
+        .ok_or(InboxError::ExitConfigMissing {
+            pda: exit_config_pda,
+            chain_id,
+        })?;
+    let exit_config = rome_zk_layouts::exit::exit_config::read(&exit_config_data).map_err(|e| {
+        InboxError::ExitConfigDecode {
+            pda: exit_config_pda,
+            reason: format!("{e:?}"),
+        }
+    })?;
+    if exit_config.chain_id != chain_id {
+        return Err(InboxError::ExitConfigChainMismatch {
+            pda: exit_config_pda,
+            got: exit_config.chain_id,
+            expected: chain_id,
+        });
+    }
+    if exit_config.bridge_program == [0u8; 32] {
+        return Err(InboxError::ExitConfigBridgeZero {
+            pda: exit_config_pda,
+        });
+    }
+    let bridge_program = Pubkey::new_from_array(exit_config.bridge_program);
+    let pdas: Vec<Pubkey> = (range.from..range.to)
+        .map(|index| {
+            rome_zk_layouts::deposit_queue::deposit_record::pda(
+                &bridge_program,
+                &settlement_program,
+                chain_id,
+                index,
+            )
+            .0
+        })
+        .collect();
+    let datas = fetch.get_multiple_accounts(&pdas)?;
+
+    let keccak = rome_zk_merkle::keccak256 as fn(&[&[u8]]) -> [u8; 32];
+    let mut hash = range.hash_from;
+    let mut out = Vec::with_capacity(pdas.len());
+    for (k, data) in datas.into_iter().enumerate() {
+        let index = range.from + k as u64;
+        let data = data.ok_or(InboxError::DepositRecordMissing {
+            index,
+            pda: pdas[k],
+        })?;
+        let record = rome_zk_layouts::deposit_queue::deposit_record::read(&data).map_err(|e| {
+            InboxError::DepositRecordDecode {
+                index,
+                reason: format!("{e:?}"),
+            }
+        })?;
+        if record.index != index {
+            return Err(InboxError::DepositRecordIndexMismatch {
+                index,
+                got_index: record.index,
+            });
+        }
+        let leaf = rome_zk_layouts::deposit::leaf(
+            &keccak,
+            &settlement_program,
+            chain_id,
+            index,
+            &record.sender,
+            &record.recipient,
+            record.amount_gwei,
+        );
+        hash = rome_zk_layouts::deposit::chain_next(&keccak, &hash, &leaf);
+        if hash != record.hash_after {
+            return Err(InboxError::DepositRecordChainMismatch {
+                index,
+                recomputed: hex::encode(hash),
+                on_chain: hex::encode(record.hash_after),
+            });
+        }
+        out.push(crate::wire::DepositInput {
+            sender: record.sender,
+            recipient: record.recipient,
+            amount_gwei: record.amount_gwei,
+        });
+    }
+    if hash != range.hash_to {
+        return Err(InboxError::DepositRangeHashMismatch {
+            from: range.from,
+            to: range.to,
+            recomputed: hex::encode(hash),
+            on_chain: hex::encode(range.hash_to),
+        });
+    }
+    Ok(out)
 }
 
 /// Decodes the channel (the same pure-Rust path the guest itself uses, `rome_zk_channel::decode_stream`

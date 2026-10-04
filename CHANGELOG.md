@@ -4,6 +4,15 @@ This changelog describes the system as built on `main`, grouped by component. It
 release-tag cadence yet — see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for what each component does
 and how they fit together.
 
+## Prover input: deposits
+
+- `build_batch_input` fills `deposit_from`, `deposit_hash_from` and `deposits` from a v3 batch header's range and its
+  deposit records; a v2 header keeps the empty fields. `fetch_deposit_records` reads the bridge program from the
+  chain's `exit_config` (a missing one, a zero bridge program and another chain's are refused by name), reads the
+  records from that program's accounts and checks their hash chain against the header, and `fetch_and_verify_batch` checks `acc` with
+  the header's range. Over account fixtures of the small synthetic batch the built input equals the committed
+  `.bin` byte for byte and its public values equal the sidecar's.
+
 ## Synthetic deposit batches
 
 - `synth-deposit-batch` (in `rome-zk-prover-input`) builds a wire v3 guest input that carries deposits, plus a JSON
@@ -124,6 +133,17 @@ bytes it did before, and the tests pin that against the old encodings.
   closes a group before a block that would take it over `max_per_batch` (the stricter of the active and pending
   values; new close reason `deposits`). A log without deposits produces byte-identical frames. The header
   readers and the send path are unchanged.
+
+## Sequencer: deposits in blocks
+
+- `rome-zk-sequencer` has an optional `[deposits]` config section (Solana RPC URL, settlement program, poll
+  interval; the bridge program comes from the chain's `exit_config`). With it, a poller reads the deposit queue
+  and its records at finalized commitment, one `getMultipleAccounts` per 100 records, and each block credits
+  every finalized deposit not yet included, oldest first, up to the queue's per-block cap and never past the
+  finalized count. Every credit is `deposit_withdrawal`, logged with its record, and the block's first header
+  carries `deposits_end`. A waiting deposit makes a tick non-idle. After a restart `deposits_end` resumes from
+  the log. New metrics: oldest waiting age, finalized count, credited total, deposit-to-balance time and poll
+  errors. Without the section nothing changes: no poller, no new metric, identical blocks.
 
 ## Batcher restart recovery
 

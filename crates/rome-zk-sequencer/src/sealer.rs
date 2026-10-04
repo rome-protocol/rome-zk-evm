@@ -30,6 +30,7 @@ use alloy::primitives::{Address, Bytes, B256};
 use alloy::signers::local::PrivateKeySigner;
 use std::io;
 
+use crate::deposits::DepositFeed;
 use crate::executor::{
     prev_randao, BlockEnv, BlockOutcome, BlockSealInputs, Executor, ExecutorError, SubBlockLimits,
     SubBlockOutcome,
@@ -190,6 +191,9 @@ pub struct ResumePoint {
     pub prev_sub_block_ts_us: u64,
     /// The last **closed** block's EVM timestamp, seconds — the monotonicity floor for the next block.
     pub prev_block_timestamp_secs: u64,
+    /// One past the last deposit the log shows a block credited (the last `deposits_end` any record carries), 0
+    /// when none did. The next block that credits deposits starts at this queue index.
+    pub deposits_end: u64,
 }
 
 impl Default for ResumePoint {
@@ -206,6 +210,7 @@ impl Default for ResumePoint {
             gas_in_block: 0,
             prev_sub_block_ts_us: 0,
             prev_block_timestamp_secs: 0,
+            deposits_end: 0,
         }
     }
 }
@@ -236,6 +241,11 @@ pub struct SealResult {
     /// the `prev + 1` catch-up debt, computed on integer seconds (never negative, never
     /// noise from where inside a second the first sub-block landed): 0 whenever the wall clock won.
     pub block_timestamp_ahead_seconds: Option<f64>,
+    /// How many deposits this sub-block's block credits: nonzero only on a block's first sub-block.
+    pub deposits_credited: usize,
+    /// When each deposit the just-closed block credited was enqueued, Unix seconds. Filled only on the
+    /// sub-block that closed the block (a block reopened after a restart reports none).
+    pub closed_block_deposit_enqueue_ts: Vec<i64>,
 }
 
 /// One call to [`SealerState::seal_sub_block`]: either nothing happened — no log
@@ -305,6 +315,13 @@ pub struct SealerState<E: Executor, S: SubBlockSink> {
     first_timestamp_us_in_block: u64,
     prev_sub_block_ts_us: u64,
     prev_block_timestamp_secs: u64,
+    /// The deposit queue's view, when this sequencer runs with deposits; `None` is the sequencer as it was
+    /// before deposits existed.
+    deposits: Option<DepositFeed>,
+    /// One past the last deposit a block has credited.
+    deposits_end: u64,
+    /// When each deposit the open block credits was enqueued; handed out when the block closes.
+    block_deposit_enqueue_ts: Vec<i64>,
 }
 
 impl<E: Executor, S: SubBlockSink> SealerState<E, S> {
@@ -344,7 +361,20 @@ impl<E: Executor, S: SubBlockSink> SealerState<E, S> {
             first_timestamp_us_in_block: resume.first_timestamp_us_in_block,
             prev_sub_block_ts_us: resume.prev_sub_block_ts_us,
             prev_block_timestamp_secs: resume.prev_block_timestamp_secs,
+            deposits: None,
+            deposits_end: resume.deposits_end,
+            block_deposit_enqueue_ts: Vec::new(),
         }
+    }
+
+    /// Credit deposits: each block then takes the finalized deposits `feed` has waiting (oldest first, up to the
+    /// queue's per-block cap), and a waiting deposit opens a block even with no transactions and the idle rule
+    /// not yet due. A builder step, like [`Self::with_empty_block_interval_secs`], so the many existing
+    /// construction sites stay as they are. Tells the feed where the log resumed.
+    pub fn with_deposits(mut self, feed: DepositFeed) -> Self {
+        feed.set_included(self.deposits_end);
+        self.deposits = Some(feed);
+        self
     }
 
     /// Set this profile's idle-block cadence (`rome_zk_profile::Profile`'s own
@@ -412,9 +442,24 @@ impl<E: Executor, S: SubBlockSink> SealerState<E, S> {
         // completes its full `sub_blocks_per_block` records) regardless of whether it carries
         // transactions. An idle tick touches nothing: no log record, no executor call, no state
         // mutation of any kind — `now_us` is handed back verbatim for the caller's own bookkeeping.
-        if index == 0 && txs.is_empty() && !self.empty_block_due(now_us / 1_000_000) {
+        // The deposits this block credits are decided here, once, from the feed. A block opened with a waiting
+        // deposit is never idle: the deposit is a reason to seal as good as a transaction is.
+        let credits = if index == 0 {
+            self.deposits
+                .as_ref()
+                .map(|f| f.next_block())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if index == 0
+            && txs.is_empty()
+            && credits.is_empty()
+            && !self.empty_block_due(now_us / 1_000_000)
+        {
             return Ok(Tick::Idle { now_us });
         }
+        let withdrawals: Vec<_> = credits.iter().map(|d| d.withdrawal()).collect();
 
         let block = self.next_block;
         let timestamp_us = resolve_sub_block_timestamp_us(now_us, self.prev_sub_block_ts_us);
@@ -443,7 +488,7 @@ impl<E: Executor, S: SubBlockSink> SealerState<E, S> {
                 // cadence).
                 prev_randao: prev_randao(self.chain_id, block),
                 base_fee: None,
-                withdrawals: vec![],
+                withdrawals: withdrawals.clone(),
             };
             self.executor.open_block(env).await?;
         }
@@ -460,7 +505,8 @@ impl<E: Executor, S: SubBlockSink> SealerState<E, S> {
             receipts_root: outcome.receipts_root,
             gas_used: outcome.gas_used,
             prev_hash: self.prev_header_hash,
-            deposits_end: None,
+            // Only the index-0 header of a block that credits deposits carries it: one past the last deposit.
+            deposits_end: credits.last().map(|d| d.index + 1),
         };
         let signature = sign_header(&self.signer, &header);
         let header_hash = header.hash();
@@ -496,9 +542,18 @@ impl<E: Executor, S: SubBlockSink> SealerState<E, S> {
         // Isolates `LogWriter::append`'s own write+fsync cost (see
         // `SealResult::log_fsync_seconds`'s doc) — brackets exactly this call, nothing else.
         let log_append_started = std::time::Instant::now();
-        self.log.append(&header, &signature, &logged_txs)?;
+        self.log
+            .append_with_withdrawals(&header, &signature, &logged_txs, &withdrawals)?;
         let log_fsync_seconds = log_append_started.elapsed().as_secs_f64();
         self.prev_header_hash = header_hash;
+        // The credits are durable now; only now does the sealer move past them.
+        if let Some(last) = credits.last() {
+            self.deposits_end = last.index + 1;
+            if let Some(feed) = &self.deposits {
+                feed.set_included(self.deposits_end);
+            }
+            self.block_deposit_enqueue_ts = credits.iter().map(|d| d.enqueue_unix_ts).collect();
+        }
 
         self.sink.publish(SealedSubBlock {
             header,
@@ -512,6 +567,7 @@ impl<E: Executor, S: SubBlockSink> SealerState<E, S> {
 
         let mut block_gas_used = None;
         let mut block_timestamp_ahead_seconds = None;
+        let mut closed_block_deposit_enqueue_ts = Vec::new();
         let block_sealed = if index + 1 == self.sub_blocks_per_block {
             let first_sub_block_secs = self.first_timestamp_us_in_block / 1_000_000;
             let block_timestamp_secs =
@@ -532,6 +588,7 @@ impl<E: Executor, S: SubBlockSink> SealerState<E, S> {
             let block_outcome = self.executor.seal_block(inputs).await?;
             self.next_block = block + 1;
             self.next_index = 0;
+            closed_block_deposit_enqueue_ts = std::mem::take(&mut self.block_deposit_enqueue_ts);
             Some(block_outcome)
         } else {
             self.next_index = index + 1;
@@ -547,6 +604,8 @@ impl<E: Executor, S: SubBlockSink> SealerState<E, S> {
             log_fsync_seconds,
             block_gas_used,
             block_timestamp_ahead_seconds,
+            deposits_credited: credits.len(),
+            closed_block_deposit_enqueue_ts,
         })))
     }
 }
@@ -1615,5 +1674,275 @@ mod tests {
             SUB_BLOCKS_PER_BLOCK as usize,
             "the backward-clock idle ticks must write no additional records"
         );
+    }
+
+    // ---- Deposits -------------------------------------------------------------------------------------
+
+    /// A sealer with deposits on and the idle interval at its default (0: never an empty block), over a feed
+    /// that already read `count` finalized deposits from a mock chain capped at `cap` per block.
+    async fn deposit_state(
+        dir: &std::path::Path,
+        resume: ResumePoint,
+        count: u64,
+        cap: u16,
+    ) -> (
+        SealerState<MockExecutor, ChannelSink>,
+        crate::deposits::DepositFeed,
+        crate::deposits::test_support::MockChain,
+    ) {
+        use crate::deposits::test_support::{feed, MockChain};
+        let chain = MockChain::new(cap);
+        chain.deposit_up_to(count, cap, 1_757_000_000);
+        let feed = feed();
+        let s = SealerState::new(
+            MockExecutor::new(),
+            LogWriter::open(dir, 1_000).unwrap(),
+            PrivateKeySigner::random(),
+            ChannelSink::new(16),
+            1,
+            DEFAULT_BLOCK_GAS_LIMIT,
+            Address::ZERO,
+            SUB_BLOCKS_PER_BLOCK,
+            resume,
+        )
+        .with_deposits(feed.clone());
+        chain.poller(&feed).poll_once().await.unwrap();
+        (s, feed, chain)
+    }
+
+    /// Seals one whole block of empty ticks starting at `base_ts`, returning its sealed results.
+    async fn seal_block(
+        s: &mut SealerState<MockExecutor, ChannelSink>,
+        base_ts: u64,
+    ) -> Vec<SealResult> {
+        let mut out = Vec::new();
+        for i in 0..SUB_BLOCKS_PER_BLOCK as u64 {
+            let tick = s
+                .seal_sub_block(vec![], base_ts + i * 50_000, SubBlockLimits::unbounded())
+                .await
+                .unwrap();
+            out.push(tick.sealed());
+        }
+        out
+    }
+
+    /// A waiting deposit makes an otherwise idle tick seal: with the idle interval at 0 an empty tick never
+    /// opens a block, and with a finalized deposit waiting it does. Once the deposit is credited the sealer is
+    /// idle again.
+    #[tokio::test]
+    async fn a_waiting_deposit_wakes_an_idle_sealer() {
+        let dir = tempdir().unwrap();
+        let (mut s, feed, chain) = deposit_state(dir.path(), ResumePoint::default(), 0, 10).await;
+        let base_ts = 1_757_000_000_000_000u64;
+        let tick = s
+            .seal_sub_block(vec![], base_ts, SubBlockLimits::unbounded())
+            .await
+            .unwrap();
+        assert!(tick.is_idle(), "no deposit waiting: idle, as before");
+
+        // A deposit becomes finalized.
+        chain.deposit_up_to(1, 10, 1_757_000_000);
+        chain.poller(&feed).poll_once().await.unwrap();
+        let results = seal_block(&mut s, base_ts + 50_000).await;
+        assert_eq!(results.len(), SUB_BLOCKS_PER_BLOCK as usize);
+        assert_eq!(results[0].header.deposits_end, Some(1));
+        assert_eq!(results[0].deposits_credited, 1);
+        assert!(results[1..].iter().all(|r| r.header.deposits_end.is_none()));
+        assert_eq!(
+            results[19].closed_block_deposit_enqueue_ts,
+            vec![1_757_000_000]
+        );
+        assert_eq!(s.next_block(), 2);
+
+        // Credited, so the sealer is idle again.
+        let tick = s
+            .seal_sub_block(vec![], base_ts + 2_000_000, SubBlockLimits::unbounded())
+            .await
+            .unwrap();
+        assert!(tick.is_idle());
+        assert_eq!(s.next_block(), 2);
+    }
+
+    /// Order and cap, through the sealer: three blocks credit 2, 2 and 1 of five finalized deposits, oldest
+    /// first, every credit the `deposit_withdrawal` the log carries, each header's `deposits_end` one past the
+    /// last credit. A sixth, not yet finalized, is never credited.
+    #[tokio::test]
+    async fn blocks_credit_in_order_up_to_the_cap_never_past_the_finalized_count() {
+        let dir = tempdir().unwrap();
+        let (mut s, _feed, chain) = deposit_state(dir.path(), ResumePoint::default(), 5, 2).await;
+        // An account for deposit 5 exists on the mock, but the queue's count stays 5.
+        chain.put_record(5, 1_757_000_000);
+        let base_ts = 1_757_000_000_000_000u64;
+        for block in 0..3u64 {
+            seal_block(&mut s, base_ts + block * 2_000_000).await;
+        }
+        // Everything finalized is credited; deposit 5 is not finalized, so the next tick is idle.
+        assert!(s
+            .seal_sub_block(vec![], base_ts + 9_000_000, SubBlockLimits::unbounded())
+            .await
+            .unwrap()
+            .is_idle());
+        let mut records = Vec::new();
+        let torn = crate::log::replay(dir.path(), false, |r| records.push(r.clone())).unwrap();
+        assert!(torn.is_none());
+
+        let credited: Vec<(u64, Option<u64>, Vec<u64>)> = records
+            .iter()
+            .filter(|r| r.header.index == 0)
+            .map(|r| {
+                (
+                    r.header.block,
+                    r.header.deposits_end,
+                    r.withdrawals.iter().map(|w| w.index).collect(),
+                )
+            })
+            .collect();
+        // Blocks 1..=3 credit; a fourth never opens.
+        assert_eq!(
+            credited,
+            vec![
+                (1, Some(2), vec![0, 1]),
+                (2, Some(4), vec![2, 3]),
+                (3, Some(5), vec![4]),
+            ]
+        );
+        for r in records.iter().filter(|r| r.header.index == 0) {
+            for w in &r.withdrawals {
+                let expected = rome_zk_executor_api::deposit_withdrawal(
+                    w.index,
+                    Address::from([w.index as u8 + 1; 20]),
+                    100 + w.index,
+                );
+                assert_eq!(
+                    *w, expected,
+                    "every credit is the withdrawal deposit_withdrawal builds"
+                );
+            }
+        }
+        assert_eq!(s.next_block(), 4);
+    }
+
+    /// Restart: replaying a log whose blocks credited deposits 0..4 resumes `deposits_end` at 4, and the next
+    /// block credits from 4 on, with no deposit credited twice and none skipped.
+    #[tokio::test]
+    async fn after_a_restart_deposits_resume_from_the_log() {
+        let dir = tempdir().unwrap();
+        let sequencer_key = PrivateKeySigner::random();
+        let address = sequencer_key.address();
+        let base_ts = 1_757_000_000_000_000u64;
+        {
+            use crate::deposits::test_support::{feed, MockChain};
+            let chain = MockChain::new(2);
+            chain.deposit_up_to(6, 2, 1_757_000_000);
+            let feed = feed();
+            let mut s = SealerState::new(
+                MockExecutor::new(),
+                LogWriter::open(dir.path(), 1_000).unwrap(),
+                sequencer_key,
+                ChannelSink::new(16),
+                1,
+                DEFAULT_BLOCK_GAS_LIMIT,
+                Address::ZERO,
+                SUB_BLOCKS_PER_BLOCK,
+                ResumePoint::default(),
+            )
+            .with_deposits(feed.clone());
+            chain.poller(&feed).poll_once().await.unwrap();
+            seal_block(&mut s, base_ts).await;
+            seal_block(&mut s, base_ts + 2_000_000).await;
+        }
+
+        let mut executor = MockExecutor::new();
+        let resume = crate::recovery::replay_into_executor(
+            dir.path(),
+            &mut executor,
+            address,
+            false,
+            DEFAULT_BLOCK_GAS_LIMIT,
+            Address::ZERO,
+            SUB_BLOCKS_PER_BLOCK,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resume.deposits_end, 4);
+        assert_eq!(resume.next_block, 3);
+
+        // A new process: a fresh feed that reads the same chain.
+        use crate::deposits::test_support::{feed, MockChain};
+        let chain = MockChain::new(2);
+        chain.deposit_up_to(6, 2, 1_757_000_000);
+        // The settlement cursor is at the point the log resumed, so the chain check starts there too.
+        chain.set_cursor(4, chain.hash_before(4));
+        let feed = feed();
+        let mut s = SealerState::new(
+            executor,
+            LogWriter::open(dir.path(), 1_000).unwrap(),
+            PrivateKeySigner::random(),
+            ChannelSink::new(16),
+            1,
+            DEFAULT_BLOCK_GAS_LIMIT,
+            Address::ZERO,
+            SUB_BLOCKS_PER_BLOCK,
+            resume,
+        )
+        .with_deposits(feed.clone());
+        chain.poller(&feed).poll_once().await.unwrap();
+        let results = seal_block(&mut s, base_ts + 4_000_000).await;
+        assert_eq!(results[0].header.block, 3);
+        assert_eq!(results[0].header.deposits_end, Some(6));
+        assert_eq!(results[0].deposits_credited, 2);
+        // The next poll after the restart never re-read what the log already credited.
+        let first_key = crate::deposits::test_support::record_key(&chain, 0);
+        assert!(!chain
+            .reader
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|keys| keys.contains(&first_key)));
+    }
+
+    /// Without a feed the sealer is what it was: an empty tick is idle, and a block with transactions carries
+    /// no `deposits_end` and no withdrawals.
+    #[tokio::test]
+    async fn without_deposits_blocks_carry_no_deposits_end_and_no_withdrawals() {
+        use crate::testutil::signed_raw_tx;
+        let dir = tempdir().unwrap();
+        let mut s = SealerState::new(
+            MockExecutor::new(),
+            LogWriter::open(dir.path(), 1_000).unwrap(),
+            PrivateKeySigner::random(),
+            ChannelSink::new(16),
+            1,
+            DEFAULT_BLOCK_GAS_LIMIT,
+            Address::ZERO,
+            SUB_BLOCKS_PER_BLOCK,
+            ResumePoint::default(),
+        );
+        let base_ts = 1_757_000_000_000_000u64;
+        assert!(s
+            .seal_sub_block(vec![], base_ts, SubBlockLimits::unbounded())
+            .await
+            .unwrap()
+            .is_idle());
+        let sender = PrivateKeySigner::random();
+        for i in 0..20u64 {
+            let txs = if i == 0 {
+                vec![signed_raw_tx(&sender, 1, 0)]
+            } else {
+                vec![]
+            };
+            let r = s
+                .seal_sub_block(txs, base_ts + i * 50_000, SubBlockLimits::unbounded())
+                .await
+                .unwrap()
+                .sealed();
+            assert_eq!(r.header.deposits_end, None);
+            assert_eq!(r.deposits_credited, 0);
+        }
+        let mut records = Vec::new();
+        crate::log::replay(dir.path(), false, |r| records.push(r.clone())).unwrap();
+        assert_eq!(records.len(), 20);
+        assert!(records.iter().all(|r| r.withdrawals.is_empty()));
     }
 }

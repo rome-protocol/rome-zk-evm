@@ -27,6 +27,8 @@ zk-settlement-client = { path = "../zk-settlement-client" }
 # The chunk account header layout (`chunk::read`, `LayoutError`) — `inbox.rs` decodes every chunk header
 # through this one owner instead of a field-by-field re-decode of `zk_inbox::OFF_*`.
 rome-zk-layouts = { path = "../rome-zk-layouts" }
+# The one keccak the deposit hash chain is checked with (the same function the layouts' own tests use).
+rome-zk-merkle = { path = "../rome-zk-merkle" }
 # This crate's own `/metrics` responder, the exact same reth-free HTTP responder the
 # batcher and sequencer share — never a second hand-rolled copy.
 rome-zk-metrics-http = { path = "../rome-zk-metrics-http" }
@@ -91,7 +93,6 @@ solana-sdk.workspace = true
 solana-system-interface = { workspace = true, features = ["bincode"] }
 tempfile = "3"
 serde_json = "1"
-rome-zk-merkle = { path = "../rome-zk-merkle" }
 rome-zk-testkit = { path = "../rome-zk-testkit" }
 borsh = { version = "1.5.1", features = ["derive"] }
 # `tests/chain_config_real_program.rs` drives the real zk-settlement program (`InitGlobalConfig`,

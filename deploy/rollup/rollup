@@ -1,14 +1,27 @@
 #!/usr/bin/env bash
 # rollup — run a rollup node on one machine. Needs bash, docker with the compose plugin (Engine 28 or newer), curl,
-# jq, openssl, python3 (3.11 or newer) and rustup/cargo. It reaches no cloud service: every file it reads is local,
-# every request it makes goes to your own containers or to the Solana RPC endpoint you configured.
+# jq, openssl and python3 (3.11 or newer). No Rust, no cargo: every operator action on Solana runs inside the node
+# image (rome-zk-ops). It reaches no cloud service: every file it reads is local, every request it makes goes to your
+# own containers or to the Solana RPC endpoint you configured.
 #
-#   ./rollup init                   read your chain id from Solana, render every config with it (from chain.toml, .env
-#                                   and the programs file)
-#   ./rollup register --dry-run     print the registration commands without running anything
-#   ./rollup register --confirm     register the chain on Solana (no verifier keys) and write rendered/pdas.env
-#   ./rollup up [service...]        start the node (the prover too when PROVER=on)
-#   ./rollup check                  health check: services, chain id, heads, batcher, inbox, roots, derive
+#   ./rollup init                       read your chain id from Solana, render every config with it (from chain.toml,
+#                                       .env and the programs file)
+#   ./rollup register --dry-run         print the registration commands without running anything
+#   ./rollup register --confirm         register the chain on Solana (no verifier keys) and write rendered/pdas.env
+#   ./rollup up [service...]            start the node (the prover too when PROVER=on)
+#   ./rollup down                       stop and remove the containers; the data volumes stay
+#   ./rollup logs [-f] [--tail N] [service...]   the services' logs
+#   ./rollup status                     the running services and what Solana says about the chain
+#   ./rollup check                      health check: services, chain id, heads, batches, roots, derive, key, payer
+#   ./rollup refund-deposit             give the registration deposit back to the chain authority
+#   ./rollup exit-config propose|activate|show   change or read the chain's exit configuration
+#   ./rollup vault init|fund|show       the chain's bridge vault
+#   ./rollup release-exit --message-hash 0x...   release a proved exit from the vault
+#   ./rollup migrate --registry-keypair FILE --max-drift-secs N   bring an older chain forward (registry authority)
+#
+# Commands that send a Solana transaction (register, refund-deposit, exit-config propose and activate, vault init and
+# fund, release-exit, migrate) are a dry run unless you pass --confirm: they read the chain, print the transaction and
+# send nothing. --offline is a dry run with no network at all.
 #
 # Where things live (each can be overridden by an environment variable of the same name):
 #   ROLLUP_ENV   the machine's settings        default deploy/rollup/.env
@@ -69,6 +82,7 @@ load_programs() {
   CLUSTER="$(jq -r '.cluster // empty' "$PROGRAMS" 2>/dev/null)"
   INBOX_ID="$(jq -r '.programs["zk-inbox"] // empty' "$PROGRAMS" 2>/dev/null)"
   SETTLEMENT_ID="$(jq -r '.programs["zk-settlement"] // empty' "$PROGRAMS" 2>/dev/null)"
+  BRIDGE_ID="$(jq -r '.programs["zk-bridge"] // empty' "$PROGRAMS" 2>/dev/null)"   # only the vault and exit commands need it
   for name in CLUSTER INBOX_ID SETTLEMENT_ID; do
     val="${!name}"
     [[ -n "$val" ]] || die ProgramsFileInvalid "$PROGRAMS has no value for $name (expected cluster, programs.zk-inbox and programs.zk-settlement)"
@@ -84,16 +98,48 @@ require_init() {
 # Other wallets that follow it refuse a larger id too.
 MAX_WALLET_SAFE_CHAIN_ID=4503599627370476
 
+# ------------------------------------------------------------------------------------------ rome-zk-ops in the node image
+# Every operator action on Solana is one `rome-zk-ops` command run from the node image the .env names (the same image
+# ./rollup up starts), so the host needs no Rust. Each key file is bind-mounted read-only by its path and the command
+# gets the path inside the container: a key's contents are never read, printed or passed on a command line. The
+# container runs on the host's network so a Solana RPC on this machine and the sequencer's published port are reachable.
+OPS_MOUNTS=()
+ops_reset() { OPS_MOUNTS=(); }
+mount_key() { # $1=name inside the container $2=host path -> REPLY is the path inside the container
+  [[ "$2" != *,* ]] || die KeyPathInvalid "$2 has a comma in it, which a bind mount cannot take; move the key file"
+  [[ -f "$2" ]] || die KeyFileMissing "$2 does not exist (a Solana keypair file; it is mounted read-only into the container and never printed)"
+  OPS_MOUNTS+=(--mount "type=bind,source=$2,target=/keys/$1,readonly")
+  REPLY="/keys/$1"
+}
+# The image: the one compose runs (rendered/compose.env), or while init is still rendering it, the one the .env names.
+node_image() { # [cfg] -> the image reference, or non-zero when none is set
+  local img="" tag=""
+  if [[ "${1:-}" != cfg && -f "$OUT/compose.env" ]]; then
+    img="$(rz_env_get "$OUT/compose.env" ROME_ZK_IMAGE)"; tag="$(rz_env_get "$OUT/compose.env" ROME_ZK_TAG)"
+  else
+    img="$(cfg ROME_ZK_IMAGE)"; tag="$(cfg ROME_ZK_TAG)"
+  fi
+  if [[ -n "$img" ]]; then printf '%s' "$img"
+  elif [[ -n "$tag" ]]; then printf 'ghcr.io/rome-protocol/rome-zk-evm:%s' "$tag"
+  else return 1; fi
+}
+need_image() { # sets OPS_IMAGE or refuses by name
+  OPS_IMAGE="$(node_image "${1:-}")" || die ImageTagNotSet "set ROME_ZK_TAG in $ENV_FILE to the tag of the source you checked out (published tags: https://github.com/rome-protocol/rome-zk-evm/tags), or ROME_ZK_IMAGE to an image you built; the operator commands run from that image"
+}
+ops() { # ops ARGS... -> runs rome-zk-ops from the node image against SOLANA_RPC_URL; the mounts are OPS_MOUNTS
+  docker run --rm --network host ${OPS_MOUNTS[@]+"${OPS_MOUNTS[@]}"} --entrypoint rome-zk-ops "$OPS_IMAGE" --rpc-url "$SOLANA_RPC_URL" "$@"
+}
+
 # The chain id is not chosen. A permissionless id is derived by the settlement program from the payer's key and the
-# number of chains that payer has registered so far, so it is read from Solana: the register_chain example's chain-id
-# command prints it and sends nothing. Sets D_AUTHORITY, D_NONCE and D_ID.
+# number of chains that payer has registered so far, so it is read from Solana: rome-zk-ops chain-id prints it and
+# sends nothing. Sets D_AUTHORITY, D_NONCE and D_ID.
 fetch_chain_id() {
   local payer="$1" out errf
-  command -v cargo >/dev/null 2>&1 || die CargoMissing "reading your chain id runs from the source tree and needs a Rust toolchain (cargo)"
-  [[ -f "$REPO_ROOT/Cargo.toml" ]] || die SourceTreeMissing "$REPO_ROOT has no Cargo.toml; run from a full checkout"
   [[ -f "$payer" ]] || die PayerKeyMissing "$payer does not exist (a funded Solana keypair; set PAYER_KEYPAIR_PATH in $ENV_FILE). Your chain id comes from this key."
+  need_image "${2:-}"
+  ops_reset; mount_key payer "$payer"
   errf="$(mktemp)"
-  if ! out="$(cd "$REPO_ROOT" && cargo run --quiet -p zk-settlement-client --features devnet-driver --example register_chain -- chain-id --keypair "$payer" --settlement "$SETTLEMENT_ID" --rpc-url "$SOLANA_RPC_URL" 2>"$errf")"; then
+  if ! out="$(ops chain-id --settlement "$SETTLEMENT_ID" --keypair "$REPLY" 2>"$errf")"; then
     tail -5 "$errf" >&2; rm -f "$errf"
     die ChainIdLookupFailed "could not read the registration nonce for $payer from $SOLANA_RPC_URL"
   fi
@@ -186,7 +232,7 @@ cmd_init() {
   # Everything in chain.toml is checked; now the one network call: the chain id.
   local payer_key chain_id rec="$OUT/chain-id.env" rec_auth rec_nonce rec_id
   payer_key="$(abs "$(cfg PAYER_KEYPAIR_PATH ./keys/payer.json)")"
-  fetch_chain_id "$payer_key"
+  fetch_chain_id "$payer_key" cfg
   local registered=0 fresh_nonce="$D_NONCE"
   [[ ! -f "$OUT/pdas.env" ]] || registered=1   # register writes pdas.env when it finishes
   if [[ -f "$rec" ]]; then
@@ -348,16 +394,17 @@ cmd_register() {
   [[ "$init_id" == "$chain_id" ]] || die ChainIdMismatch "the genesis under $OUT has chain id $chain_id but init recorded $init_id in $rec"
   # Registration sends no verifier keys: the program refuses them on a permissionless chain. Rome registers the
   # chain's layout-1 key afterwards.
+  local ops_prefix="docker run --rm --network host --mount type=bind,source=$payer,target=/keys/payer,readonly --entrypoint rome-zk-ops <node image> --rpc-url $SOLANA_RPC_URL"
   local id_cmd reg_cmd cursor_cmd pda_cmd
-  id_cmd="cargo run --quiet -p zk-settlement-client --features devnet-driver --example register_chain -- chain-id --keypair $payer --settlement $SETTLEMENT_ID --rpc-url $SOLANA_RPC_URL"
-  reg_cmd="cargo run -p zk-settlement-client --features devnet-driver --example register_chain -- --keypair $payer --settlement $SETTLEMENT_ID --inbox $INBOX_ID --evm-rpc $evm_rpc --permissionless --nonce $init_nonce --expect-chain-id $init_id --max-drift-secs $max_drift --rpc-url $SOLANA_RPC_URL"
-  cursor_cmd="cargo run -p zk-inbox-client --features devnet-driver --example init_cursor -- --keypair $payer --inbox $INBOX_ID --settlement $SETTLEMENT_ID --chain-id $chain_id --next-batch 1 --rpc-url $SOLANA_RPC_URL"
-  pda_cmd="cargo run --quiet -p rome-zk-layouts --example print_pdas -- $INBOX_ID $SETTLEMENT_ID $chain_id"
+  id_cmd="$ops_prefix chain-id --settlement $SETTLEMENT_ID --keypair /keys/payer"
+  reg_cmd="$ops_prefix register --keypair /keys/payer --settlement $SETTLEMENT_ID --inbox $INBOX_ID --evm-rpc $evm_rpc --permissionless --nonce $init_nonce --expect-chain-id $init_id --max-drift-secs $max_drift --confirm"
+  cursor_cmd="$ops_prefix init-cursor --keypair /keys/payer --inbox $INBOX_ID --settlement $SETTLEMENT_ID --chain-id $chain_id --next-batch 1 --confirm"
+  pda_cmd="$ops_prefix pdas --inbox $INBOX_ID --settlement $SETTLEMENT_ID --chain-id $chain_id"
 
   echo "chain_id=$chain_id authority=$init_auth nonce=$init_nonce inbox=$INBOX_ID settlement=$SETTLEMENT_ID cluster=$CLUSTER (init derived this chain id from the authority's nonce and rendered the genesis with it)"
   if [[ $dry -eq 1 ]]; then
     echo "-- dry run: no key read, no network call, nothing started --"
-    echo "would run, in order, from $REPO_ROOT:"
+    echo "would run, in order (<node image> is the image ROME_ZK_IMAGE or ROME_ZK_TAG names; no Rust or cargo on this machine):"
     echo "  $id_cmd    # must still print chain_id=$chain_id, or registration stops with NonceAdvanced"
     echo "  $reg_cmd    # skipped when the chain's root account already exists (a re-run after a partial failure)"
     echo "  $cursor_cmd"
@@ -366,8 +413,7 @@ cmd_register() {
     return 0
   fi
 
-  [[ -f "$REPO_ROOT/Cargo.toml" ]] || die SourceTreeMissing "$REPO_ROOT has no Cargo.toml; run register from a full checkout"
-  cd "$REPO_ROOT" || exit 1
+  need_image
   # The payer must be the authority init recorded, on a first registration and on a resume alike. Say so by name before
   # any nonce is compared, so a changed key is not reported as a moved nonce.
   fetch_chain_id "$payer"
@@ -406,7 +452,8 @@ cmd_register() {
 
     local out registered
     # The recorded nonce and chain id go with the send, so the program itself refuses a pair that went stale.
-    out="$(cargo run -p zk-settlement-client --features devnet-driver --example register_chain -- --keypair "$payer" --settlement "$SETTLEMENT_ID" --inbox "$INBOX_ID" --evm-rpc "$evm_rpc" --permissionless --nonce "$init_nonce" --expect-chain-id "$init_id" --max-drift-secs "$max_drift" --rpc-url "$SOLANA_RPC_URL" 2>&1)" || { echo "$out" >&2; die RegisterFailed "register_chain exited non-zero"; }
+    ops_reset; mount_key payer "$payer"
+    out="$(ops register --keypair "$REPLY" --settlement "$SETTLEMENT_ID" --inbox "$INBOX_ID" --evm-rpc "$evm_rpc" --permissionless --nonce "$init_nonce" --expect-chain-id "$init_id" --max-drift-secs "$max_drift" --confirm 2>&1)" || { echo "$out" >&2; die RegisterFailed "rome-zk-ops register exited non-zero"; }
     echo "$out"
     registered="$(grep -oE '^chain [0-9]+' <<<"$out" | head -1 | cut -d' ' -f2)"
     if [[ -n "$registered" && "$registered" != "$chain_id" ]]; then
@@ -417,10 +464,11 @@ cmd_register() {
   # The addresses of this chain's accounts are known before anything is sent. If the root account is already there, an
   # earlier run registered this chain and stopped later: carry on from the cursor instead of registering again.
   local pdas cursor_pda root_pda
-  pdas="$(cargo run --quiet -p rome-zk-layouts --example print_pdas -- "$INBOX_ID" "$SETTLEMENT_ID" "$chain_id" 2>/dev/null)"
-  cursor_pda="$(grep -E '^\| batch cursor \| zk-inbox \|' <<<"$pdas" | grep -oE '`[^`]+`' | tr -d '`' | head -1)"
-  root_pda="$(grep -E '^\| root \| zk-settlement \|' <<<"$pdas" | grep -oE '`[^`]+`' | tr -d '`' | head -1)"
-  [[ -n "$cursor_pda" && -n "$root_pda" ]] || die PdaLookupFailed "could not read the batch cursor and root addresses from print_pdas"
+  ops_reset
+  pdas="$(ops pdas --inbox "$INBOX_ID" --settlement "$SETTLEMENT_ID" --chain-id "$chain_id" 2>/dev/null)"
+  cursor_pda="$(sed -n 's/^cursor=//p' <<<"$pdas" | head -1)"
+  root_pda="$(sed -n 's/^root=//p' <<<"$pdas" | head -1)"
+  [[ -n "$cursor_pda" && -n "$root_pda" ]] || die PdaLookupFailed "could not read the batch cursor and root addresses from rome-zk-ops pdas"
   local exists_rc=0
   account_exists "$root_pda" || exists_rc=$?
   case "$exists_rc" in
@@ -428,7 +476,8 @@ cmd_register() {
     1) register_new_chain ;;
     *) die RootLookupFailed "could not read the root account $root_pda from $SOLANA_RPC_URL, so it is not known whether chain $chain_id is registered; nothing was sent" ;;
   esac
-  cargo run -p zk-inbox-client --features devnet-driver --example init_cursor -- --keypair "$payer" --inbox "$INBOX_ID" --settlement "$SETTLEMENT_ID" --chain-id "$chain_id" --next-batch 1 --rpc-url "$SOLANA_RPC_URL" || die InitCursorFailed "init_cursor exited non-zero"
+  ops_reset; mount_key payer "$payer"
+  ops init-cursor --keypair "$REPLY" --inbox "$INBOX_ID" --settlement "$SETTLEMENT_ID" --chain-id "$chain_id" --next-batch 1 --confirm || die InitCursorFailed "rome-zk-ops init-cursor exited non-zero"
   printf 'CURSOR_PDA=%s\nROOT_PDA=%s\n' "$cursor_pda" "$root_pda" > "$OUT/pdas.env"
   echo "registered; wrote $OUT/pdas.env (cursor $cursor_pda, root $root_pda)"
 }
@@ -455,11 +504,210 @@ cmd_up() {
   dc up -d "$@"
 }
 
+# --------------------------------------------------------------------------------------------- operator commands
+# One context for every command below: the rendered chain, the Solana RPC, the programs file and the payer key. Sets
+# CHAIN_ID and PAYER (the host path of the key). Each command then says which keys it mounts.
+ops_context() {
+  require_init
+  load_env; load_programs
+  CHAIN_ID="$(jq -r '.config.chainId // empty' "$OUT/genesis.json" 2>/dev/null)"
+  [[ "$CHAIN_ID" =~ ^[0-9]+$ ]] || die NotInitialised "$OUT/genesis.json has no chain id (run ./rollup init again)"
+  PAYER="$(rz_env_get "$OUT/compose.env" PAYER_KEYPAIR_PATH)"
+  [[ -n "$PAYER" ]] || PAYER="$(abs "$(cfg PAYER_KEYPAIR_PATH ./keys/payer.json)")"
+  need_image
+  ops_reset
+}
+need_bridge() {
+  [[ -n "$BRIDGE_ID" ]] || die ProgramsFileInvalid "$PROGRAMS has no value for programs.zk-bridge, which the vault and exit commands need"
+}
+# MODE holds the one flag that says whether a command sends: nothing (a dry run), --confirm, or --offline. REST holds the
+# arguments that are left. --confirm with --dry-run or --offline is refused by name.
+parse_mode() {
+  MODE=(); REST=()
+  local confirm=0 dry=0 offline=0 a
+  for a in "$@"; do
+    case "$a" in
+      --confirm) confirm=1 ;;
+      --dry-run) dry=1 ;;
+      --offline) offline=1 ;;
+      *) REST+=("$a") ;;
+    esac
+  done
+  (( confirm == 0 || (dry == 0 && offline == 0) )) || die ConfirmAndDryRun "--confirm cannot go with --dry-run or --offline: a command either sends or it does not"
+  (( confirm )) && MODE=(--confirm)
+  (( offline )) && MODE=(--offline)
+  return 0
+}
+# flag_value FLAG VALUE-OR-EMPTY -> the value, refused by name when it is missing
+flag_value() { [[ -n "${2:-}" ]] || die FlagValueMissing "$1 needs a value"; printf '%s' "$2"; }
+only_numbers() { [[ "$2" =~ ^[0-9]+$ ]] || die FlagValueInvalid "$1 must be a whole number (got '$2')"; }
+hex_bytes() { # NAME VALUE BYTES
+  local want=$(( $3 * 2 ))
+  [[ "${2#0x}" =~ ^[0-9a-fA-F]+$ && ${#2} -ge $want && "${2#0x}" =~ ^[0-9a-fA-F]{$want}$ ]] || die FlagValueInvalid "$1 must be $3 bytes of hex ($(( $3 * 2 )) characters, with or without 0x)"
+}
+
+cmd_refund_deposit() {
+  parse_mode "$@"
+  [[ ${#REST[@]} -eq 0 ]] || die UnknownArgument "'${REST[0]}' (usage: rollup refund-deposit [--confirm])"
+  ops_context
+  mount_key payer "$PAYER"
+  ops refund-deposit --settlement "$SETTLEMENT_ID" --chain-id "$CHAIN_ID" --keypair "$REPLY" ${MODE[@]+"${MODE[@]}"}
+}
+
+cmd_exit_config() {
+  local sub="${1:-}"; [[ $# -eq 0 ]] || shift
+  case "$sub" in
+    propose)
+      parse_mode "$@"; set -- "${REST[@]+"${REST[@]}"}"
+      local flags=() have_field=0 slot="" delay="" v
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --exit-portal) v="$(flag_value "$1" "${2:-}")" || exit 1; hex_bytes "$1" "$v" 20; flags+=(--exit-portal "$v"); have_field=1; shift 2 ;;
+          --bridge-program) v="$(flag_value "$1" "${2:-}")" || exit 1; flags+=(--bridge-program "$v"); have_field=1; shift 2 ;;
+          --exit-cap) v="$(flag_value "$1" "${2:-}")" || exit 1; only_numbers "$1" "$v"; flags+=(--exit-cap "$v"); have_field=1; shift 2 ;;
+          --poster-bond) v="$(flag_value "$1" "${2:-}")" || exit 1; only_numbers "$1" "$v"; flags+=(--poster-bond "$v"); have_field=1; shift 2 ;;
+          --activation-slot) slot="$(flag_value "$1" "${2:-}")" || exit 1; only_numbers "$1" "$slot"; shift 2 ;;
+          --activation-delay-slots) delay="$(flag_value "$1" "${2:-}")" || exit 1; only_numbers "$1" "$delay"; shift 2 ;;
+          *) die UnknownArgument "'$1' (usage: rollup exit-config propose [--exit-portal 0x..] [--bridge-program P] [--exit-cap N] [--poster-bond N] --activation-slot N | --activation-delay-slots N [--confirm])" ;;
+        esac
+      done
+      (( have_field )) || die NothingProposed "name at least one of --exit-portal, --bridge-program, --exit-cap, --poster-bond"
+      [[ -n "$slot" || -n "$delay" ]] || die ActivationMissing "give --activation-slot N or --activation-delay-slots N: a proposal takes effect only at a slot you choose"
+      [[ -z "$slot" || -z "$delay" ]] || die ActivationConflict "give --activation-slot or --activation-delay-slots, not both"
+      [[ -z "$slot" ]] || flags+=(--activation-slot "$slot")
+      [[ -z "$delay" ]] || flags+=(--activation-delay-slots "$delay")
+      ops_context
+      mount_key payer "$PAYER"
+      # The chain authority is the payer key: the registration made it the authority.
+      ops exit-config propose --settlement "$SETTLEMENT_ID" --chain-id "$CHAIN_ID" --chain-authority-keypair "$REPLY" --payer-keypair "$REPLY" "${flags[@]}" ${MODE[@]+"${MODE[@]}"} ;;
+    activate)
+      parse_mode "$@"
+      [[ ${#REST[@]} -eq 0 ]] || die UnknownArgument "'${REST[0]}' (usage: rollup exit-config activate [--confirm])"
+      ops_context
+      mount_key payer "$PAYER"
+      ops exit-config activate --settlement "$SETTLEMENT_ID" --chain-id "$CHAIN_ID" --payer-keypair "$REPLY" ${MODE[@]+"${MODE[@]}"} ;;
+    show)
+      [[ $# -eq 0 ]] || die UnknownArgument "'$1' (usage: rollup exit-config show)"
+      ops_context
+      ops exit-config show --settlement "$SETTLEMENT_ID" --chain-id "$CHAIN_ID" ;;
+    *) die UnknownSubcommand "'$sub' (usage: rollup exit-config propose|activate|show)" ;;
+  esac
+}
+
+WRAPPED_SOL_MINT=So11111111111111111111111111111111111111112
+cmd_vault() {
+  local sub="${1:-}"; [[ $# -eq 0 ]] || shift
+  case "$sub" in
+    init)
+      parse_mode "$@"; set -- "${REST[@]+"${REST[@]}"}"
+      local mint="$WRAPPED_SOL_MINT" decimals=9
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --mint) mint="$(flag_value "$1" "${2:-}")" || exit 1; shift 2 ;;
+          --mint-decimals) decimals="$(flag_value "$1" "${2:-}")" || exit 1; only_numbers "$1" "$decimals"; shift 2 ;;
+          *) die UnknownArgument "'$1' (usage: rollup vault init [--mint M] [--mint-decimals N] [--confirm]; the default is wrapped SOL, 9 decimals)" ;;
+        esac
+      done
+      ops_context; need_bridge
+      mount_key payer "$PAYER"
+      ops vault init --authority-keypair "$REPLY" --mint "$mint" --mint-decimals "$decimals" --settlement "$SETTLEMENT_ID" --bridge "$BRIDGE_ID" --chain-id "$CHAIN_ID" ${MODE[@]+"${MODE[@]}"} ;;
+    fund)
+      parse_mode "$@"; set -- "${REST[@]+"${REST[@]}"}"
+      local amount=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --amount) amount="$(flag_value "$1" "${2:-}")" || exit 1; only_numbers "$1" "$amount"; shift 2 ;;
+          *) die UnknownArgument "'$1' (usage: rollup vault fund --amount RAW_TOKEN_UNITS [--confirm])" ;;
+        esac
+      done
+      [[ -n "$amount" ]] || die AmountMissing "give --amount N, in the mint's raw token units (lamports for wrapped SOL)"
+      ops_context; need_bridge
+      mount_key payer "$PAYER"
+      ops vault fund --payer-keypair "$REPLY" --amount "$amount" --settlement "$SETTLEMENT_ID" --bridge "$BRIDGE_ID" --chain-id "$CHAIN_ID" ${MODE[@]+"${MODE[@]}"} ;;
+    show)
+      [[ $# -eq 0 ]] || die UnknownArgument "'$1' (usage: rollup vault show)"
+      ops_context; need_bridge
+      ops vault show --settlement "$SETTLEMENT_ID" --bridge "$BRIDGE_ID" --chain-id "$CHAIN_ID" ;;
+    *) die UnknownSubcommand "'$sub' (usage: rollup vault init|fund|show)" ;;
+  esac
+}
+
+cmd_release_exit() {
+  parse_mode "$@"; set -- "${REST[@]+"${REST[@]}"}"
+  local hash=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --message-hash) hash="$(flag_value "$1" "${2:-}")" || exit 1; shift 2 ;;
+      *) die UnknownArgument "'$1' (usage: rollup release-exit --message-hash 0x... [--confirm])" ;;
+    esac
+  done
+  [[ -n "$hash" ]] || die MessageHashMissing "give --message-hash 0x followed by 64 hex characters: the exit's message hash"
+  hex_bytes --message-hash "$hash" 32
+  ops_context; need_bridge
+  mount_key payer "$PAYER"
+  ops release-exit --settlement "$SETTLEMENT_ID" --bridge "$BRIDGE_ID" --chain-id "$CHAIN_ID" --message-hash "$hash" --payer-keypair "$REPLY" ${MODE[@]+"${MODE[@]}"}
+}
+
+cmd_migrate() {
+  parse_mode "$@"; set -- "${REST[@]+"${REST[@]}"}"
+  local registry="" drift="" v
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --registry-keypair) v="$(flag_value "$1" "${2:-}")" || exit 1; registry="$(abs "$v")"; shift 2 ;;
+      --max-drift-secs) drift="$(flag_value "$1" "${2:-}")" || exit 1; only_numbers "$1" "$drift"; shift 2 ;;
+      *) die UnknownArgument "'$1' (usage: rollup migrate --registry-keypair FILE --max-drift-secs N [--confirm])" ;;
+    esac
+  done
+  [[ -n "$registry" ]] || die RegistryKeypairMissing "give --registry-keypair FILE: only the registry authority can migrate a chain"
+  [[ -n "$drift" ]] || die MaxDriftMissing "give --max-drift-secs N: the chain's timestamp drift bound has no default"
+  ops_context
+  mount_key payer "$PAYER"; local payer_in="$REPLY"
+  mount_key registry "$registry"
+  ops migrate --settlement "$SETTLEMENT_ID" --chain-id "$CHAIN_ID" --registry-keypair "$REPLY" --payer-keypair "$payer_in" --max-drift-secs "$drift" ${MODE[@]+"${MODE[@]}"}
+}
+
+# The services compose knows, for `logs`.
+KNOWN_SERVICES=(sequencer batcher reth-verifier derive prover postgres)
+cmd_logs() {
+  local follow=() tail="${LOGS_TAIL:-200}" svcs=() s k
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f|--follow) follow=(--follow); shift ;;
+      --tail) tail="$(flag_value "$1" "${2:-}")" || exit 1; only_numbers "$1" "$tail"; shift 2 ;;
+      -*) die UnknownArgument "'$1' (usage: rollup logs [-f] [--tail N] [service...])" ;;
+      *) svcs+=("$1"); shift ;;
+    esac
+  done
+  for s in ${svcs[@]+"${svcs[@]}"}; do
+    k=0; for known in "${KNOWN_SERVICES[@]}"; do [[ "$s" == "$known" ]] && k=1; done
+    (( k )) || die UnknownService "'$s' is not a service (${KNOWN_SERVICES[*]})"
+  done
+  require_init
+  dc logs --tail "$tail" ${follow[@]+"${follow[@]}"} ${svcs[@]+"${svcs[@]}"}
+}
+
+cmd_down() {
+  [[ $# -eq 0 ]] || die UnknownArgument "'$1' (usage: rollup down; it stops and removes the containers and keeps the data volumes, so the chain's data is safe; remove a volume yourself only to start a chain over)"
+  require_init
+  dc down
+}
+
+cmd_status() {
+  [[ $# -eq 0 ]] || die UnknownArgument "'$1' (usage: rollup status)"
+  ops_context
+  echo "chain_id=$CHAIN_ID cluster=$CLUSTER settlement=$SETTLEMENT_ID inbox=$INBOX_ID"
+  echo "-- services --"
+  dc ps || die ComposeFailed "docker compose ps failed"
+  echo "-- the chain on Solana ($SOLANA_RPC_URL) --"
+  ops chain-status --settlement "$SETTLEMENT_ID" --chain-id "$CHAIN_ID" || die StatusFailed "rome-zk-ops chain-status could not read the chain (the refusal is above)"
+}
+
 # -------------------------------------------------------------------------------------------------------- check
 FAILED=0
 pass() { echo "PASS: $1 — $2"; }
 fail() { echo "FAIL: $1 — $2"; FAILED=1; }
 skip() { echo "SKIP: $1 — $2"; }
+warn() { echo "WARN: $1 — $2"; } # named and visible, but the check still passes
 
 rpc() { # $1=url $2=method -> the result field, or nothing
   curl -sS --max-time 5 -X POST -H 'content-type: application/json' \
@@ -483,9 +731,19 @@ print(struct.unpack_from("<Q", data, off)[0])
 PY
 }
 
+sol_balance() { # $1=pubkey -> lamports, or nothing (and non-zero) when the RPC does not answer
+  local body json v
+  body="{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getBalance\",\"params\":[\"$1\",{\"commitment\":\"confirmed\"}]}"
+  json="$(curl -sS --max-time 10 -X POST -H 'content-type: application/json' --data "$body" "$SOLANA_RPC_URL" 2>/dev/null)" || return 1
+  v="$(jq -r '.result.value // empty' <<<"$json" 2>/dev/null)"
+  [[ "$v" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$v"
+}
+
 cmd_check() {
   require_init
   load_env
+  load_programs
   local env="$OUT/compose.env" sample="${CHECK_SAMPLE_SECS:-3}"
   local chain_id bpb close_after prover
   chain_id="$(rz_env_get "$env" CHAIN_ID)"; bpb="$(rz_env_get "$env" BLOCKS_PER_BATCH)"
@@ -542,24 +800,55 @@ cmd_check() {
     fail "batcher cursor" "PdasMissing: $OUT/pdas.env does not exist; run ./rollup register --confirm, which writes it"
   fi
 
-  # Batcher backlog: an unposted block older than the close-after window plus a minute means the batcher is stuck.
-  local bound=$(( close_after + 60 )) oldest=""
-  if needs batcher; then
-    oldest="$(metric "$METRICS_BATCHER" rome_zk_batcher_oldest_unposted_block_age_seconds)"
-    if [[ -z "$oldest" ]]; then fail "batcher backlog" "BatcherUnreachable: no metrics from $METRICS_BATCHER"
-    elif awk -v v="$oldest" -v b="$bound" 'BEGIN{exit !(v<=b)}'; then pass "batcher backlog" "oldest unposted block is ${oldest}s old (bound ${bound}s)"
-    else fail "batcher backlog" "BatcherBehind: the oldest unposted block is ${oldest}s old (bound ${bound}s)"; fi
+  # Batches finalized against blocks sealed. The batcher's own age gauge resets on every age close and stands still while
+  # the batcher waits on Solana, so it cannot see a stuck batcher. Two counters can: blocks the sequencer sealed and
+  # batches the batcher finalized. Each run of this check records both; once a sample from at least the window ago exists,
+  # blocks sealed since then with no batch finalized is a stuck batcher, the same rule the example alerts use. A restart
+  # of either process resets its counter, and a sample from before a reset is not used.
+  local window="${CHECK_FINALIZE_WINDOW_SECS:-$(( close_after * 4 > 900 ? close_after * 4 : 900 ))}"
+  if needs sequencer batcher; then
+    local sealed finalized now samples="$OUT/check-samples" base
+    sealed="$(metric "$METRICS_SEQUENCER" rome_zk_sequencer_blocks_sealed_total)"
+    finalized="$(metric "$METRICS_BATCHER" rome_zk_batcher_batches_finalized_total)"
+    if [[ ! "$sealed" =~ ^[0-9]+(\.[0-9]+)?$ || ! "$finalized" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+      fail "batches finalized" "BatcherUnreachable: no blocks-sealed or batches-finalized counter from $METRICS_SEQUENCER and $METRICS_BATCHER"
+    else
+      sealed="${sealed%.*}"; finalized="${finalized%.*}"; now="${CHECK_NOW:-$(date +%s)}"
+      base=""
+      [[ ! -f "$samples" ]] || base="$(awk -v now="$now" -v w="$window" -v s="$sealed" -v f="$finalized" '
+        NF == 3 { n++; t[n] = $1; a[n] = $2; b[n] = $3 }
+        END { ls = s; lf = f
+          for (i = n; i >= 1; i--) {
+            if (a[i] > ls || b[i] > lf) break
+            ls = a[i]; lf = b[i]
+            if (now - t[i] >= w) { print t[i], a[i], b[i]; break } } }' "$samples" 2>/dev/null)"
+      { [[ -f "$samples" ]] && tail -n 499 "$samples"; echo "$now $sealed $finalized"; } > "$samples.new" 2>/dev/null && mv "$samples.new" "$samples" 2>/dev/null
+      if [[ -z "$base" ]]; then
+        skip "batches finalized" "no sample from at least ${window}s ago yet (sealed $sealed, finalized $finalized); run ./rollup check on a timer and it judges the window from the second run on"
+      else
+        local bt bs bf; read -r bt bs bf <<<"$base"
+        if (( sealed > bs && finalized == bf )); then
+          fail "batches finalized" "BatchesNotFinalizing: $((sealed - bs)) blocks sealed in the last $((now - bt))s and the batcher finalized no batch (finalized_total stayed at $finalized)"
+        else
+          pass "batches finalized" "sealed +$((sealed - bs)) blocks, finalized +$((finalized - bf)) batches in the last $((now - bt))s (window ${window}s)"
+        fi
+      fi
+    fi
   else
-    skip "batcher backlog" "needs the batcher, which is not running"
+    skip "batches finalized" "needs the sequencer and the batcher, which are not both running"
   fi
 
-  # Inbox batches: next_batch - 1 batches are on Solana. None yet is fine until a block has waited too long.
-  if (( cursor_ok )) && needs batcher && [[ -n "$oldest" ]]; then
-    local posted=$(( next_batch - 1 ))
-    if (( posted > 0 )); then pass "inbox batches" "$posted posted (next_batch=$next_batch)"
-    elif awk -v v="$oldest" -v b="$bound" 'BEGIN{exit !(v<=b)}'; then pass "inbox batches" "0 posted yet, and no block has waited past ${bound}s"
-    else fail "inbox batches" "NoBatchPosted: nothing is on Solana and the oldest unposted block is ${oldest}s old"; fi
-  elif (( cursor_ok )); then skip "inbox batches" "needs the batcher, which is not running"
+  # Inbox batches: next_batch - 1 batches are on Solana, and a batch holds at most blocks_per_batch blocks. A sequencer
+  # that is two batches' worth of blocks ahead of what the posted batches could hold has an unposted tail, whatever the
+  # batcher's own gauges say.
+  if (( cursor_ok )) && [[ -n "$bn2" ]]; then
+    local posted=$(( next_batch - 1 )) unposted=$(( bn2 - (next_batch - 1) * bpb ))
+    if (( unposted >= 2 * bpb )); then
+      if (( posted == 0 )); then fail "inbox batches" "NoBatchPosted: nothing is on Solana and the sequencer is at block $((bn2)), $((2 * bpb)) or more blocks ahead"
+      else fail "inbox batches" "BatcherBehind: $posted batches posted hold at most $((posted * bpb)) blocks and the sequencer is at block $((bn2)) (at least $unposted unposted, limit $((2 * bpb - 1)))"; fi
+    elif (( posted > 0 )); then pass "inbox batches" "$posted posted (next_batch=$next_batch)"
+    else pass "inbox batches" "0 posted yet, and the sequencer is at block $((bn2)), under two batches ($((2 * bpb)) blocks)"; fi
+  elif (( cursor_ok )); then skip "inbox batches" "needs the sequencer's head, which could not be read"
   else skip "inbox batches" "needs the batch cursor, which could not be read"; fi
 
   # Roots: the settlement account's last finalized batch.
@@ -589,6 +878,51 @@ cmd_check() {
     skip "settlement lag" "no prover configured (PROVER=on in .env turns it on)"
     skip "prover lag" "no prover configured (PROVER=on in .env turns it on)"
   fi
+
+  # The payer: it pays every Solana fee and the rent of every batch. Below the floor the batcher stops sending.
+  local payer_pk floor="${PAYER_FLOOR_LAMPORTS:-$(cfg PAYER_FLOOR_LAMPORTS 1000000000)}" bal
+  payer_pk="$(rz_env_get "$OUT/chain-id.env" AUTHORITY)"
+  if [[ -z "$payer_pk" ]]; then skip "payer balance" "needs $OUT/chain-id.env, which ./rollup init writes"
+  elif bal="$(sol_balance "$payer_pk")" && [[ "$bal" =~ ^[0-9]+$ ]]; then
+    if (( bal >= floor )); then pass "payer balance" "$bal lamports at $payer_pk (floor $floor)"
+    else fail "payer balance" "PayerBelowFloor: $bal lamports at $payer_pk, floor $floor (fund it, or move the floor with PAYER_FLOOR_LAMPORTS)"; fi
+  else fail "payer balance" "PayerBalanceUnreadable: could not read the balance of $payer_pk from $SOLANA_RPC_URL"; fi
+
+  # What the settlement program says about the chain, read once through rome-zk-ops from the node image.
+  local cs="" cs_ok=0 cs_why="" margin="${RECLAIM_MARGIN_SLOTS:-$(cfg RECLAIM_MARGIN_SLOTS 108000)}"
+  if OPS_IMAGE="$(node_image)"; then
+    ops_reset
+    if cs="$(ops chain-status --settlement "$SETTLEMENT_ID" --chain-id "$chain_id" 2>&1)"; then cs_ok=1; else cs_why="$(tail -1 <<<"$cs")"; fi
+  else cs_why="ImageTagNotSet: neither ROME_ZK_IMAGE nor ROME_ZK_TAG is set in $env"; fi
+  csv() { sed -n "s/^$1=//p" <<<"$cs" | head -1; }
+  if [[ "$prover" != on ]]; then
+    skip "verification key" "no prover configured (PROVER=on in .env turns it on)"
+  elif (( cs_ok )); then
+    if [[ "$(csv vkey_active)" == yes ]]; then pass "verification key" "active for the proving layout ($(csv vkey_entries) registry entries)"
+    else
+      local pend; pend="$(csv vkey_pending_activation_slot)"
+      fail "verification key" "VkeyNotActive: no verification key is active for this chain's proving layout${pend:+ (one activates at slot $pend, now at slot $(csv slot))}; the prover cannot settle until Rome registers one"
+    fi
+  else fail "verification key" "ChainStatusUnreadable: ${cs_why:-rome-zk-ops chain-status failed}"; fi
+  if (( cs_ok )); then
+    local left; left="$(csv reclaim_slots_left)"
+    if [[ "$left" == none ]]; then pass "reclaim deadline" "the chain has posted a root; nobody can reclaim it"
+    elif [[ "$left" =~ ^[0-9]+$ ]]; then
+      if (( left == 0 )); then fail "reclaim deadline" "ReclaimDeadlinePassed: the window is over and this chain has not posted a root, so anyone can reclaim its registration now; post a root or the chain can be taken from you"
+      elif (( left < margin )); then fail "reclaim deadline" "ReclaimDeadlineNear: $left slots left (about $(( left * 4 / 36000 )) hours) until anyone can reclaim this chain, which has not posted a root; post a root before then (the margin is $margin slots)"
+      else pass "reclaim deadline" "$left slots left (about $(( left * 4 / 36000 )) hours), margin $margin"; fi
+    else fail "reclaim deadline" "ChainStatusUnreadable: no reclaim_slots_left line in the chain-status output"; fi
+  else fail "reclaim deadline" "ChainStatusUnreadable: ${cs_why:-rome-zk-ops chain-status failed}"; fi
+
+  # The exit configuration the chain runs with, shown.
+  local ec="" ec_ok=0 ec_why="$cs_why"
+  if OPS_IMAGE="$(node_image)"; then
+    ops_reset
+    if ec="$(ops exit-config show --settlement "$SETTLEMENT_ID" --chain-id "$chain_id" 2>&1)"; then ec_ok=1; else ec_why="$(tail -1 <<<"$ec")"; fi
+  fi
+  if (( ec_ok )); then
+    pass "exit config" "$(grep -E 'no exit config|exit_portal \(current\)|bridge_program \(current\)|pending_mask|activation_slot' <<<"$ec" | sed 's/^ *//; s/  */ /g' | paste -sd ';' - | sed 's/;/; /g')"
+  else fail "exit config" "ExitConfigUnreadable: ${ec_why:-rome-zk-ops exit-config show failed}"; fi
 
   # Derive lag: the verifier node trails the sequencer by the batch still open and the one being posted. A gap of two
   # batches' worth of blocks that is not closing is a derive that has stopped.
@@ -622,7 +956,7 @@ cmd_check() {
   exit "$FAILED"
 }
 
-usage() { sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,/^set -uo/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'; }
 
 cmd="${1:-}"; shift || true
 case "$cmd" in
@@ -630,6 +964,14 @@ case "$cmd" in
   register) cmd_register "$@" ;;
   up) cmd_up "$@" ;;
   check) cmd_check "$@" ;;
+  down) cmd_down "$@" ;;
+  logs) cmd_logs "$@" ;;
+  status) cmd_status "$@" ;;
+  refund-deposit) cmd_refund_deposit "$@" ;;
+  exit-config) cmd_exit_config "$@" ;;
+  vault) cmd_vault "$@" ;;
+  release-exit) cmd_release_exit "$@" ;;
+  migrate) cmd_migrate "$@" ;;
   -h|--help|help|"") usage ;;
   *) echo "UnknownCommand: '$cmd'" >&2; usage >&2; exit 1 ;;
 esac

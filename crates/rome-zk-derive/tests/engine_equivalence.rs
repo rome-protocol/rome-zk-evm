@@ -92,6 +92,29 @@ fn unbounded_limits() -> SubBlockLimits {
 #[ignore = "spins up a real in-process reth node; run explicitly: cargo test -p rome-zk-derive --test engine_equivalence -- --ignored --nocapture"]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_batch_derived_through_the_real_engine_api_matches_rome_zk_executor_reth() {
+    equivalence(vec![vec![]; BLOCKS as usize]).await;
+}
+
+/// The same equivalence for blocks that carry deposits: the sequencer's executor seals each block with its
+/// withdrawals, derive builds it through the real Engine API with the same ones, and the block hashes and
+/// state roots agree. A block with no deposits stays in the batch (the middle one).
+#[ignore = "spins up a real in-process reth node; run explicitly: cargo test -p rome-zk-derive --test engine_equivalence -- --ignored --nocapture"]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_with_deposits_derived_through_the_real_engine_api_matches_rome_zk_executor_reth() {
+    let w = |index: u64| {
+        rome_zk_executor_api::deposit_withdrawal(
+            index,
+            Address::repeat_byte(0xA0 + index as u8),
+            1_000_000 * (index + 1),
+        )
+    };
+    equivalence(vec![vec![w(0), w(1)], vec![], vec![w(2)]]).await;
+}
+
+/// `withdrawals[b]` are block `b + 1`'s deposits, built with `deposit_withdrawal` (their indices run on
+/// across the blocks); a block with some carries the cumulative cursor as its `deposits_end`.
+async fn equivalence(withdrawals: Vec<Vec<alloy_eips::eip4895::Withdrawal>>) {
+    assert_eq!(withdrawals.len() as u64, BLOCKS);
     reth_tracing::init_test_tracing();
 
     let signer = PrivateKeySigner::random();
@@ -116,6 +139,7 @@ async fn a_batch_derived_through_the_real_engine_api_matches_rome_zk_executor_re
     let base_ts = chain_spec.genesis().timestamp;
     let mut recorded_hashes = Vec::new();
     let mut recorded_state_roots = Vec::new();
+    let mut deposits_cursor = 0u64;
     for b in 0..BLOCKS {
         // The sequencer numbers its first sealed block 1 — design
         // number 0 names only the EL's genesis, which is never sealed. `number` is what feeds both
@@ -131,7 +155,7 @@ async fn a_batch_derived_through_the_real_engine_api_matches_rome_zk_executor_re
             coinbase: Address::ZERO,
             prev_randao,
             base_fee: None,
-            withdrawals: vec![],
+            withdrawals: withdrawals[b as usize].clone(),
         })
         .await
         .unwrap();
@@ -165,12 +189,13 @@ async fn a_batch_derived_through_the_real_engine_api_matches_rome_zk_executor_re
             .unwrap();
         recorded_hashes.push(outcome.block_hash);
         recorded_state_roots.push(outcome.state_root);
+        deposits_cursor += withdrawals[b as usize].len() as u64;
         blocks.push(Block {
             number,
             timestamp,
             gas_limit: chain_spec.genesis().gas_limit,
             txs: block_txs,
-            deposits_end: None,
+            deposits_end: (!withdrawals[b as usize].is_empty()).then_some(deposits_cursor),
         });
     }
 
@@ -200,14 +225,24 @@ async fn a_batch_derived_through_the_real_engine_api_matches_rome_zk_executor_re
     let node_config = NodeConfig::test()
         .with_chain(chain_spec.clone())
         .with_unused_ports()
-        .with_network(reth_node_core::args::NetworkArgs {
-            discovery: reth_node_core::args::DiscoveryArgs {
-                disable_discovery: true,
-                disable_dns_discovery: true,
+        // No peer discovery, no peers, p2p on loopback and a free port (the default 30303 made two
+        // nodes in one binary collide).
+        .with_network(
+            reth_node_core::args::NetworkArgs {
+                discovery: reth_node_core::args::DiscoveryArgs {
+                    disable_discovery: true,
+                    disable_dns_discovery: true,
+                    addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    ..Default::default()
+                },
+                // The peer listener (TCP) is on loopback too, not only the discovery socket.
+                addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                max_outbound_peers: Some(0),
+                max_inbound_peers: Some(0),
                 ..Default::default()
-            },
-            ..Default::default()
-        })
+            }
+            .with_unused_ports(),
+        )
         .with_rpc({
             let mut rpc = RpcServerArgs::default()
                 .with_unused_ports()
@@ -224,6 +259,13 @@ async fn a_batch_derived_through_the_real_engine_api_matches_rome_zk_executor_re
             rpc.auth_jwtsecret = Some(jwt_path.clone());
             rpc
         });
+    // The node never joins a public network: no discovery, no peers, loopback only.
+    assert!(node_config.network.discovery.disable_discovery);
+    assert!(node_config.network.discovery.disable_dns_discovery);
+    assert!(node_config.network.discovery.addr.is_loopback());
+    assert!(node_config.network.addr.is_loopback());
+    assert_eq!(node_config.network.max_outbound_peers, Some(0));
+    assert_eq!(node_config.network.max_inbound_peers, Some(0));
     let NodeHandle {
         node,
         node_exit_future: _,
@@ -233,7 +275,6 @@ async fn a_batch_derived_through_the_real_engine_api_matches_rome_zk_executor_re
         .launch()
         .await
         .unwrap();
-
     let rpc_url = format!(
         "http://{}",
         node.rpc_server_handle().http_local_addr().unwrap()
@@ -245,7 +286,12 @@ async fn a_batch_derived_through_the_real_engine_api_matches_rome_zk_executor_re
     let mut ctrl = EngineController::new(engine_api, genesis_hash, 0);
 
     for (i, block) in decoded.iter().enumerate() {
-        let attrs = attributes::attributes_for_block(CHAIN_ID, Address::ZERO, block);
+        let attrs = attributes::attributes_for_block(
+            CHAIN_ID,
+            Address::ZERO,
+            block,
+            withdrawals[i].clone(),
+        );
         assert_eq!(attrs.env.gas_limit, genesis_gas_limit);
         let outcome = ctrl.advance(&attrs).await.unwrap_or_else(|e| {
             panic!("block {i}: EngineController::advance against the real node failed: {e}")
@@ -274,7 +320,12 @@ async fn a_batch_derived_through_the_real_engine_api_matches_rome_zk_executor_re
         .await
         .unwrap();
     for (i, block) in decoded.iter().enumerate() {
-        let attrs = attributes::attributes_for_block(CHAIN_ID, Address::ZERO, block);
+        let attrs = attributes::attributes_for_block(
+            CHAIN_ID,
+            Address::ZERO,
+            block,
+            withdrawals[i].clone(),
+        );
         let outcome = ctrl2.advance(&attrs).await.unwrap_or_else(|e| {
             panic!(
                 "re-derive block {i}: EngineController::advance against the real node failed: {e}"

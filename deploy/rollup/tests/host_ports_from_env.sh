@@ -7,6 +7,7 @@ set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/fixtures/common.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/fixtures/check_stubs.sh"
 COMPOSE="$ROLLUP_DIR/docker-compose.yml"
+REAL_DOCKER="$(command -v docker || true)"   # the stub docker that setup_fixture puts on PATH shadows it
 
 # service  variable  default  container port
 TABLE='sequencer RPC_PORT 8545 8545
@@ -57,12 +58,12 @@ out="$(WS_PORT=70000 "$ROLLUP" init 2>&1)"; code=$?
 [[ $code -ne 0 ]] && grep -q '^PortInvalid: WS_PORT' <<<"$out" && pass "a port above 65535 is refused by name" || fail "a port above 65535 is refused by name" "exit=$code $out"
 
 # 4. docker compose config: defaults unchanged, and moving every variable moves every published port.
-if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+if [[ -n "$REAL_DOCKER" ]] && "$REAL_DOCKER" compose version >/dev/null 2>&1; then
   published() { # extra env assignments as arguments -> "service published" lines
     local cfg
     cfg="$(cd "$ROLLUP_DIR" && env -u RPC_PORT -u WS_PORT -u VERIFIER_RPC_PORT -u SEQUENCER_METRICS_PORT -u BATCHER_METRICS_PORT -u DERIVE_METRICS_PORT -u PROVER_METRICS_PORT \
       "$@" SEQUENCER_KEY_PATH=/x PAYER_KEYPAIR_PATH=/x CHAIN_ID=1 BLOCK_GAS_LIMIT=1 SOLANA_RPC_URL=x PROVER_DB_PASSWORD_FILE=/x \
-      docker compose --profile prover -f docker-compose.yml config --format json 2>&1)"
+      "$REAL_DOCKER" compose --profile prover -f docker-compose.yml config --format json 2>&1)"
     jq -r '.services | to_entries[] | .key as $s | (.value.ports // [])[] | "\($s) \(.target) \(.published)"' <<<"$cfg" | sort
   }
   def_out="$(published ENV_NONE=1)"

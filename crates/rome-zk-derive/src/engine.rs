@@ -98,7 +98,7 @@ fn payload_attrs_from(attrs: &Attributes) -> PayloadAttributes {
         timestamp: attrs.env.timestamp_secs,
         prev_randao: rule.prev_randao,
         suggested_fee_recipient: rule.beneficiary,
-        withdrawals: Some(vec![]),
+        withdrawals: Some(attrs.env.withdrawals.clone()),
         parent_beacon_block_root: Some(rule.parent_beacon_block_root),
         slot_number: None,
         target_gas_limit: Some(attrs.env.gas_limit),
@@ -309,10 +309,11 @@ impl<E: EngineApi> EngineController<E> {
             // happened to match. `rule` is the same call `payload_attrs_from` makes for the BUILD path
             // (module doc), so a resumed node checks a consolidated block against the identical rule a
             // freshly-built one is held to.
-            let rule = rome_zk_executor_api::canonical_header_rule(
+            let rule = rome_zk_executor_api::canonical_header_rule_with_withdrawals(
                 attrs.chain_id,
                 target_height,
                 attrs.env.coinbase,
+                &attrs.env.withdrawals,
             );
             let identity_matches = existing.timestamp == attrs.env.timestamp_secs
                 && existing.prev_randao == attrs.env.prev_randao
@@ -394,9 +395,10 @@ impl<E: EngineApi> EngineController<E> {
             || built.prev_randao != attrs.env.prev_randao
             || built.gas_limit != attrs.env.gas_limit
             || built_hashes != expected_hashes
+            || payload.payload_inner.withdrawals != attrs.env.withdrawals
         {
             return Err(PipelineError::Critical(format!(
-                "block {block_number}: built payload's committed identity (parent_hash/timestamp/prev_randao/gas_limit/ordered tx list) diverges from this batch's frame — strict policy"
+                "block {block_number}: built payload's committed identity (parent_hash/timestamp/prev_randao/gas_limit/ordered tx list/withdrawals) diverges from this batch's frame — strict policy"
             )));
         }
 
@@ -766,7 +768,9 @@ pub mod mock {
                     // from the same `canonical_header_rule` a later consolidation checks against.
                     beneficiary: attrs.suggested_fee_recipient,
                     extra_data: Bytes::new(),
-                    withdrawals_root: rome_zk_executor_api::EMPTY_WITHDRAWALS,
+                    withdrawals_root: rome_zk_executor_api::withdrawals_root(
+                        attrs.withdrawals.as_deref().unwrap_or_default(),
+                    ),
                     parent_beacon_block_root: attrs.parent_beacon_block_root.unwrap_or(B256::ZERO),
                     blob_gas_used: 0,
                     excess_blob_gas: 0,
@@ -790,7 +794,7 @@ pub mod mock {
                         block_hash,
                         transactions,
                     },
-                    withdrawals: vec![],
+                    withdrawals: attrs.withdrawals.clone().unwrap_or_default(),
                 },
                 blob_gas_used: 0,
                 excess_blob_gas: 0,
@@ -1225,6 +1229,62 @@ mod tests {
                 ..honest_existing_block(&a, B256::repeat_byte(0x13), B256::ZERO)
             },
         );
+        let mut ctrl = EngineController::new(mock, B256::ZERO, 0);
+        let err = ctrl.advance(&a).await.unwrap_err();
+        assert!(matches!(err, PipelineError::Critical(_)), "got {err:?}");
+    }
+
+    fn two_withdrawals() -> Vec<alloy_eips::eip4895::Withdrawal> {
+        vec![
+            rome_zk_executor_api::deposit_withdrawal(4, Address::repeat_byte(0x41), 1_000),
+            rome_zk_executor_api::deposit_withdrawal(5, Address::repeat_byte(0x42), 2_000),
+        ]
+    }
+
+    /// The block's withdrawals reach the engine's payload attributes in order, and a block without any
+    /// still sends the empty list it always sent.
+    #[test]
+    fn payload_attrs_from_carries_the_blocks_withdrawals() {
+        let mut a = attrs(11, vec![]);
+        a.env.withdrawals = two_withdrawals();
+        assert_eq!(payload_attrs_from(&a).withdrawals, Some(two_withdrawals()));
+        assert_eq!(
+            payload_attrs_from(&attrs(11, vec![])).withdrawals,
+            Some(vec![])
+        );
+    }
+
+    /// A block built with withdrawals reports their root, and a re-derive of the same block consolidates
+    /// against the rule with those withdrawals.
+    #[tokio::test]
+    async fn a_block_with_withdrawals_builds_then_consolidates() {
+        let mut a = attrs(1, vec![Bytes::from_static(b"tx-a")]);
+        a.env.withdrawals = two_withdrawals();
+        let mut ctrl = EngineController::new(MockEngineApi::default(), B256::ZERO, 0);
+        let start = ctrl.position();
+        let first = ctrl.advance(&a).await.unwrap();
+        assert!(!first.consolidated);
+        assert_eq!(
+            ctrl.engine().existing_blocks[&1].withdrawals_root,
+            rome_zk_executor_api::withdrawals_root(&two_withdrawals())
+        );
+        ctrl.rewind_to(start);
+        let again = ctrl.advance(&a).await.unwrap();
+        assert!(again.consolidated);
+        assert_eq!(again.block_hash, first.block_hash);
+    }
+
+    /// An existing block built with different withdrawals (here none) is not the block this batch names.
+    #[tokio::test]
+    async fn a_consolidated_block_without_the_batchs_withdrawals_is_critical() {
+        let mut mock = MockEngineApi::default();
+        let plain = attrs(1, vec![Bytes::from_static(b"tx-a")]);
+        mock.existing_blocks.insert(
+            1,
+            honest_existing_block(&plain, B256::repeat_byte(0x15), B256::ZERO),
+        );
+        let mut a = plain.clone();
+        a.env.withdrawals = two_withdrawals();
         let mut ctrl = EngineController::new(mock, B256::ZERO, 0);
         let err = ctrl.advance(&a).await.unwrap_err();
         assert!(matches!(err, PipelineError::Critical(_)), "got {err:?}");

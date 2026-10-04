@@ -106,7 +106,7 @@ fn frames_from_the_batchers_own_golden_vector_decode_to_identical_blocks_and_env
 
     // AttributesQueue — the committed BlockEnv for each block, using the shared prev_randao formula.
     for (block, expected_number) in decoded_blocks.iter().zip([0u64, 1]) {
-        let attrs = attributes::attributes_for_block(CHAIN_ID, Address::ZERO, block);
+        let attrs = attributes::attributes_for_block(CHAIN_ID, Address::ZERO, block, vec![]);
         assert_eq!(attrs.env.number, expected_number);
         assert_eq!(
             attrs.env.prev_randao,

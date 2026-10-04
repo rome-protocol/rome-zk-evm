@@ -3,9 +3,11 @@
 
 pub mod bridge;
 pub mod chain_id;
+pub mod chain_status;
 pub mod exit_config;
 pub mod init_cursor;
 pub mod migrate;
+pub mod pdas;
 pub mod refund_deposit;
 pub mod register;
 

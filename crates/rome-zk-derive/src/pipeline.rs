@@ -284,9 +284,18 @@ impl<R: AccountReader, E: EngineApi> DerivePipeline<R, E> {
             .expect("decode_batch rejects an empty block list")
             .number;
 
+        // The batch's deposits: the header's range checked against the records and the blocks' cursor, and
+        // each block's withdrawals built from them. Every check runs here, before the engine is touched.
+        let withdrawals = self.inbox.deposit_withdrawals(&batch_ref, &blocks).await?;
+
         let mut outcomes = Vec::with_capacity(blocks.len());
-        for block in &blocks {
-            let attrs = attributes::attributes_for_block(self.chain_id, self.fee_recipient, block);
+        for (block, block_withdrawals) in blocks.iter().zip(withdrawals) {
+            let attrs = attributes::attributes_for_block(
+                self.chain_id,
+                self.fee_recipient,
+                block,
+                block_withdrawals,
+            );
             outcomes.push(self.engine.advance(&attrs).await?);
         }
         Ok((last_block, outcomes))

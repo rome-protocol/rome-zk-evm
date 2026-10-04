@@ -9,7 +9,9 @@ pub mod inbox;
 pub mod verifier;
 pub mod wire;
 
-pub use inbox::{decode_block_range, fetch_and_verify_batch, BatchAccount, InboxError};
+pub use inbox::{
+    decode_block_range, fetch_and_verify_batch, fetch_deposit_records, BatchAccount, InboxError,
+};
 pub use wire::{write_slice_frame, DepositInput, RomePublicInput, RomeWitnessInput};
 
 /// `keccak(rlp(header))` — used to anchor `parent_hash` in [`build::ExpectedPublicValues`], the same hash

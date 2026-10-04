@@ -8,12 +8,12 @@ setup_fixture
 
 refuses() { # $1=label $2=expected name $3=chain.toml
   local label="$1" name="$2" toml="$3"
-  : > "$WORK/cargo_calls"; rm -rf "$WORK/o-r"
+  : > "$WORK/ops_calls"; rm -rf "$WORK/o-r"
   if out="$(CHAIN_TOML="$toml" ROLLUP_OUT="$WORK/o-r" "$ROLLUP" init 2>&1)"; then fail "init refuses: $label" "exited 0"
   elif grep -q "^$name" <<<"$out" && grep -q 'fee_recipient' <<<"$out"; then pass "init refuses by name ($name): $label"
   else fail "init refuses by name ($name): $label" "$out"; fi
   [[ ! -e "$WORK/o-r/genesis.json" ]] || fail "nothing rendered after $name ($label)" "genesis.json exists"
-  grep -q 'chain-id' "$WORK/cargo_calls" && fail "no network call after $name ($label)" "$(cat "$WORK/cargo_calls")"
+  grep -q 'chain-id' "$WORK/ops_calls" && fail "no network call after $name ($label)" "$(cat "$WORK/ops_calls")"
 }
 
 # Missing: the key is absent, or empty.

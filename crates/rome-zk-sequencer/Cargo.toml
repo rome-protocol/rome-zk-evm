@@ -42,6 +42,14 @@ rome-zk-profile = { path = "../rome-zk-profile" }
 # `header` so every existing call site keeps compiling; the batcher, derive and the indexer read the same
 # crate directly.
 rome-zk-log = { path = "../rome-zk-log" }
+rome-zk-layouts = { path = "../rome-zk-layouts" }
+# Deposits (`src/deposits.rs`): the sequencer READS the Solana queue at finalized commitment through the one
+# configured RPC and sends nothing. Same workspace pins as the batcher and derive.
+solana-program.workspace = true
+solana-client.workspace = true
+solana-commitment-config.workspace = true
+# `describe_rpc_error`: a Solana RPC error's text carries the request URL, and the URL often carries a key.
+rome-zk-solana-sender = { path = "../rome-zk-solana-sender" }
 rome-zk-executor-reth = { path = "../rome-zk-executor-reth", optional = true }
 # `src/node.rs`'s standalone reth RPC surface (`RpcModuleBuilder` + `EthApiBuilder`
 # over this crate's own `ProviderFactory` clone, `examples/rpc-db` in the pinned reth tree — see

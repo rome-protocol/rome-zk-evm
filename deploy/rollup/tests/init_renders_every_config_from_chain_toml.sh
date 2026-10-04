@@ -15,7 +15,8 @@ for f in sequencer-config.toml genesis.json batcher.toml derive.toml jwt.hex com
 done
 
 # The chain id is read from Solana (stubbed here: authority StubAuthority..., nonce 0 -> 4295391538), not chosen.
-grep -q 'chain-id --keypair '"$WORK/keys/payer.json"' --settlement FixtureBprogram11111111111111111111111111112 --rpc-url https://rpc.example.invalid' "$WORK/cargo_calls" && pass "init asked the chain-id command for the payer's id, with the settlement program and RPC from the config" || fail "init calls chain-id" "$(cat "$WORK/cargo_calls" 2>/dev/null)"
+grep -qx 'chain-id --settlement FixtureBprogram11111111111111111111111111112 --keypair /keys/payer' "$WORK/ops_calls" && pass "init asked rome-zk-ops chain-id for the payer's id, with the settlement program from the config" || fail "init calls chain-id" "$(cat "$WORK/ops_calls" 2>/dev/null)"
+grep -q "source=$WORK/keys/payer.json,target=/keys/payer,readonly" "$WORK/ops_mounts" && pass "init mounted the payer key read-only by its path" || fail "init mounts the payer key read-only" "$(cat "$WORK/ops_mounts" 2>/dev/null)"
 has() { grep -qE -- "$2" "$OUT/$1" && pass "$1: $3" || fail "$1: $3" "no match for /$2/ in $(head -c 300 "$OUT/$1" 2>/dev/null)"; }
 has sequencer-config.toml '^chain_id = 4295391538$' "chain_id is the derived id"
 has chain-id.env '^AUTHORITY=StubAuthority1111111111111111111111111111111$' "the authority is recorded"
@@ -102,7 +103,7 @@ refuses "no .env file" EnvMissing ROLLUP_ENV="$WORK/none.env" ROLLUP_OUT="$WORK/
 refuses "no chain.toml" ChainTomlMissing CHAIN_TOML="$WORK/none.toml" ROLLUP_OUT="$WORK/o4"
 { echo 'chain_id = 200101'; cat "$FIX/chain.toml"; } > "$WORK/bad1.toml"; refuses "a chosen chain_id" ChainIdNotChosen CHAIN_TOML="$WORK/bad1.toml" ROLLUP_OUT="$WORK/o5"
 refuses "no payer keypair" PayerKeyMissing PAYER_KEYPAIR_PATH="$WORK/keys/none.json" ROLLUP_OUT="$WORK/o9"
-printf '#!/bin/sh\necho "error: rpc down" >&2\nexit 1\n' > "$WORK/failcargo"; chmod +x "$WORK/failcargo"; mkdir -p "$WORK/failbin"; cp "$WORK/failcargo" "$WORK/failbin/cargo"
+mkdir -p "$WORK/failbin"; printf '#!/bin/sh\necho "error: rpc down" >&2\nexit 1\n' > "$WORK/failbin/docker"; chmod +x "$WORK/failbin/docker"
 refuses "the chain-id lookup failing" ChainIdLookupFailed PATH="$WORK/failbin:$PATH" ROLLUP_OUT="$WORK/o10"
 refuses "a derived id below 2^32" ChainIdInvalid STUB_ID=1000 ROLLUP_OUT="$WORK/o11"
 printf '' > "$WORK/emptyportal.hex"

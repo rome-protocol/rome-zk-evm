@@ -5,10 +5,10 @@ files and a machine with Docker. You do not need a cloud account, and nothing he
 Settling on Solana also needs an NVIDIA GPU for the prover.
 
 You need an x86-64 Linux machine with bash 4 or newer, Git, Docker Engine 28 or newer with the Compose plugin,
-curl, jq, openssl, the Solana CLI, Python 3.11 or newer, a C compiler, and rustup with cargo. The repository pins the Rust
-toolchain, and rustup installs it on the first build. On Debian or Ubuntu, run `sudo apt install build-essential`
-for the compiler. The first `./rollup init` compiles the client that reads your chain id from Solana, so it
-takes a few minutes. Older Docker engines can expose ports bound to 127.0.0.1 to other machines.
+curl, jq, openssl, the Solana CLI and Python 3.11 or newer. You do not need Rust or a compiler: everything the
+`rollup` command does on Solana runs inside the node image, so the first command that talks to Solana pulls the image
+(set `ROME_ZK_TAG` first, see [The node image](#the-node-image)). Older Docker engines can expose ports bound to
+127.0.0.1 to other machines.
 
 ## What a full run needs
 
@@ -24,7 +24,7 @@ permissionless registration, with a 5 SOL registration deposit and a 0.001 SOL f
 posted. The reclaim window is 6,480,000 slots, about 30 days at 400 ms per slot. After that, anyone
 can reclaim a chain that has never posted a root. Its root, registry and chain
 configuration accounts close. Their SOL, including the deposit, goes to the treasury, and its batcher
-stops. The deposit is refundable to the chain authority after one final root or ten posted roots.
+stops. The deposit is refundable to the chain authority after one final root or ten posted roots. `./rollup refund-deposit --confirm` sends it back.
 
 Set `SOLANA_RPC_URL` in `.env` to any Solana devnet RPC endpoint you use. A provider endpoint is more reliable
 than the public endpoint under load.
@@ -32,7 +32,7 @@ than the public endpoint under load.
 This folder contains the node and prover configuration and the `rollup` commands; it does not yet include the
 command to build your chain's guest. The tests here run without the Solana programs.
 
-## The four commands
+## The commands
 
 Copy `.env.example` to `.env` and `chain.toml.example` to `chain.toml`, then edit both. `.env` holds this machine's
 settings: your Solana RPC URL, the paths to your key files, who may reach the RPC. `chain.toml` describes the chain
@@ -46,6 +46,8 @@ program derives it from your payer key and the number of chains that key has reg
 ./rollup up                  # start the node
 ./rollup check               # health check
 ```
+
+These four set a chain up. The rest of the commands are listed under [Operating the chain](#operating-the-chain).
 
 The node can run after `init` and `register --confirm`. To settle roots, you need a guest built for your
 genesis and its verification key registered by Rome. If the sequencer is not running, registration starts
@@ -125,7 +127,65 @@ built for your chain's genesis, [open an issue on rome-protocol/rome-zk-evm](htt
 registry authority. Until then, your chain has no verification key on Solana.
 
 `up` starts the services. `./rollup up sequencer` starts just that one. `check` tells you, by name, which service is
-missing or unhealthy, then compares the chain id, the heads, the batcher's progress, the inbox and the roots.
+missing or unhealthy, then compares the chain id, the heads, the batcher's progress, the inbox and the roots. Its items
+are listed under [What `check` looks at](#what-check-looks-at).
+
+## Operating the chain
+
+Every command that sends a Solana transaction is a dry run unless you add `--confirm`. A dry run reads the chain, prints
+the transaction it would send and sends nothing. `--offline` is a dry run with no network at all, and `--confirm` with
+`--dry-run` or `--offline` is refused with `ConfirmAndDryRun`. Each command runs `rome-zk-ops` from the node image, so
+`ROME_ZK_TAG` (or `ROME_ZK_IMAGE`) must be set. Your payer key is mounted into that container read-only for the one
+command and is never printed. Run `init` first: the commands read the chain from `rendered/`.
+
+| Command | What it does |
+| --- | --- |
+| `./rollup status` | the running services, then what Solana says about the chain: slot, last pending and final batch, the reclaim deadline, the deposit and whether a verification key is active |
+| `./rollup logs [-f] [--tail N] [service...]` | the services' logs, the last 200 lines each by default |
+| `./rollup down` | stops and removes the containers; the data volumes stay, so the chain's data is safe |
+| `./rollup refund-deposit [--confirm]` | gives the registration deposit back to the chain authority |
+| `./rollup exit-config propose ... [--confirm]` | proposes a new exit portal, bridge program, cap or poster bond (see [Exits](#exits)) |
+| `./rollup exit-config activate [--confirm]` | activates a proposal once its slot has passed |
+| `./rollup exit-config show` | prints the exit configuration and any pending change |
+| `./rollup vault init\|fund\|show` | creates, funds and reads your chain's vault (see [Your chain's vault](#your-chains-vault)) |
+| `./rollup release-exit --message-hash 0x... [--confirm]` | releases a proved exit from the vault to its recipient |
+| `./rollup migrate --registry-keypair FILE --max-drift-secs N [--confirm]` | brings an older chain's accounts forward; only the registry authority can run it |
+
+A refusal always starts with its name, for example `NothingProposed` or `KeyFileMissing`, and nothing is sent.
+
+## What `check` looks at
+
+`./rollup check` prints `PASS`, `FAIL`, `WARN` or `SKIP` for each item, names every failure, and exits non-zero
+when any item failed. A `WARN` is shown but does not fail the run. An item that cannot be judged because a service
+is not running is skipped with the reason.
+
+| Item | Passes when | Fails by name |
+| --- | --- | --- |
+| service | each service is running | `ServiceMissing` |
+| chain id, sequencer head, derive lag, verifier peers | the chain id matches, blocks (or the idle counter) advance, the verifier keeps pace and has no peers | `ChainIdMismatch`, `SequencerStalled`, `DeriveBehind`, `VerifierHasPeers` |
+| batcher cursor, inbox batches, roots | the accounts on Solana read, and the sequencer is not two batches' worth of blocks ahead of the posted batches | `CursorUnreadable`, `NoBatchPosted`, `BatcherBehind`, `RootUnreadable` |
+| batches finalized | blocks were sealed and the batcher finalized a batch since the first sample from at least the window ago | `BatchesNotFinalizing` |
+| settlement lag, prover lag (`PROVER=on`) | the prover is at most 2 batches behind | `SettlementBehind`, `ProverBehind` |
+| verification key (`PROVER=on`) | a verification key for the proving layout is active in the registry | `VkeyNotActive` |
+| payer balance | the payer holds at least the floor | `PayerBelowFloor` |
+| reclaim deadline | the chain has posted a root, or the deadline is further away than the margin | `ReclaimDeadlineNear` inside the margin, `ReclaimDeadlinePassed` once it is over |
+| exit config | the exit configuration reads, and is shown | `ExitConfigUnreadable` |
+
+The batcher's own age gauge resets each time a batch closes by age and stands still while the batcher waits on Solana,
+so it cannot see a stuck batcher. `check` compares two counters instead: blocks the sequencer sealed and batches the
+batcher finalized. Each run records both in `rendered/check-samples`. From the first sample at least the window old, if
+blocks were sealed and no batch finalized, the batcher is stuck, which is the same rule the
+`RomeZkBatchesNotFinalizing` alert in [`docs/monitoring/alerts.example.yml`](../../docs/monitoring/alerts.example.yml) uses. So run
+`./rollup check` on a timer (every few minutes): the first run only records a sample and says so, and the item
+judges from the second run on. A restart of either process resets its counter, and a sample from before a reset is not used.
+
+Settings, each in `.env` or the environment:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `PAYER_FLOOR_LAMPORTS` | 1000000000 (1 SOL) | the payer balance below which `check` fails |
+| `RECLAIM_MARGIN_SLOTS` | 108000 (about 12 hours) | `check` fails when fewer slots than this are left before anyone can reclaim a chain that has not posted a root |
+| `CHECK_FINALIZE_WINDOW_SECS` | the larger of 900 and four times `BATCH_CLOSE_AFTER_SECS` | how long blocks may go without a batch finalizing |
 
 ## What runs
 
@@ -235,10 +295,13 @@ image you built from this tree yourself, set `ROME_ZK_IMAGE` to its full referen
 
 The genesis carries the exit portal, the contract where a withdrawal starts, at `0x4200000000000000000000000000000000000016`.
 New chains start with no exit portal configured and an exit cap of zero, so exits are off. The chain authority
-can use the settlement client's `governance` example with `propose-exit-config` to set the portal,
-bridge program and cap.
-After at least one 172,800-slot challenge window, anyone can send `activate-exit-config`. A final root
-and a funded vault are also needed to release an exit. On devnet, exits are paid from the shared zk-bridge program
+can run `./rollup exit-config propose` to set any of the portal (`--exit-portal 0x...`), the bridge program
+(`--bridge-program`), the cap (`--exit-cap`) and the poster bond (`--poster-bond`), with either `--activation-slot N` or
+`--activation-delay-slots N`. It prints what it would send until you add `--confirm`. Once the activation slot has
+passed, which is at least one 172,800-slot challenge window away, `./rollup exit-config activate --confirm` makes it
+current, and `./rollup exit-config show` prints the current values and anything pending. `./rollup check` shows the same
+exit configuration. A final root and a funded vault are also needed to release an exit; once an exit is proved,
+`./rollup release-exit --message-hash 0x... --confirm` pays it out of the vault. On devnet, exits are paid from the shared zk-bridge program
 listed in `programs.devnet.json`, out of your chain's own vault.
 
 ## Your chain's vault
@@ -248,33 +311,27 @@ Only the chain authority (your payer key) can create it, and only after `registe
 chosen when it is created. A backed balance needs the wrapped SOL mint,
 `So11111111111111111111111111111111111111112`, which has 9 decimals.
 
-Run these from this directory, with your chain id from `rendered/chain-id.env` and your Solana RPC URL from `.env`.
-The first run compiles the client. `init-vault` and `fund` print what they would send and send nothing until you add
+Run these from this directory after `init`; they take the chain id, the Solana RPC URL, your payer key and the program
+addresses from `rendered/` and `.env`. `vault init` and `vault fund` print what they would send and send nothing until you add
 `--confirm`.
 
 ```sh
-cargo run -p zk-bridge-client --example vault --features devnet-driver -- init-vault \
-  --authority-keypair keys/payer.json \
-  --mint So11111111111111111111111111111111111111112 --mint-decimals 9 \
-  --settlement 8anSjJZu5vgfNbESPLoKudVBNEraDZASwKJnkDLTCaGo \
-  --bridge 27TbMDUyVynpFpqeKygpUMcDzWKHfW4k9aRN5yCysLEQ \
-  --chain-id <your chain id> --rpc-url <your Solana RPC URL>
+./rollup vault init                  # dry run; wrapped SOL, 9 decimals by default
+./rollup vault init --confirm
 ```
+
+`init` takes `--mint M` and `--mint-decimals N` for another mint.
 
 `fund` moves the amount from the funding key's wrapped SOL token account (its associated token account for that
 mint), so wrap the SOL first, for example with `spl-token wrap`, which comes with the Solana CLI. For a backed
 balance, `--amount` is the lamport amount `init` printed. Anyone can fund a vault.
 
 ```sh
-cargo run -p zk-bridge-client --example vault --features devnet-driver -- fund \
-  --payer-keypair keys/payer.json --amount <lamports> \
-  --settlement 8anSjJZu5vgfNbESPLoKudVBNEraDZASwKJnkDLTCaGo \
-  --bridge 27TbMDUyVynpFpqeKygpUMcDzWKHfW4k9aRN5yCysLEQ \
-  --chain-id <your chain id> --rpc-url <your Solana RPC URL>
+./rollup vault fund --amount <lamports>
+./rollup vault fund --amount <lamports> --confirm
 ```
 
-`show-vault`, with the same `--settlement`, `--bridge`, `--chain-id` and `--rpc-url`, prints the vault and its
-balance.
+`./rollup vault show` prints the vault and its balance.
 
 ## Key files
 

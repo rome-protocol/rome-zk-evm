@@ -70,9 +70,15 @@ encodes with this crate's types and decodes with the fork's own, and the reverse
 
 **Wire v3 (deposits):** `RomePublicInput` appends the deposit range after `blocks` — `settlement_program`,
 `deposit_from`, `deposit_hash_from` and `deposits` (`DepositInput { sender, recipient, amount_gwei }`).
-`build_batch_input` writes the empty range for now: the batch account's settlement program, `deposit_from` 0,
-`deposit_hash_from` = `h_0(settlement_program, chain_id)` (the cursor's value on a chain that never took a
-deposit) and no deposits; real ranges arrive with the batch header v3. The two committed fixtures were migrated
+`build_batch_input` takes the deposit range from the batch header: a v3 header gives `deposit_from` and
+`deposit_hash_from`, and the records `[from, to)` become `deposits`. `inbox::fetch_deposit_records` reads those
+records the way `fetch_and_verify_batch` reads the chunks (one paged `getMultipleAccounts` over the record
+addresses under the bridge program, decoded through `rome_zk_layouts::deposit_queue`) and checks every record's
+`hash_after` and the chain's end against the header; `build_batch_input` checks the count and the end hash again.
+`fetch_and_verify_batch` now recomputes `acc` with the header's range, so a v3 batch verifies. A v2 header has no
+range: the batch keeps the deposit-free fields (its settlement program, `deposit_from` 0, `deposit_hash_from` =
+`h_0(settlement_program, chain_id)`, no deposits) and needs no bridge program. The command-line tool takes the bridge
+program as `--bridge`, needed only when the header names deposits. The two committed fixtures were migrated
 from v2 by `wire::tests::migrate_the_committed_fixtures_from_wire_v2_to_v3` (ignored, run once); the standing
 test `committed_fixtures_are_wire_v3_with_every_v2_field_unchanged` pins the v2 bytes' hashes and proves
 every v2 field and the witness frame are unchanged. **Flag day:** a v2 ELF cannot read v3 input and the
