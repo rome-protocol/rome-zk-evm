@@ -93,6 +93,9 @@ alloy-rlp = { version = "0.3", features = ["derive"] }
 # depends on this one; Cargo explicitly allows a dev-dependency cycle (never an ordinary one) since dev-
 # dependencies never build when `rome-zk-derive` itself compiles this crate as a normal dependency.
 rome-zk-derive = { path = "../rome-zk-derive" }
+# Tests write a block's deposit credits to the ordered log through `deposit_withdrawal`, the one constructor of a
+# deposit's withdrawal, never by hand.
+rome-zk-executor-api = { path = "../rome-zk-executor-api" }
 rome-zk-testkit = { path = "../rome-zk-testkit" }
 tempfile = "3"
 # `with_retry`'s own tests drive its exponential backoff under a

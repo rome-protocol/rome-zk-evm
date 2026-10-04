@@ -1,9 +1,10 @@
 # zk-bridge-client
 
 A thin, async-runtime-agnostic client for [`programs/zk-bridge`](../../programs/zk-bridge): instruction
-builders, PDA derivation, and account decoding for the vault config account. Mirrors
-[`zk-settlement-client`](../zk-settlement-client)'s own shape and reasoning — no async runtime opinions;
-this crate only builds `Instruction`s and decodes bytes, sending transactions is the caller's job.
+builders, PDA derivation, and account decoding for the vault config account. Like
+[`zk-settlement-client`](../zk-settlement-client), it has no async runtime opinions: this crate only builds
+`Instruction`s and decodes bytes, and sending transactions is the caller's job. The operator commands that
+send them are in [`rome-zk-ops`](../rome-zk-ops).
 
 ## What it provides
 
@@ -22,69 +23,62 @@ this crate only builds `Instruction`s and decodes bytes, sending transactions is
 - `create_recipient_ata_idempotent_ix(payer, recipient, mint)` — Associated Token Program
   `CreateIdempotent`: creates the recipient's ATA if it does not exist yet, a documented no-op if it does.
   `programs/zk-bridge/src/release.rs` only derives and checks `recipient_ata`, never creates it — this is
-  what the `release-exit` example (below) prepends to every `ReleaseExit` it sends, so a first-time
-  recipient's missing ATA never blocks a release.
+  what `rome-zk-ops release-exit` prepends to every `ReleaseExit` it sends, so a first-time recipient's
+  missing ATA never blocks a release.
 - `decode_vault_config_account` — decodes a `vault_config` account's bytes into `chain_id`,
   `settlement_program`, `mint`, `mint_decimals`, `authority`.
 - `check_vault_settlement(cfg, expected_settlement)` — `vault_config`'s address is a PDA *derived from* a
   caller-supplied `settlement_program`, so nothing on the wire stops a stale/mistyped/wrong-network value
   from resolving to some account this program owns whose *recorded* `settlement_program` disagrees with
   what was intended. Refuses `VaultSettlementMismatch` when the decoded account's own field does not
-  match; the `vault` example's `fund` subcommand runs this before building `fund_ix`, let alone sending it.
+  match; `rome-zk-ops vault fund` runs this before building `fund_ix`, let alone sending it.
+- `vault_tool` — the planning logic behind `rome-zk-ops vault`, kept here so its tests run over fakes:
+  `plan_init_vault` (an existing vault is reported and never created again), `plan_fund` (refuses
+  `VaultSettlementMismatch` before any instruction is built), `describe_vault` for `vault show`, and `execute`,
+  which sends exactly once with `--confirm` and never in a dry run.
 
-## The `vault` example (operator tool)
+## Operator commands: `rome-zk-ops vault` and `rome-zk-ops release-exit`
 
-`init-vault`, `fund`, `show-vault` for `programs/zk-bridge`'s vault — same shape as `release-exit`
-(subcommands mirror `zk-settlement-client/examples/governance.rs`'s own shape): keys always read from FILE
-PATHS and never printed, **`--dry-run` is the DEFAULT** wherever a send is possible, `--confirm` opts in.
-Every account list comes straight from `zk_bridge_client::{init_vault_ix, fund_ix}`.
+Use [`rome-zk-ops`](../rome-zk-ops): `vault init`, `vault fund` and `vault show` create, fund and show a
+chain's vault, and `release-exit` releases a proved exit to its recipient. Each is a dry run unless
+`--confirm` is given, reads keys from file paths and never prints them, and sends one V1 transaction
+through `rome-zk-solana-sender`. Their flags and refusals are in that crate's README.
 
 ```sh
-# Idempotent — a second run against an already-initialized vault prints its decoded vault_config and
-# does nothing else. authority is BOTH the payer and the chain authority (must equal the settlement
-# root.authority for chain-id).
-cargo run -p zk-bridge-client --example vault --features devnet-driver -- \
-  init-vault --authority-keypair /path/to/chain_authority.json \
+# Creates the vault. The authority is both the payer and the chain authority, and must equal the
+# settlement root's authority for the chain. A vault that already exists is reported and nothing is sent.
+rome-zk-ops vault init --authority-keypair /path/to/chain_authority.json \
   --mint <mint pubkey> --mint-decimals 6 \
-  --settlement <settlement program pubkey> --bridge <zk-bridge program pubkey> --chain-id <u64> \
-  [--rpc-url URL] [--confirm]
+  --settlement <settlement program pubkey> --bridge <zk-bridge program pubkey> --chain-id <u64> [--confirm]
 
-# Permissionless. Reads vault_config back on-chain and derives the mint/funder ATA from it — never a
-# re-typed --mint. Refuses by name (VaultSettlementMismatch) before building fund_ix if the vault this
-# address resolves to does not actually belong to --settlement.
-cargo run -p zk-bridge-client --example vault --features devnet-driver -- \
-  fund --payer-keypair /path/to/funder.json --amount <u64, raw units> \
-  --settlement <settlement program pubkey> --bridge <zk-bridge program pubkey> --chain-id <u64> \
-  [--rpc-url URL] [--confirm]
+# Anyone can fund. Reads vault_config back and derives the mint and the funder's token account from it.
+# Refused by name (VaultSettlementMismatch) before fund_ix is built if the vault does not belong to --settlement.
+rome-zk-ops vault fund --payer-keypair /path/to/funder.json --amount <u64, raw units> \
+  --settlement <settlement program pubkey> --bridge <zk-bridge program pubkey> --chain-id <u64> [--confirm]
 
-# Read-only, no signer: decodes vault_config and prints the vault's own SPL token balance.
-cargo run -p zk-bridge-client --example vault --features devnet-driver -- \
-  show-vault --settlement <settlement program pubkey> --bridge <zk-bridge program pubkey> \
-  --chain-id <u64> [--rpc-url URL]
+# Read-only: decodes vault_config and prints the vault's token balance.
+rome-zk-ops vault show --settlement <settlement program pubkey> --bridge <zk-bridge program pubkey> \
+  --chain-id <u64>
+
+# Reads the exit_record for the message hash (refused by name if it does not exist or is not PROVED) and the
+# vault, derives the recipient's token account, and sends [create_recipient_ata_idempotent_ix, release_exit_ix].
+rome-zk-ops release-exit --settlement <settlement program pubkey> --bridge <zk-bridge program pubkey> \
+  --chain-id <u64> --message-hash 0x<32 bytes> --payer-keypair /path/to/payer.json [--confirm]
 ```
 
-Every chain read happens before any keypair is touched and before branching on `--dry-run`/`--confirm` —
-an unreachable RPC, a not-yet-created vault (`fund`), or a settlement mismatch (`fund`) all fail loud, by
-name, in EITHER mode, the same "reads before keys, before branches" shape `release-exit.rs` already uses.
+Add `--rpc-url URL` to each command to choose the Solana endpoint.
 
-## The `release-exit` example (operator tool)
+The `vault` example (`init-vault`, `fund`, `show-vault`) and the `release-exit` example are thin wrappers over
+these commands, kept so scripts that call them keep working. They take the same flags and keep the same
+default, a dry run unless `--confirm` is given:
 
-```
-cargo run -p zk-bridge-client --example release-exit --features devnet-driver -- \
-  --settlement <settlement program pubkey> --bridge <zk-bridge program pubkey> \
-  --chain-id <u64> --message-hash 0x<32 bytes> --payer-keypair /path/to/payer.json \
-  [--rpc-url URL] [--confirm]
+```sh
+cargo run -p zk-bridge-client --example vault --features devnet-driver -- init-vault ...
+cargo run -p zk-bridge-client --example release-exit --features devnet-driver -- --settlement ... --confirm
 ```
 
-Reads the settlement `exit_record` for `message_hash` (refuses by name if it does not exist, or exists
-but is not `PROVED`) and the vault's `vault_config` (for its mint), derives the recipient's ATA, and
-builds `[create_recipient_ata_idempotent_ix, release_exit_ix]` as one transaction — printing every
-account before doing anything else. **`--dry-run` is the DEFAULT**: both instructions are signed against
-an all-zero placeholder blockhash and printed as base64, nothing is sent to any cluster (mirrors
-`zk-settlement-client/examples/governance.rs`'s own `--dry-run` shape). Only `--confirm` sends for real.
-Both chain reads happen before the payer keypair is ever touched and before either branch, so an
-unreachable RPC or a not-yet-proved record fails loud, by name, in EITHER mode — this tool never silently
-proceeds toward a send it cannot justify.
+The `devnet-driver` feature is empty now. It stays so commands that pass it keep working; the library pulls in
+no RPC client or async runtime either way.
 
 ## Building a real `ReleaseExit` transaction
 

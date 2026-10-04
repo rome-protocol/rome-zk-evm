@@ -37,8 +37,19 @@ it. Splitting it out gives that machinery one home instead of a second copy per 
   `solana-client`'s V1-generation nonblocking RPC client, with retry (`with_retry`, exponential backoff)
   around every one of them.
 - **`bumped_priority_fee`/`priority_lamports`** — the priority-fee doubling-with-cap schedule and the
-  µL/CU-price-to-flat-lamports conversion (mirrors the Rome SDK's V1 batch formula; an
-  independently-tested duplication, not a dependency, since that crate lives in a different repo).
+  V1 priority-fee formula, `ceil(cu * price / 1e6)` lamports for a µL/CU price, independently tested.
+- **Co-signers** — `TxSigner` is what signs a transaction: a `Keypair` alone, or `PayerAndCosigners`, a fee
+  payer plus further required signers. `RpcSender::with_cosigners` adds keys that sign after the payer; a
+  required signer missing from the set fails the build with `SenderError::MissingSigner` before anything is
+  sent. Long-running services sign with the payer alone; the operator CLI uses co-signers, for a reserved
+  registration for example.
+- **Compute retry** — `Sender::send_and_confirm_many_retrying_compute` resends a transaction once, unchanged
+  except for a higher compute-unit limit, when it failed on chain for running out of compute units
+  (`is_compute_exceeded`, `sender_error_is_compute_exceeded`). A retry limit not above the base limit turns
+  the retry off. `RpcSender` does the retry inside its batched confirm loop; the batcher's chunk lane uses it.
+- **`build_v1_tx`** builds a V1 transaction exactly as a real send does, for a caller that only measures its
+  wire size. **`required_loaded_accounts_bytes`** is the loaded-accounts size formula, `Σ(64 + len)` over every
+  account a transaction loads. **`RPC_REQUEST_TIMEOUT`** (20 s) bounds each HTTP request to the RPC node.
 - **`SendTuning`** — per-send tuning. `confirm_commitment` (`ConfirmCommitment::Finalized` by default, so
   "sent" means final; `Confirmed` is selectable) is the level a send must reach; `confirm_timeout` (default
   15 s, `DEFAULT_CONFIRM_TIMEOUT_SECS`) sets the overall ceiling (ten times it) after which a send stops resubmitting
@@ -83,6 +94,7 @@ the real codec constants), the same accepted dev-only cycle already in use betwe
   `rome_zk_batcher::sender` module path (`sender.rs` is now a one-line `pub use`), so no existing call site
   or test in that crate changed. `pipeline.rs` builds `FramePlan`s from grouped batches; `resolve.rs` and
   `config.rs` use the re-exported per-call caps and the `compat` conversions directly.
-- The prover orchestrator's `PostRootProved` poster, the challenger's dispute-resolution transactions, and
-  governance tooling are the crate's other intended consumers — the same V1 send/confirm machinery,
-  none of them touching the batcher's own channel/grouping/anchor logic to reach it.
+- **`rome-zk-prover`** (its `PostRootProved` poster), **`rome-zk-exit-prover`** (`ProveExit`) and
+  **`rome-zk-ops`** (every operator command) use it directly. None of them touches the batcher's own
+  channel, grouping or anchor logic to reach it. `programs/zk-settlement`'s tests use its `compat`
+  conversions to measure real V1 transaction sizes.

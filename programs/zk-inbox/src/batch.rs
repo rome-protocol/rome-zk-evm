@@ -5,8 +5,9 @@
 //!
 //! ## Account layout (fixed, byte-exact — not borsh; see the module-level rationale in `lib.rs`)
 //!
-//! Defined once in `rome_zk_layouts::batch` (re-exported here as `MAGIC`/`VERSION`/`HEADER_LEN`/the
-//! `OFF_*` offsets/`bitmap_len`/`leaves_offset`/`account_len`) so this program and `zk-inbox-client`
+//! Defined once in `rome_zk_layouts::batch` (re-exported here as `MAGIC`/`VERSION`/`HEADER_LEN_V2`/the
+//! `OFF_*` offsets/`bitmap_len`; the lengths and offsets that depend on the header version are
+//! `header_len`/`leaves_offset_for`/`account_len_for`, which take the account's version byte) so this program and `zk-inbox-client`
 //! read and write the identical bytes:
 //! ```text
 //! magic 'ZKBT' u32 | version u8 | chain_id u64 | batch u64 | open_slot u64 | expected_count u32
@@ -81,9 +82,9 @@ use solana_program::{
 use solana_system_interface::{instruction as system_instruction, program as system_program};
 
 pub use rome_zk_layouts::batch::{
-    account_len, bitmap_len, leaves_offset, HEADER_LEN, MAGIC, OFF_ACC, OFF_AUTHORITY, OFF_BATCH,
-    OFF_CHAIN_ID, OFF_EXPECTED_COUNT, OFF_FINALIZED, OFF_FINALIZE_CURSOR, OFF_FORCED_ROOT,
-    OFF_LEAVES_PRESENT, OFF_MAGIC, OFF_OPEN_SLOT, OFF_OPEN_UNIX_TS, OFF_ROOT,
+    account_len_for, bitmap_len, header_len, leaves_offset_for, MAGIC, OFF_ACC, OFF_AUTHORITY,
+    OFF_BATCH, OFF_CHAIN_ID, OFF_EXPECTED_COUNT, OFF_FINALIZED, OFF_FINALIZE_CURSOR,
+    OFF_FORCED_ROOT, OFF_LEAVES_PRESENT, OFF_MAGIC, OFF_OPEN_SLOT, OFF_OPEN_UNIX_TS, OFF_ROOT,
     OFF_SETTLEMENT_PROGRAM, OFF_VERSION, VERSION,
 };
 
@@ -152,7 +153,7 @@ fn pubkey_at(d: &[u8], o: usize) -> Pubkey {
     Pubkey::new_from_array(d[o..o + 32].try_into().unwrap())
 }
 
-/// Validates the header magic/version and returns `(chain_id, batch, expected_count)` — the 3 fields
+/// Validates the header magic/version (2 or 3) and returns `(version, chain_id, batch, expected_count)` — the 3 fields
 /// `SealLeaf`/`FinalizeBatch` need on every call. Reads only those 3 fields directly by offset rather
 /// than through `rome_zk_layouts::batch::read` (which also decodes 5 unused `[u8; 32]` fields): measured
 /// at +23.5k CU on the 900-leaf `FinalizeBatch` path when this used the full decode instead (369,406 vs
@@ -160,11 +161,19 @@ fn pubkey_at(d: &[u8], o: usize) -> Pubkey {
 /// `close_chunk_check` and `abandon_batch_inner` (each called at most once per instruction, never in a
 /// per-leaf loop) use the full decode for the extra fields they need. Does not check the account's
 /// owner — callers must do that themselves (they already have `program_id` in scope).
-fn read_header(d: &[u8]) -> Result<(u64, u64, u32), ProgramError> {
-    if d.len() < HEADER_LEN || u32_at(d, OFF_MAGIC) != MAGIC || d[OFF_VERSION] != VERSION {
+fn read_header(d: &[u8]) -> Result<(u8, u64, u64, u32), ProgramError> {
+    if d.len() <= OFF_VERSION || u32_at(d, OFF_MAGIC) != MAGIC {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    // Accepts header v2 and v3 and returns the account's own version byte; every length and offset the
+    // callers need comes from the version-taking forms in `rome_zk_layouts::batch`.
+    let version = d[OFF_VERSION];
+    let need = header_len(version).map_err(|_| ProgramError::InvalidAccountData)?;
+    if d.len() < need {
         return Err(ProgramError::InvalidAccountData);
     }
     Ok((
+        version,
         u64_at(d, OFF_CHAIN_ID),
         u64_at(d, OFF_BATCH),
         u32_at(d, OFF_EXPECTED_COUNT),
@@ -346,7 +355,8 @@ fn open_batch_inner<'a, 'b: 'a>(
     // bytes in this one top-level instruction, so `expected_count` above ~312 leaves cannot be created
     // at its full `account_len` here — `GrowBatch` (a separate top-level instruction, so it gets its
     // own fresh realloc allowance) finishes the job.
-    let full_space = account_len(expected_count);
+    let full_space =
+        account_len_for(VERSION, expected_count).map_err(|_| ProgramError::InvalidAccountData)?;
     let space = full_space.min(MAX_PERMITTED_DATA_INCREASE);
     // `batch`'s address is public and predictable (`(chain_id, batch)`-derived), and it is exactly the next
     // id the cursor will ever accept — so anyone can pre-fund it with the rent-exempt minimum before this
@@ -408,8 +418,10 @@ fn seal_leaf_inner<'a, 'b: 'a>(
         return Err(ProgramError::IncorrectProgramId);
     }
     let mut d = batch_pda.try_borrow_mut_data()?;
-    let (chain_id, batch, expected_count) = read_header(&d)?;
-    if d.len() != account_len(expected_count) {
+    let (version, chain_id, batch, expected_count) = read_header(&d)?;
+    if d.len()
+        != account_len_for(version, expected_count).map_err(|_| ProgramError::InvalidAccountData)?
+    {
         return Err(BatchError::BatchNotGrown.into());
     }
     if d[OFF_FINALIZED] != 0 {
@@ -441,8 +453,9 @@ fn seal_leaf_inner<'a, 'b: 'a>(
         let body = &cd[crate::HEADER_LEN..crate::HEADER_LEN + len as usize];
         rome_zk_merkle::keccak256(&[body])
     };
-    let lo = leaves_offset(expected_count);
-    let bitmap_off = HEADER_LEN;
+    let lo =
+        leaves_offset_for(version, expected_count).map_err(|_| ProgramError::InvalidAccountData)?;
+    let bitmap_off = header_len(version).map_err(|_| ProgramError::InvalidAccountData)?;
     let present = (d[bitmap_off + (idx as usize) / 8] >> (idx % 8)) & 1 == 1;
     let slot = lo + 32 * idx as usize;
     if present {
@@ -470,7 +483,7 @@ fn finalize_batch_inner<'a, 'b: 'a>(
         return Err(ProgramError::IncorrectProgramId);
     }
     let mut d = batch_pda.try_borrow_mut_data()?;
-    let (chain_id, batch, expected_count) = read_header(&d)?;
+    let (version, chain_id, batch, expected_count) = read_header(&d)?;
     // The trailing signer must be this batch's own stored `authority` — same check shape
     // `close_batch_inner` uses. Read directly off the raw header bytes (already borrowed above) rather
     // than the full `rome_zk_layouts::batch::read` decode: this runs on every `FinalizeBatch` call,
@@ -479,7 +492,9 @@ fn finalize_batch_inner<'a, 'b: 'a>(
     if !authority.is_signer || *authority.key != pubkey_at(&d, OFF_AUTHORITY) {
         return Err(ProgramError::MissingRequiredSignature);
     }
-    if d.len() != account_len(expected_count) {
+    if d.len()
+        != account_len_for(version, expected_count).map_err(|_| ProgramError::InvalidAccountData)?
+    {
         return Err(BatchError::BatchNotGrown.into());
     }
     if d[OFF_FINALIZED] != 0 {
@@ -489,7 +504,8 @@ fn finalize_batch_inner<'a, 'b: 'a>(
     if leaves_present != expected_count {
         return Err(BatchError::NotAllLeavesSealed.into());
     }
-    let lo = leaves_offset(expected_count);
+    let lo =
+        leaves_offset_for(version, expected_count).map_err(|_| ProgramError::InvalidAccountData)?;
     let cursor = u32_at(&d, OFF_FINALIZE_CURSOR);
     let cap = if step == 0 { expected_count } else { step };
     let end = cursor.saturating_add(cap).min(expected_count);
@@ -551,7 +567,7 @@ fn close_batch_inner<'a, 'b: 'a>(
     }
     let (chain_id, batch, _expected_count) = {
         let d = batch_pda.try_borrow_data()?;
-        let (chain_id, batch, expected_count) = read_header(&d)?;
+        let (_version, chain_id, batch, expected_count) = read_header(&d)?;
         if !authority.is_signer || *authority.key != pubkey_at(&d, OFF_AUTHORITY) {
             return Err(ProgramError::MissingRequiredSignature);
         }
@@ -641,7 +657,12 @@ pub fn open_chunk_check(
     // has not yet finished growing — `SealLeaf`/`FinalizeBatch` require the same full size, so gating
     // it here too (chunk creation is the very first step of a chunk's life) fails closed as early as
     // possible.
-    if d.len() != account_len(f.expected_count) {
+    // `read` above accepted only v2 or v3, so the version byte names the account's own header.
+    let version = d[OFF_VERSION];
+    if d.len()
+        != account_len_for(version, f.expected_count)
+            .map_err(|_| ProgramError::InvalidAccountData)?
+    {
         return Err(BatchError::BatchNotGrown.into());
     }
     if f.finalized {
@@ -710,9 +731,9 @@ fn grow_batch_inner<'a, 'b: 'a>(
     if pda.owner != program_id {
         return Err(ProgramError::IncorrectProgramId);
     }
-    let expected_count = {
+    let (version, expected_count) = {
         let d = pda.try_borrow_data()?;
-        let (h_chain_id, h_batch, expected_count) = read_header(&d)?;
+        let (version, h_chain_id, h_batch, expected_count) = read_header(&d)?;
         if h_chain_id != chain_id || h_batch != batch {
             return Err(BatchError::WrongBatchAccount.into());
         }
@@ -724,9 +745,10 @@ fn grow_batch_inner<'a, 'b: 'a>(
         if expected != *pda.key {
             return Err(BatchError::WrongBatchAccount.into());
         }
-        expected_count
+        (version, expected_count)
     };
-    let target = account_len(expected_count);
+    let target =
+        account_len_for(version, expected_count).map_err(|_| ProgramError::InvalidAccountData)?;
     let current = pda.data_len();
     if current >= target {
         // Already fully grown (including a batch small enough that `OpenBatch` reached `target` in one

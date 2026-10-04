@@ -246,12 +246,20 @@ async fn open_grown_and_presealed_batch(
         .await
         .unwrap()
         .expect("batch account must exist after OpenBatch(+Grow)");
-    let target_len = rome_zk_layouts::batch::account_len(frames.len() as u32);
+    let target_len = rome_zk_layouts::batch::account_len_for(
+        rome_zk_layouts::batch::VERSION,
+        frames.len() as u32,
+    )
+    .unwrap();
     assert_eq!(account.data.len(), target_len);
 
     let mut data = account.data.clone();
-    let bitmap_off = rome_zk_layouts::batch::HEADER_LEN;
-    let leaves_off = rome_zk_layouts::batch::leaves_offset(frames.len() as u32);
+    let bitmap_off = rome_zk_layouts::batch::HEADER_LEN_V2;
+    let leaves_off = rome_zk_layouts::batch::leaves_offset_for(
+        rome_zk_layouts::batch::VERSION,
+        frames.len() as u32,
+    )
+    .unwrap();
     for (i, frame) in frames.iter().enumerate() {
         data[bitmap_off + i / 8] |= 1 << (i % 8);
         let hash = keccak::hashv(&[&frame.to_bytes()]).to_bytes();

@@ -15,7 +15,9 @@ codec with no Solana RPC client, no tokio runtime, no sender.
 ## What it owns
 
 - **`Block`** — one block's channel-stream content: `number`, `timestamp`, `gas_limit`, and `txs` (raw,
-  already-signed EIP-2718 tx bytes; this codec never parses tx contents).
+  already-signed EIP-2718 tx bytes; this codec never parses tx contents), plus an optional fifth field,
+  `deposits_end`, the deposit queue's index after the block. `None` encodes the same four-item list as
+  before; `resolve_deposits_end` refuses a value that does not move past the previous block's.
 - **`encode_stream`/`decode_stream`** — `RLP([Block]) -> zstd-19`, and the inverse. The one-shot (not
   streaming) codec used for the final encoding a channel closes with, and for decoding it back.
 - **`channel_id`** — `keccak256(chain_id_le[8] ++ batch_le[8])[..16]`, binding every frame of one batch's

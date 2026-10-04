@@ -6,6 +6,9 @@
 //! Loads the real, `cargo build-sbf`-compiled `.so` (not a native/builtin shortcut) so CU numbers reflect
 //! real BPF execution — run `cargo build-sbf --manifest-path programs/zk-inbox/Cargo.toml` first.
 
+use rome_zk_layouts::batch::{
+    account_len_for, header_len, leaves_offset_for, VERSION as BATCH_VERSION,
+};
 use rome_zk_testkit::{cursor_account, prefund_pda, rent_exempt, root_account_with_authority};
 use solana_program::{keccak, pubkey::Pubkey};
 use solana_sdk::{
@@ -428,7 +431,7 @@ async fn open_batch_succeeds_even_when_an_attacker_prefunds_its_pda() {
     assert_eq!(acct.owner, program_id);
     assert_eq!(
         acct.data.len(),
-        rome_zk_layouts::batch::account_len(expected_count),
+        account_len_for(BATCH_VERSION, expected_count).unwrap(),
         "adopted account must be sized exactly as a freshly-created one would be"
     );
     assert!(
@@ -744,7 +747,7 @@ async fn grow_batch_rejects_a_well_formed_batch_account_at_the_wrong_address() {
     let settlement_program = rome_zk_testkit::fixed_settlement_program_id();
     let wrong_address = Pubkey::new_unique(); // never the real seeds(chain_id, batch) PDA
     let n = 5u32;
-    let mut data = vec![0u8; rome_zk_layouts::batch::account_len(n)];
+    let mut data = vec![0u8; account_len_for(BATCH_VERSION, n).unwrap()];
     // The batch account records the settlement program it was opened through; GrowBatch derives the
     // batch address from that recorded field.
     data[rome_zk_layouts::batch::OFF_SETTLEMENT_PROGRAM
@@ -808,7 +811,7 @@ async fn grow_batch_rejects_a_batch_account_whose_stored_header_does_not_match_t
     let settlement_program = rome_zk_testkit::fixed_settlement_program_id();
     let (batch_pda, _) = client::batch_pda(&program_id, &settlement_program, chain_id, batch);
     let n = 5u32;
-    let mut data = vec![0u8; rome_zk_layouts::batch::account_len(n)];
+    let mut data = vec![0u8; account_len_for(BATCH_VERSION, n).unwrap()];
     // The batch account records the settlement program it was opened through; GrowBatch derives the
     // batch address from that recorded field.
     data[rome_zk_layouts::batch::OFF_SETTLEMENT_PROGRAM
@@ -871,7 +874,7 @@ async fn grow_batch_rejects_a_batch_account_owned_by_a_foreign_program() {
     let settlement_program = rome_zk_testkit::fixed_settlement_program_id();
     let (batch_pda, _) = client::batch_pda(&program_id, &settlement_program, chain_id, batch);
     let n = 5u32;
-    let mut data = vec![0u8; rome_zk_layouts::batch::account_len(n)];
+    let mut data = vec![0u8; account_len_for(BATCH_VERSION, n).unwrap()];
     // The batch account records the settlement program it was opened through; GrowBatch derives the
     // batch address from that recorded field.
     data[rome_zk_layouts::batch::OFF_SETTLEMENT_PROGRAM
@@ -984,7 +987,7 @@ async fn open_batch_313_leaves_opens_capped_then_grows_and_finalizes() {
     eprintln!("OpenBatch(313 leaves, capped) consumed {open_cu} CU");
 
     let (batch_pda, _) = client::batch_pda(&program_id, &settlement_program, chain_id, batch);
-    let target = rome_zk_layouts::batch::account_len(n);
+    let target = account_len_for(BATCH_VERSION, n).unwrap();
     let capped_len = ctx
         .banks_client
         .get_account(batch_pda)
@@ -1123,7 +1126,7 @@ async fn grow_batch_at_full_size_is_a_no_op() {
         .unwrap()
         .data
         .len();
-    assert_eq!(len_before, rome_zk_layouts::batch::account_len(n));
+    assert_eq!(len_before, account_len_for(BATCH_VERSION, n).unwrap());
     let lamports_before = ctx
         .banks_client
         .get_account(batch_pda)
@@ -1200,7 +1203,7 @@ async fn grow_batch_by_a_random_payer_succeeds_and_cannot_exceed_account_len() {
     send(&mut ctx, &[open_ix], &authority, &[]).await.unwrap();
 
     let (batch_pda, _) = client::batch_pda(&program_id, &settlement_program, chain_id, batch);
-    let target = rome_zk_layouts::batch::account_len(n);
+    let target = account_len_for(BATCH_VERSION, n).unwrap();
     assert!(target > client::MAX_PERMITTED_DATA_INCREASE);
 
     let random_payer_lamports_before = ctx
@@ -1411,7 +1414,7 @@ async fn open_and_grow_batch_900_leaves_in_one_transaction_finalizes_within_cu_b
     );
 
     let (batch_pda, _) = client::batch_pda(&program_id, &settlement_program, chain_id, batch);
-    let target = rome_zk_layouts::batch::account_len(n);
+    let target = account_len_for(BATCH_VERSION, n).unwrap();
     let account = ctx
         .banks_client
         .get_account(batch_pda)
@@ -1432,8 +1435,8 @@ async fn open_and_grow_batch_900_leaves_in_one_transaction_finalizes_within_cu_b
     let bodies: Vec<[u8; 4]> = (0..n).map(|i| i.to_le_bytes()).collect();
     let chunk_hashes: Vec<[u8; 32]> = bodies.iter().map(|b| chunk_body_hash(b)).collect();
     let mut data = account.data.clone();
-    let bitmap_off = rome_zk_layouts::batch::HEADER_LEN;
-    let leaves_off = rome_zk_layouts::batch::leaves_offset(n);
+    let bitmap_off = header_len(BATCH_VERSION).unwrap();
+    let leaves_off = leaves_offset_for(BATCH_VERSION, n).unwrap();
     for i in 0..n as usize {
         data[bitmap_off + i / 8] |= 1 << (i % 8);
         let slot = leaves_off + 32 * i;

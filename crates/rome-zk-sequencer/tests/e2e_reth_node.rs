@@ -16,7 +16,7 @@ use jsonrpsee::http_client::HttpClientBuilder;
 use jsonrpsee::ws_client::WsClientBuilder;
 use rome_zk_sequencer::testutil::signed_raw_tx;
 use serde_json::Value;
-use std::net::TcpListener;
+use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,26 +25,51 @@ use tempfile::tempdir;
 const CHAIN_ID: u64 = 424_244;
 const GENESIS_BALANCE_HEX: &str = "0x33b2e3c9fd0803ce8000000";
 
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
+/// The running sequencer process plus the addresses IT reported binding. Every address in the
+/// config is port 0, so the OS picks the ports at bind time and the node prints them in its startup
+/// line; the tests read them from there and never guess a free port up front (a probe-then-release
+/// "free port" can be taken by another server on a busy machine before the node binds it).
+struct ChildGuard {
+    child: Child,
+    http_port: u16,
+    /// The WS server's reported `host:port` (the host may be IPv6, so it is kept whole).
+    ws_addr: String,
+    http_addr: String,
+    metrics_addr: String,
 }
-
-struct ChildGuard(Child);
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
+/// The three addresses of the startup line `listening on http <a> / ws <b>, metrics on <c>`.
+fn parse_listening_line(line: &str) -> Option<(String, String, String)> {
+    let rest = line.split_once("listening on http ")?.1;
+    let (http, rest) = rest.split_once(" / ws ")?;
+    let (ws, metrics) = rest.split_once(", metrics on ")?;
+    Some((
+        http.trim().to_string(),
+        ws.trim().to_string(),
+        metrics.trim().to_string(),
+    ))
+}
+
+fn port_of(addr: &str) -> u16 {
+    addr.rsplit_once(':')
+        .and_then(|(_, p)| p.parse().ok())
+        .unwrap_or_else(|| panic!("no port in reported address {addr:?}"))
+}
+
 async fn wait_for_port(port: u16, timeout: Duration) {
+    wait_for_addr(&format!("127.0.0.1:{port}"), timeout).await;
+}
+
+async fn wait_for_addr(addr: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_ok()
-        {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
             return;
         }
         assert!(
@@ -55,13 +80,30 @@ async fn wait_for_port(port: u16, timeout: Duration) {
     }
 }
 
+/// A loopback address for the WS server, port 0, that differs from the HTTP server's `127.0.0.1:0`.
+///
+/// The node (and reth's `RpcServerConfig::start`) merge the two servers into ONE, built from the HTTP
+/// settings, whenever the two configured addresses are equal. Production configures HTTP and WS on
+/// different ports, each with its own settings, so the tests must keep the two configured addresses
+/// unequal while both still bind port 0 (no guessed free port). `[::1]:0` does that on a developer Mac
+/// and on the Linux boxes; where IPv6 loopback is not available (some containers), `127.0.0.2:0` does
+/// it instead (all of 127.0.0.0/8 is loopback on Linux, but not on macOS, hence IPv6 first).
+fn ws_loopback_addr() -> &'static str {
+    if std::net::TcpListener::bind("[::1]:0").is_ok() {
+        "[::1]:0"
+    } else {
+        "127.0.0.2:0"
+    }
+}
+
 /// Spawns `rome-zk-sequencer --executor reth` with a `[reth]` section carrying `http_addr`/
-/// `ws_addr` — the new `node::serve` path — funded with `senders`, and returns the guard + the
-/// bound http port.
+/// `ws_addr` — the new `node::serve` path — funded with `senders`, and returns the guard, the
+/// bound http port and the bound ws `host:port`. HTTP and WS are on different addresses, so the node
+/// runs the two-server layout; this asserts the node reported two different servers.
 fn spawn_node(
     dir: &std::path::Path,
     senders: &[PrivateKeySigner],
-) -> (ChildGuard, u16, u16, std::path::PathBuf) {
+) -> (ChildGuard, u16, String, std::path::PathBuf) {
     let log_dir = dir.join("log");
     let key_path = dir.join("sequencer.key");
     std::fs::write(
@@ -98,18 +140,15 @@ fn spawn_node(
     let genesis_path = dir.join("genesis.json");
     std::fs::write(&genesis_path, genesis.to_string()).unwrap();
 
-    let rpc_port = free_port(); // unused by this path but Config still requires the field
-    let metrics_port = free_port();
-    let http_port = free_port();
-    let ws_port = free_port();
     let config_path = dir.join("config.toml");
+    let ws_addr = ws_loopback_addr();
     std::fs::write(
         &config_path,
         format!(
             r#"
             chain_id = {CHAIN_ID}
-            rpc_addr = "127.0.0.1:{rpc_port}"
-            metrics_addr = "127.0.0.1:{metrics_port}"
+            rpc_addr = "127.0.0.1:0" # unused by this path but Config still requires the field
+            metrics_addr = "127.0.0.1:0"
             log_dir = "{}"
             sequencer_key_path = "{}"
 
@@ -122,8 +161,8 @@ fn spawn_node(
             [reth]
             datadir = "{}"
             genesis_path = "{}"
-            http_addr = "127.0.0.1:{http_port}"
-            ws_addr = "127.0.0.1:{ws_port}"
+            http_addr = "127.0.0.1:0"
+            ws_addr = "{ws_addr}"
             "#,
             log_dir.display(),
             key_path.display(),
@@ -133,30 +172,69 @@ fn spawn_node(
     )
     .unwrap();
 
-    (
-        spawn_from_config(&config_path),
-        http_port,
-        ws_port,
-        config_path,
-    )
+    let guard = spawn_from_config(&config_path);
+    // The two-server layout must not silently collapse into one (equal configured addresses are
+    // merged into a single server built from the HTTP settings): a merged node reports the same
+    // `host:port` for both. (Compared as addresses, not ports: different loopback hosts may
+    // legitimately be given the same ephemeral port number.)
+    assert_ne!(
+        guard.http_addr, guard.ws_addr,
+        "HTTP and WS were reported on one address: the node merged them into a single server"
+    );
+    let (http_port, ws_addr) = (guard.http_port, guard.ws_addr.clone());
+    (guard, http_port, ws_addr, config_path)
 }
 
 /// Launches `rome-zk-sequencer --executor reth` against an already-written config file — factored
 /// out of `spawn_node` so a test can restart the SAME binary over the SAME `[reth].datadir`/
-/// `log_dir` (and the SAME bound ports, since those are fixed in the config file too) after killing
-/// the first instance.
+/// `log_dir` after killing the first instance. The config binds port 0, so a restart gets fresh
+/// ports; the returned guard carries the ones the new process reported. Blocks until the process
+/// has bound its servers and printed them (or exits without doing so, which panics).
 fn spawn_from_config(config_path: &std::path::Path) -> ChildGuard {
     let bin = env!("CARGO_BIN_EXE_rome-zk-sequencer");
-    let child = Command::new(bin)
+    let mut child = Command::new(bin)
         .arg("--config")
         .arg(config_path)
         .arg("--executor")
         .arg("reth")
-        .stdout(Stdio::inherit())
+        // The startup line is an info-level log (the default filter shows errors only), and it must
+        // be free of colour codes to parse as plain text.
+        .env("RUST_LOG", "error,rome_zk_sequencer=info")
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
         .expect("spawn rome-zk-sequencer binary");
-    ChildGuard(child)
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    // Echo every line (as `Stdio::inherit()` did) and keep draining until the process exits, so a
+    // full pipe can never stall the node; report the bound addresses once, from the first match.
+    std::thread::spawn(move || {
+        let mut reported = false;
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            println!("{line}");
+            if !reported {
+                if let Some(addrs) = parse_listening_line(&line) {
+                    reported = true;
+                    let _ = tx.send(addrs);
+                }
+            }
+        }
+    });
+    let (http, ws, metrics_addr) = rx
+        .recv_timeout(Duration::from_secs(120))
+        .unwrap_or_else(|e| {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the sequencer did not report its bound addresses ({e}); it exited or hung before serving")
+        });
+    ChildGuard {
+        child,
+        http_port: port_of(&http),
+        http_addr: http,
+        ws_addr: ws,
+        metrics_addr,
+    }
 }
 
 async fn rpc_call(client: &jsonrpsee::http_client::HttpClient, method: &str) -> Value {
@@ -171,7 +249,7 @@ async fn rpc_call(client: &jsonrpsee::http_client::HttpClient, method: &str) -> 
 #[tokio::test(flavor = "multi_thread")]
 async fn node_starts_and_answers_identity_methods() {
     let dir = tempdir().unwrap();
-    let (_guard, http_port, _ws_port, _config_path) = spawn_node(dir.path(), &[]);
+    let (_guard, http_port, _ws_addr, _config_path) = spawn_node(dir.path(), &[]);
     wait_for_port(http_port, Duration::from_secs(20)).await;
     let client = HttpClientBuilder::default()
         .build(format!("http://127.0.0.1:{http_port}"))
@@ -202,8 +280,8 @@ async fn the_201st_ws_connection_is_not_capped_at_jsonrpsees_default_of_100() {
     const HELD_OPEN: usize = 200;
 
     let dir = tempdir().unwrap();
-    let (_guard, _http_port, ws_port, _config_path) = spawn_node(dir.path(), &[]);
-    wait_for_port(ws_port, Duration::from_secs(20)).await;
+    let (_guard, _http_port, ws_addr, _config_path) = spawn_node(dir.path(), &[]);
+    wait_for_addr(&ws_addr, Duration::from_secs(20)).await;
 
     // Open HELD_OPEN concurrent WS connections and hold them open in `_clients` for the rest of the
     // test (never dropped) — a WS connection's permit is held for its whole session, unlike a plain
@@ -212,7 +290,7 @@ async fn the_201st_ws_connection_is_not_capped_at_jsonrpsees_default_of_100() {
     let mut _clients = Vec::with_capacity(HELD_OPEN);
     for _ in 0..HELD_OPEN {
         let client = WsClientBuilder::default()
-            .build(format!("ws://127.0.0.1:{ws_port}"))
+            .build(format!("ws://{ws_addr}"))
             .await
             .expect("open a WS connection");
         _clients.push(client);
@@ -225,7 +303,7 @@ async fn the_201st_ws_connection_is_not_capped_at_jsonrpsees_default_of_100() {
     let started = Instant::now();
     let outcome = tokio::time::timeout(Duration::from_secs(5), async {
         let client_201 = WsClientBuilder::default()
-            .build(format!("ws://127.0.0.1:{ws_port}"))
+            .build(format!("ws://{ws_addr}"))
             .await?;
         client_201
             .request::<Value, _>("eth_chainId", jsonrpsee::rpc_params![])
@@ -260,7 +338,7 @@ async fn sent_tx_is_reflected_by_reths_own_rpc_after_its_block_seals() {
     let dir = tempdir().unwrap();
     let sender = PrivateKeySigner::random();
     let recipient = alloy::primitives::Address::repeat_byte(0x42);
-    let (_guard, http_port, _ws_port, _config_path) =
+    let (_guard, http_port, _ws_addr, _config_path) =
         spawn_node(dir.path(), std::slice::from_ref(&sender));
     wait_for_port(http_port, Duration::from_secs(20)).await;
     let client = HttpClientBuilder::default()
@@ -366,7 +444,7 @@ async fn e2e_2000_txs_via_node_rpc_preconf_p99_under_100ms() {
 
     let dir = tempdir().unwrap();
     let senders: Vec<PrivateKeySigner> = (0..SENDERS).map(|_| PrivateKeySigner::random()).collect();
-    let (_guard, http_port, _ws_port, config_path) = spawn_node(dir.path(), &senders);
+    let (guard, http_port, _ws_addr, _config_path) = spawn_node(dir.path(), &senders);
     wait_for_port(http_port, Duration::from_secs(20)).await;
 
     let mut clients = Vec::with_capacity(SENDERS);
@@ -436,13 +514,7 @@ async fn e2e_2000_txs_via_node_rpc_preconf_p99_under_100ms() {
     // (does the log-layer fsync's own tail explain the residual gap between seal_block's now-negligible
     // foreground cost and the observed e2e p99?). Printed before the assertion below so the report
     // survives even if the budget assertion itself fails.
-    let config_text = std::fs::read_to_string(&config_path).unwrap();
-    let metrics_addr = config_text
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("metrics_addr = "))
-        .expect("metrics_addr in the written config")
-        .trim_matches('"')
-        .to_string();
+    let metrics_addr = guard.metrics_addr.clone();
     let metrics_output = std::process::Command::new("curl")
         .args(["-s", &format!("http://{metrics_addr}/metrics")])
         .output()
@@ -477,7 +549,7 @@ async fn kill_9_right_after_a_block_seals_then_restart_reaches_the_same_state() 
     let dir = tempdir().unwrap();
     let sender = PrivateKeySigner::random();
     let recipient = alloy::primitives::Address::repeat_byte(0x77);
-    let (mut guard, http_port, _ws_port, config_path) =
+    let (mut guard, http_port, _ws_addr, config_path) =
         spawn_node(dir.path(), std::slice::from_ref(&sender));
     wait_for_port(http_port, Duration::from_secs(20)).await;
     let client = HttpClientBuilder::default()
@@ -516,17 +588,18 @@ async fn kill_9_right_after_a_block_seals_then_restart_reaches_the_same_state() 
     // A real SIGKILL — not a graceful shutdown, no `Executor::flush`, no chance for the background
     // persist thread to finish on its own terms. `ChildGuard::drop` would do the same kill()+wait(),
     // but doing it explicitly here (before restart) is the point of this test, not incidental cleanup.
-    guard.0.kill().expect("kill the sequencer process");
-    guard.0.wait().expect("reap the killed process");
+    guard.child.kill().expect("kill the sequencer process");
+    guard.child.wait().expect("reap the killed process");
 
-    // Restart the SAME binary over the SAME `[reth].datadir` and `log_dir` (same config file, so the
-    // same bound ports too) — must come back up cleanly (MDBX opening a datadir an interrupted write
+    // Restart the SAME binary over the SAME `[reth].datadir` and `log_dir` (same config file; the
+    // restarted process binds fresh ports and reports them) — must come back up cleanly (MDBX opening a datadir an interrupted write
     // never committed to is exactly the ACID property this relies on) and, via tail replay
     // (`recovery::replay_into_executor`), reach the state the tx should have produced either way.
     let guard2 = spawn_from_config(&config_path);
-    wait_for_port(http_port, Duration::from_secs(20)).await;
+    let http_port2 = guard2.http_port;
+    wait_for_port(http_port2, Duration::from_secs(20)).await;
     let client2 = HttpClientBuilder::default()
-        .build(format!("http://127.0.0.1:{http_port}"))
+        .build(format!("http://127.0.0.1:{http_port2}"))
         .unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -583,7 +656,7 @@ async fn kill_9_right_after_a_block_seals_then_restart_reaches_the_same_state() 
 async fn latest_tag_advances_as_blocks_seal_not_stuck_at_genesis() {
     let dir = tempdir().unwrap();
     let sender = PrivateKeySigner::random();
-    let (_guard, http_port, _ws_port, _config_path) =
+    let (_guard, http_port, _ws_addr, _config_path) =
         spawn_node(dir.path(), std::slice::from_ref(&sender));
     wait_for_port(http_port, Duration::from_secs(20)).await;
     let client = HttpClientBuilder::default()
@@ -711,16 +784,14 @@ async fn executor_reth_without_reth_http_ws_keys_still_serves_eth_get_balance() 
     let genesis_path = dir.path().join("genesis.json");
     std::fs::write(&genesis_path, genesis.to_string()).unwrap();
 
-    let rpc_port = free_port();
-    let metrics_port = free_port();
     let config_path = dir.path().join("config.toml");
     std::fs::write(
         &config_path,
         format!(
             r#"
             chain_id = {CHAIN_ID}
-            rpc_addr = "127.0.0.1:{rpc_port}"
-            metrics_addr = "127.0.0.1:{metrics_port}"
+            rpc_addr = "127.0.0.1:0"
+            metrics_addr = "127.0.0.1:0"
             log_dir = "{}"
             sequencer_key_path = "{}"
 
@@ -743,7 +814,9 @@ async fn executor_reth_without_reth_http_ws_keys_still_serves_eth_get_balance() 
     )
     .unwrap();
 
-    let _guard = spawn_from_config(&config_path);
+    let guard = spawn_from_config(&config_path);
+    // One socket serves http and ws here, so the reported http port is the `rpc_addr` one.
+    let rpc_port = guard.http_port;
     wait_for_port(rpc_port, Duration::from_secs(20)).await;
     let client = HttpClientBuilder::default()
         .build(format!("http://127.0.0.1:{rpc_port}"))
@@ -784,17 +857,11 @@ async fn rss_after_1000_blocks_of_100_txs_with_node_rpc_serving() {
 
     let dir = tempdir().unwrap();
     let senders: Vec<PrivateKeySigner> = (0..SENDERS).map(|_| PrivateKeySigner::random()).collect();
-    let (guard, http_port, _ws_port, config_path) = spawn_node(dir.path(), &senders);
+    let (guard, http_port, _ws_addr, _config_path) = spawn_node(dir.path(), &senders);
     wait_for_port(http_port, Duration::from_secs(20)).await;
-    let pid = guard.0.id();
+    let pid = guard.child.id();
 
-    let config_text = std::fs::read_to_string(&config_path).unwrap();
-    let metrics_addr = config_text
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("metrics_addr = "))
-        .expect("metrics_addr in the written config")
-        .trim_matches('"')
-        .to_string();
+    let metrics_addr = guard.metrics_addr.clone();
 
     let mut tasks = Vec::with_capacity(SENDERS);
     for signer in senders {

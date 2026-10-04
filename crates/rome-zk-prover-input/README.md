@@ -3,7 +3,7 @@
 Host-only input generator for the batch guest: reads a finalized
 batch's inbox chunk bodies + batch account from the Tiber devnet, fetches each block and its execution witness
 from a reth verifier, and writes the guest's two bincode inputs — `guest-rome`'s wire format
-(`rome-protocol/rome-zk-guest` (tag `v0.1.0`), `crates/clients/rome/guest`). Never writes to any
+(wire v3; `rome-protocol/zisk-eth-client`, branch `deposits-guest`, `crates/clients/rome/guest`). Never writes to any
 cluster; never generates a proof (proving is a separate step).
 
 Verified end to end against a real batch: see "Real batch, verified" below.
@@ -63,11 +63,20 @@ compiling the *exact same* `alloy_consensus::Header`/`reth_ethereum_primitives::
 version-conflict reason). **Wire v2:** `RomePublicInput` no longer carries a
 `chain_config` field at all — the chain's rules are baked into the guest ELF at compile time instead
 (`guest-rome::chain_config`). `alloy-genesis`'s `serde-bincode-compat` feature stays a dependency only for
-the one-time v1→v2 fixture migration test (`wire::tests::migrate_the_committed_batch_3930_fixture_from_wire_v1_to_v2`,
-which decodes the OLD shape locally) and `genesis::load_chain_config` (still learns `chain_id` from
+the earlier v1→v2 fixture migration (its test is gone now that the fixtures are v3) and `genesis::load_chain_config` (still learns `chain_id` from
 `--genesis` for PDA derivation) — no current-shape code needs it. **Proven, both directions, byte for
 byte:** see `crates/rome-zk-prover-input-cross-repo-wire` — a sibling crate, its own workspace, that
 encodes with this crate's types and decodes with the fork's own, and the reverse.
+
+**Wire v3 (deposits):** `RomePublicInput` appends the deposit range after `blocks` — `settlement_program`,
+`deposit_from`, `deposit_hash_from` and `deposits` (`DepositInput { sender, recipient, amount_gwei }`).
+`build_batch_input` writes the empty range for now: the batch account's settlement program, `deposit_from` 0,
+`deposit_hash_from` = `h_0(settlement_program, chain_id)` (the cursor's value on a chain that never took a
+deposit) and no deposits; real ranges arrive with the batch header v3. The two committed fixtures were migrated
+from v2 by `wire::tests::migrate_the_committed_fixtures_from_wire_v2_to_v3` (ignored, run once); the standing
+test `committed_fixtures_are_wire_v3_with_every_v2_field_unchanged` pins the v2 bytes' hashes and proves
+every v2 field and the witness frame are unchanged. **Flag day:** a v2 ELF cannot read v3 input and the
+reverse, so this lands only together with the guest release and its new verification keys.
 
 ## Command
 

@@ -1,7 +1,13 @@
-//! The guest's wire contract, **v2**, field-for-field
+//! The guest's wire contract, **v3**, field-for-field
 //! identical to `guest-rome::input::{RomePublicInput, RomeWitnessInput}`
-//! (`rome-protocol/rome-zk-guest` (tag `v0.1.0`), `crates/clients/rome/guest/src/input.rs`) —
-//! duplicated here rather than depended on across repos.
+//! (`rome-protocol/zisk-eth-client`, branch `deposits-guest`,
+//! `crates/clients/rome/guest/src/input.rs`) — duplicated here rather than depended on across repos.
+//!
+//! **v3 appends the deposit range after `blocks`:** `settlement_program`, `deposit_from`,
+//! `deposit_hash_from` and `deposits` (a list of [`DepositInput`]). bincode is positional, so a v3
+//! public frame is exactly the v2 frame followed by those four fields; the witness frame is unchanged.
+//! **Flag day:** a v2 guest ELF cannot read a v3 input and a v3 ELF cannot read a v2 one, so the
+//! prover feeds only the ELF generation this crate's wire version names.
 //!
 //! **v2 drops `chain_config`:** v1 carried a host-supplied `chain_config`, which let a
 //! prover claim a different chain's rules for the same batch — a stateless validator proves
@@ -60,7 +66,20 @@ impl<'de> DeserializeAs<'de, Block> for BlockRlp {
     }
 }
 
-/// Field-for-field identical to `guest_rome::RomePublicInput` (wire v2 — see this module's doc).
+/// One deposit of the batch's range, as the settlement program's queue stores it. Field-for-field
+/// identical to `guest_rome::input::DepositInput`. Its index is not a field: it is the range's
+/// `deposit_from` plus its position in [`RomePublicInput::deposits`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DepositInput {
+    /// The depositor's signing public key.
+    pub sender: [u8; 32],
+    /// The L2 address that receives the funds.
+    pub recipient: [u8; 20],
+    /// The amount, in gwei.
+    pub amount_gwei: u64,
+}
+
+/// Field-for-field identical to `guest_rome::RomePublicInput` (wire v3 — see this module's doc).
 #[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RomePublicInput {
@@ -75,6 +94,14 @@ pub struct RomePublicInput {
     pub parent_header: Header,
     #[serde_as(as = "Vec<BlockRlp>")]
     pub blocks: Vec<Block>,
+    /// The settlement program whose deposit queue this batch's range belongs to (wire v3).
+    pub settlement_program: [u8; 32],
+    /// The index of the first deposit of the batch's range `[deposit_from, deposit_from + deposits.len())`.
+    pub deposit_from: u64,
+    /// The queue's hash-chain value before deposit `deposit_from`.
+    pub deposit_hash_from: [u8; 32],
+    /// The range's deposit records, in queue order. Empty is the deposit-free batch.
+    pub deposits: Vec<DepositInput>,
 }
 
 impl RomePublicInput {
@@ -155,6 +182,10 @@ mod tests {
             chunk_bodies: vec![vec![1, 2, 3]],
             parent_header: sample_header(10),
             blocks: vec![],
+            settlement_program: [0x33; 32],
+            deposit_from: 0,
+            deposit_hash_from: [0; 32],
+            deposits: vec![],
         };
         let bytes = input.serialize();
         let (back, _): (RomePublicInput, usize) =
@@ -182,6 +213,10 @@ mod tests {
             chunk_bodies: vec![],
             parent_header: sample_header(0),
             blocks: vec![],
+            settlement_program: [0x33; 32],
+            deposit_from: 0,
+            deposit_hash_from: [0; 32],
+            deposits: vec![],
         };
         let witness = RomeWitnessInput { witnesses: vec![] };
         let mut out = Vec::new();
@@ -205,6 +240,10 @@ mod tests {
             chunk_bodies: vec![],
             parent_header: sample_header(0),
             blocks: vec![],
+            settlement_program: [0x33; 32],
+            deposit_from: 0,
+            deposit_hash_from: [0; 32],
+            deposits: vec![],
         };
         let witness = RomeWitnessInput { witnesses: vec![] };
         let mut out = Vec::new();
@@ -237,6 +276,10 @@ mod tests {
             chunk_bodies: vec![vec![0u8; 5]], // too short to be a valid 19-byte frame header
             parent_header: sample_header(0),
             blocks: vec![block],
+            settlement_program: [0x33; 32],
+            deposit_from: 0,
+            deposit_hash_from: [0; 32],
+            deposits: vec![],
         };
         let witness = RomeWitnessInput {
             witnesses: vec![alloy_rpc_types_debug::ExecutionWitness::default()],
@@ -247,98 +290,298 @@ mod tests {
         std::fs::write("/tmp/rome-guest-bad-chunk.bin", out).unwrap();
     }
 
-    /// The committed real-batch fixture
-    /// (`fixtures/prover-input/txv1-dev-batch-3930.bin`) was written under wire v1 (with `chain_config`).
-    /// This migrates it to v2 in place — no live tunnel needed, since every OTHER field is untouched real
-    /// batch-3930 data (chain 200101, blocks 39181..=39190) and `chain_config` is the only field
-    /// removed. `#[ignore]`d: a one-time migration run against a committed fixture path, not part of the
-    /// normal suite (mirrors this module's other `#[ignore]`d fixture-writing tests).
-    ///
-    /// The v1 shape is redefined LOCALLY here (never as this crate's own public type any more — v2 is
-    /// the only shape this crate produces or accepts going forward) purely so this one-time migration can
-    /// decode the old bytes; `RomeWitnessInput`'s shape never changed, so its frame is copied byte for
-    /// byte, unparsed.
+    /// The wire v2 public frame, kept only here (this crate produces and accepts v3 only) so the one-time
+    /// fixture migration can read the old bytes and the standing test below can re-derive them.
+    /// bincode is positional: v3 is exactly this layout followed by the four deposit fields.
+    #[serde_as]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct RomePublicInputV2 {
+        chain_id: u64,
+        batch: u64,
+        open_slot: u64,
+        open_unix_ts: i64,
+        max_drift_secs: u64,
+        expected_count: u32,
+        chunk_bodies: Vec<Vec<u8>>,
+        #[serde_as(as = "HeaderRlp")]
+        parent_header: Header,
+        #[serde_as(as = "Vec<BlockRlp>")]
+        blocks: Vec<Block>,
+    }
+
+    impl RomePublicInputV2 {
+        fn serialize(&self) -> Vec<u8> {
+            bincode::serde::encode_to_vec(self, bincode::config::standard()).unwrap()
+        }
+    }
+
+    impl From<&RomePublicInput> for RomePublicInputV2 {
+        fn from(v3: &RomePublicInput) -> Self {
+            Self {
+                chain_id: v3.chain_id,
+                batch: v3.batch,
+                open_slot: v3.open_slot,
+                open_unix_ts: v3.open_unix_ts,
+                max_drift_secs: v3.max_drift_secs,
+                expected_count: v3.expected_count,
+                chunk_bodies: v3.chunk_bodies.clone(),
+                parent_header: v3.parent_header.clone(),
+                blocks: v3.blocks.clone(),
+            }
+        }
+    }
+
+    /// What the two committed fixtures looked like under wire v2, recorded before the migration: the
+    /// sha256 and length of the public frame's payload and of the witness frame (length prefix and padding
+    /// included, copied verbatim by the migration), and the facts the sidecar `.json` also states.
+    struct V2Pin {
+        name: &'static str,
+        public_len: usize,
+        public_sha256: &'static str,
+        witness_frame_len: usize,
+        witness_frame_sha256: &'static str,
+        batch: u64,
+        blocks: usize,
+    }
+
+    const V2_PINS: [V2Pin; 2] = [
+        V2Pin {
+            name: "txv1-dev-batch-3930",
+            public_len: 6897,
+            public_sha256: "cc3eac8ccd40595f85654fb82116039d7f5719e5872197bcb4c513ff0ede87b8",
+            witness_frame_len: 7392,
+            witness_frame_sha256:
+                "1c756fe4fef84fb7c66b942bed61784914c0571ccb027d5f0de00226f75149be",
+            batch: 3930,
+            blocks: 10,
+        },
+        V2Pin {
+            name: "txv1-dev-reset6-batch-1",
+            public_len: 37944,
+            public_sha256: "a11684585349c0a3b3449bfeb2928b23880de85fda9cf22ea01d39f2fdfbfaa9",
+            witness_frame_len: 44376,
+            witness_frame_sha256:
+                "374e5405d3583491918820f2a851c31842ad796d338e236da822f39b5bcef994",
+            batch: 1,
+            blocks: 60,
+        },
+    ];
+
+    /// Tiber's own `zk-settlement` program id, the program both fixtures' batches were
+    /// settled under. The v2 files never recorded a settlement program; the deposit-free v3 range needs one
+    /// and the chain id, and nothing else in these inputs depends on it.
+    const FIXTURE_SETTLEMENT_PROGRAM: &str = "6yWj1Az1JmHBmt1654bFx2UdPMWd6Aak2QqBDPQxpj56";
+    /// `h_0(FIXTURE_SETTLEMENT_PROGRAM, 200101)`, pinned as a literal so the standing test does not only
+    /// compare the layouts function against itself.
+    const FIXTURE_H0_HEX: &str = "5c2e7685787a6066c850bddd95ea94fef5e945180c4f1fcc6b44c162e14a7cde";
+
+    fn fixture_path(name: &str, ext: &str) -> String {
+        format!(
+            "{}/../../fixtures/prover-input/{name}.{ext}",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    /// Splits a stdin file into the public frame's payload and the witness frame's raw bytes.
+    fn split_frames(raw: &[u8]) -> (&[u8], &[u8]) {
+        let public_len = u64::from_le_bytes(raw[0..8].try_into().unwrap()) as usize;
+        let public_frame_end = 8 + public_len + ((8 - (public_len % 8)) % 8);
+        (&raw[8..8 + public_len], &raw[public_frame_end..])
+    }
+
+    fn fixture_settlement_program() -> [u8; 32] {
+        use std::str::FromStr;
+        solana_program::pubkey::Pubkey::from_str(FIXTURE_SETTLEMENT_PROGRAM)
+            .unwrap()
+            .to_bytes()
+    }
+
+    fn fixture_h0() -> [u8; 32] {
+        let keccak = rome_zk_merkle::keccak256 as fn(&[&[u8]]) -> [u8; 32];
+        rome_zk_layouts::deposit::queue_seed_hash(&keccak, &fixture_settlement_program(), 200101)
+    }
+
+    /// One-time migration of the two committed fixtures from wire v2 to wire v3, in place (it replaces the
+    /// earlier v1 to v2 migration test, whose input shape no longer exists). It needs no live tunnel: every v2 field is copied untouched and the witness
+    /// frame is copied byte for byte, so only the deposit-free range is new (the fixture settlement
+    /// program, `deposit_from` 0, `deposit_hash_from` = `h_0`, no deposits). It refuses a file that is not
+    /// the recorded v2 original, then checks its own output with the same function the standing test
+    /// uses. `#[ignore]`d: it rewrites committed files, so it is run by hand, once.
     #[test]
     #[ignore]
-    fn migrate_the_committed_batch_3930_fixture_from_wire_v1_to_v2() {
-        use serde::{Deserialize, Serialize};
-        use serde_with::serde_as;
+    fn migrate_the_committed_fixtures_from_wire_v2_to_v3() {
+        for pin in &V2_PINS {
+            let path = fixture_path(pin.name, "bin");
+            let raw = std::fs::read(&path).expect("read the committed v2 fixture");
+            let (public_bytes, witness_frame) = split_frames(&raw);
+            assert_eq!(
+                sha256_hex(public_bytes),
+                pin.public_sha256,
+                "{}: not the recorded v2 original (already migrated?)",
+                pin.name
+            );
+            let (v2, used): (RomePublicInputV2, usize) =
+                bincode::serde::decode_from_slice(public_bytes, bincode::config::standard())
+                    .expect("decode the v2 public frame");
+            assert_eq!(used, public_bytes.len(), "{}: trailing bytes", pin.name);
 
-        #[serde_as]
-        #[derive(Debug, Clone, Serialize, Deserialize)]
-        struct RomePublicInputV1 {
-            chain_id: u64,
-            batch: u64,
-            open_slot: u64,
-            open_unix_ts: i64,
-            max_drift_secs: u64,
-            expected_count: u32,
-            chunk_bodies: Vec<Vec<u8>>,
-            #[serde_as(as = "HeaderRlp")]
-            parent_header: Header,
-            #[serde_as(as = "alloy_genesis::serde_bincode_compat::ChainConfig<'_>")]
-            chain_config: alloy_genesis::ChainConfig,
-            #[serde_as(as = "Vec<BlockRlp>")]
-            blocks: Vec<Block>,
+            let v3 = RomePublicInput {
+                chain_id: v2.chain_id,
+                batch: v2.batch,
+                open_slot: v2.open_slot,
+                open_unix_ts: v2.open_unix_ts,
+                max_drift_secs: v2.max_drift_secs,
+                expected_count: v2.expected_count,
+                chunk_bodies: v2.chunk_bodies,
+                parent_header: v2.parent_header,
+                blocks: v2.blocks,
+                settlement_program: fixture_settlement_program(),
+                deposit_from: 0,
+                deposit_hash_from: fixture_h0(),
+                deposits: vec![],
+            };
+            let mut out = Vec::new();
+            write_slice_frame(&mut out, &v3.serialize());
+            out.extend_from_slice(witness_frame);
+            std::fs::write(&path, &out).expect("write the migrated v3 fixture in place");
+            assert_fixture_is_v3_with_every_v2_field(pin);
         }
+    }
 
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../fixtures/prover-input/txv1-dev-batch-3930.bin"
+    fn assert_fixture_is_v3_with_every_v2_field(pin: &V2Pin) {
+        let raw = std::fs::read(fixture_path(pin.name, "bin")).unwrap();
+        let (public_bytes, witness_frame) = split_frames(&raw);
+
+        // The witness frame is the v2 one, byte for byte.
+        assert_eq!(witness_frame.len(), pin.witness_frame_len, "{}", pin.name);
+        assert_eq!(
+            sha256_hex(witness_frame),
+            pin.witness_frame_sha256,
+            "{}: witness frame changed",
+            pin.name
         );
-        let raw = std::fs::read(path).expect("read the committed v1 fixture");
 
-        // Two `ZiskStdin::write_slice` frames, each an 8-byte LE length prefix then the payload then
-        // padding to an 8-byte boundary (`write_slice_frame`'s own doc) — read the public frame's bytes
-        // to re-encode, and copy the witness frame's raw bytes (including its own length prefix and
-        // padding) verbatim since its shape never changed.
-        let public_len = u64::from_le_bytes(raw[0..8].try_into().unwrap()) as usize;
-        let public_bytes = &raw[8..8 + public_len];
-        let public_frame_end = 8 + public_len + ((8 - (public_len % 8)) % 8);
-        let witness_frame_bytes = &raw[public_frame_end..];
-
-        let (v1, _): (RomePublicInputV1, usize) =
+        let (v3, used): (RomePublicInput, usize) =
             bincode::serde::decode_from_slice(public_bytes, bincode::config::standard())
-                .expect("decode the v1 public frame");
+                .expect("the fixture must decode as v3");
+        assert_eq!(used, public_bytes.len(), "{}: trailing bytes", pin.name);
+
+        // Every v2 field is unchanged: re-encoding the v3 input's v2 fields reproduces the recorded v2
+        // public frame (same length, same sha256), and that frame is a strict prefix of the v3 one.
+        let v2_bytes = RomePublicInputV2::from(&v3).serialize();
+        assert_eq!(v2_bytes.len(), pin.public_len, "{}", pin.name);
         assert_eq!(
-            v1.chain_config.chain_id, v1.chain_id,
-            "sanity: the v1 fixture's own chain_config agreed with chain_id before it is dropped"
+            sha256_hex(&v2_bytes),
+            pin.public_sha256,
+            "{}: a v2 field changed",
+            pin.name
         );
+        assert!(public_bytes.starts_with(&v2_bytes), "{}", pin.name);
 
-        let v2 = RomePublicInput {
-            chain_id: v1.chain_id,
-            batch: v1.batch,
-            open_slot: v1.open_slot,
-            open_unix_ts: v1.open_unix_ts,
-            max_drift_secs: v1.max_drift_secs,
-            expected_count: v1.expected_count,
-            chunk_bodies: v1.chunk_bodies,
-            parent_header: v1.parent_header,
-            blocks: v1.blocks,
-        };
-
-        let mut out = Vec::new();
-        write_slice_frame(&mut out, &v2.serialize());
-        out.extend_from_slice(witness_frame_bytes);
-        std::fs::write(path, &out).expect("write the migrated v2 fixture in place");
-
-        // Re-read what was just written and confirm it round-trips as v2 before trusting the file.
-        let reread = std::fs::read(path).unwrap();
-        let reread_public_len = u64::from_le_bytes(reread[0..8].try_into().unwrap()) as usize;
-        let (back, _): (RomePublicInput, usize) = bincode::serde::decode_from_slice(
-            &reread[8..8 + reread_public_len],
-            bincode::config::standard(),
-        )
-        .expect("the migrated fixture must decode as v2");
-        assert_eq!(back.chain_id, v1.chain_id);
+        // What follows the v2 fields is exactly the deposit-free range: settlement program, deposit_from
+        // 0 (one varint byte), h_0, an empty deposit list (one varint byte).
+        let h0 = fixture_h0();
+        let mut tail = Vec::new();
+        tail.extend_from_slice(&fixture_settlement_program());
+        tail.push(0);
+        tail.extend_from_slice(&h0);
+        tail.push(0);
         assert_eq!(
-            back.blocks.len(),
-            10,
-            "batch 3930: blocks 39181..=39190, ten blocks (all empty on idle Tiber)"
+            &public_bytes[v2_bytes.len()..],
+            tail.as_slice(),
+            "{}",
+            pin.name
+        );
+        assert_eq!(v3.settlement_program, fixture_settlement_program());
+        assert_eq!(v3.deposit_from, 0);
+        assert_eq!(v3.deposit_hash_from, h0);
+        assert!(v3.deposits.is_empty());
+        assert_eq!(hex::encode(h0), FIXTURE_H0_HEX, "h_0 literal");
+
+        // And the v2 fields still say what the sidecar says about the batch.
+        let sidecar: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixture_path(pin.name, "json")).unwrap())
+                .unwrap();
+        assert_eq!(v3.chain_id, sidecar["chain_id"].as_u64().unwrap());
+        assert_eq!(v3.batch, pin.batch);
+        assert_eq!(
+            v3.open_unix_ts as u64,
+            sidecar["open_unix_ts"].as_u64().unwrap()
+        );
+        assert_eq!(
+            v3.max_drift_secs,
+            sidecar["max_drift_secs"].as_u64().unwrap()
+        );
+        assert_eq!(v3.blocks.len(), pin.blocks);
+        assert_eq!(
+            v3.blocks.first().unwrap().header.number,
+            sidecar["first_number"].as_u64().unwrap()
+        );
+        assert_eq!(
+            v3.blocks.last().unwrap().header.number,
+            sidecar["last_number"].as_u64().unwrap()
+        );
+        assert_eq!(
+            hex::encode(crate::header_hash(&v3.parent_header)),
+            sidecar["parent_hash"].as_str().unwrap()
         );
     }
 
-    /// Writes the seven `ziskemu` refusal fixtures (reproduced against the migrated v2 batch-3930 input) —
+    /// The committed fixtures are wire v3 and carry every v2 field unchanged (the explicit migration
+    /// test above wrote them; this one keeps proving it).
+    #[test]
+    fn committed_fixtures_are_wire_v3_with_every_v2_field_unchanged() {
+        for pin in &V2_PINS {
+            assert_fixture_is_v3_with_every_v2_field(pin);
+        }
+    }
+
+    /// A deposit-bearing v3 input round-trips, including the record order and widths.
+    #[test]
+    fn public_input_with_deposits_round_trips() {
+        let mut input = RomePublicInput {
+            chain_id: 200101,
+            batch: 7,
+            open_slot: 1,
+            open_unix_ts: 1_789_337_436,
+            max_drift_secs: 60,
+            expected_count: 1,
+            chunk_bodies: vec![vec![1]],
+            parent_header: sample_header(10),
+            blocks: vec![],
+            settlement_program: [0x33; 32],
+            deposit_from: 5,
+            deposit_hash_from: [0x44; 32],
+            deposits: vec![],
+        };
+        input.deposits = vec![
+            DepositInput {
+                sender: [0x11; 32],
+                recipient: [0x22; 20],
+                amount_gwei: 1_000_000_000,
+            },
+            DepositInput {
+                sender: [0x55; 32],
+                recipient: [0x66; 20],
+                amount_gwei: 2,
+            },
+        ];
+        let (back, used): (RomePublicInput, usize) =
+            bincode::serde::decode_from_slice(&input.serialize(), bincode::config::standard())
+                .unwrap();
+        assert_eq!(used, input.serialize().len());
+        assert_eq!(back.settlement_program, input.settlement_program);
+        assert_eq!(back.deposit_from, 5);
+        assert_eq!(back.deposit_hash_from, input.deposit_hash_from);
+        assert_eq!(back.deposits, input.deposits);
+    }
+
+    /// Writes the seven `ziskemu` refusal fixtures (reproduced against the migrated batch-3930 input, now wire v3) —
     /// four mutations on `blocks[9]` (the last of the ten blocks, number 39190) that the guest once
     /// accepted, re-run as refusals
     /// (`gas_limit` +1, `beneficiary` = 0xdead…beef, a flipped `mix_hash`, `extra_data` = "evil"), plus
@@ -355,7 +598,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../../fixtures/prover-input/txv1-dev-batch-3930.bin"
         );
-        let raw = std::fs::read(path).expect("read the migrated v2 fixture");
+        let raw = std::fs::read(path).expect("read the migrated v3 fixture");
         let public_len = u64::from_le_bytes(raw[0..8].try_into().unwrap()) as usize;
         let public_bytes = &raw[8..8 + public_len];
         let public_frame_end = 8 + public_len + ((8 - (public_len % 8)) % 8);
@@ -363,7 +606,7 @@ mod tests {
 
         let (honest, _): (RomePublicInput, usize) =
             bincode::serde::decode_from_slice(public_bytes, bincode::config::standard())
-                .expect("decode the v2 public frame");
+                .expect("decode the v3 public frame");
         let last = honest.blocks.len() - 1; // block index 9, number 39190
 
         let write = |name: &str, public: &RomePublicInput| {

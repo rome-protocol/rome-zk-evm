@@ -293,7 +293,7 @@ fn default_confirm_poll_interval_ms() -> u64 {
 /// every account a transaction loads.
 ///
 /// The previous 131,072 (128 KiB)
-/// default was computed from only the batch account (`rome_zk_layouts::batch::account_len`, up to
+/// default was computed from only the batch account (`rome_zk_layouts::batch::account_len_for`, up to
 /// 29,123 B at the design's own 900-leaf default) plus headroom — it ignored SIMD-0186's actual
 /// accounting, under which **every loaded account costs 64 B + its own data length, and a loader-v3
 /// program's `ProgramData` account is counted even though it is never one of the transaction's own

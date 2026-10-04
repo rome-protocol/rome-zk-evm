@@ -98,16 +98,30 @@ pub fn funded_keypair() -> Keypair {
 }
 
 /// An inbox `batch_cursor` account at `next_batch`, owned by `program_id` — the layout `rome_zk_layouts::cursor`
-/// defines.
+/// defines, at version 1 (what the inbox writes today). [`cursor_account_for`] takes the version.
 pub fn cursor_account(program_id: Pubkey, chain_id: u64, next_batch: u64) -> Account {
-    let mut d = vec![0u8; rome_zk_layouts::cursor::LEN];
-    d[rome_zk_layouts::cursor::OFF_MAGIC..rome_zk_layouts::cursor::OFF_MAGIC + 4]
-        .copy_from_slice(&rome_zk_layouts::cursor::MAGIC.to_le_bytes());
-    d[rome_zk_layouts::cursor::OFF_VERSION] = rome_zk_layouts::cursor::VERSION;
-    d[rome_zk_layouts::cursor::OFF_CHAIN_ID..rome_zk_layouts::cursor::OFF_CHAIN_ID + 8]
-        .copy_from_slice(&chain_id.to_le_bytes());
-    d[rome_zk_layouts::cursor::OFF_NEXT_BATCH..rome_zk_layouts::cursor::OFF_NEXT_BATCH + 8]
-        .copy_from_slice(&next_batch.to_le_bytes());
+    cursor_account_for(
+        rome_zk_layouts::cursor::VERSION,
+        program_id,
+        chain_id,
+        next_batch,
+    )
+}
+
+/// [`cursor_account`] at `version` (1 or 2). A version-2 account carries an empty deposit cursor (every
+/// appended field zero); panics for any other version, since a fixture of an unknown layout is a test bug.
+pub fn cursor_account_for(
+    version: u8,
+    program_id: Pubkey,
+    chain_id: u64,
+    next_batch: u64,
+) -> Account {
+    use rome_zk_layouts::cursor as c;
+    let mut d = vec![0u8; c::len_for_version(version).expect("cursor version 1 or 2")];
+    d[c::OFF_MAGIC..c::OFF_MAGIC + 4].copy_from_slice(&c::MAGIC.to_le_bytes());
+    d[c::OFF_VERSION] = version;
+    d[c::OFF_CHAIN_ID..c::OFF_CHAIN_ID + 8].copy_from_slice(&chain_id.to_le_bytes());
+    d[c::OFF_NEXT_BATCH..c::OFF_NEXT_BATCH + 8].copy_from_slice(&next_batch.to_le_bytes());
     Account {
         lamports: rent_exempt(d.len()),
         data: d,
@@ -229,6 +243,28 @@ pub fn fixed_settlement_program_id() -> Pubkey {
     Pubkey::new_from_array([0x51u8; 32])
 }
 
+/// The fixed seed of synthetic depositor `index` (32 bytes: a tag byte, then the index little-endian). The synthetic
+/// deposit batches (`fixtures/prover-input/synthetic-deposits-{small,full}`) use these depositors as their senders, so
+/// a program test can sign `Deposit` as the same account the guest's golden values were built with. Fixed test seeds,
+/// not secrets: nothing derived from them ever holds value.
+pub fn synthetic_depositor_seed(index: u64) -> [u8; 32] {
+    let mut seed = [0u8; 32];
+    seed[0] = 0xD5;
+    seed[1..9].copy_from_slice(&index.to_le_bytes());
+    seed
+}
+
+/// The keypair of synthetic depositor `index`, made from [`synthetic_depositor_seed`] with `keypair_from_seed`.
+pub fn synthetic_depositor_keypair(index: u64) -> Keypair {
+    solana_sdk::signature::keypair_from_seed(&synthetic_depositor_seed(index))
+        .expect("a 32-byte seed always makes a keypair")
+}
+
+/// The pubkey bytes of synthetic depositor `index`: the `sender` of the synthetic batches' deposit `index`.
+pub fn synthetic_depositor_pubkey(index: u64) -> [u8; 32] {
+    synthetic_depositor_keypair(index).pubkey().to_bytes()
+}
+
 /// A fixed, distinct program id for the TEST-ONLY stub bridge program
 /// (`programs/zk-settlement/tests/fixtures/stub-bridge`) in CU-gate tests — same rationale as
 /// [`fixed_inbox_program_id`]: `ConsumeExit`'s `exit_consumer` PDA is derived under this program's own id
@@ -305,6 +341,27 @@ pub async fn prefund_pda(ctx: &mut ProgramTestContext, pda: Pubkey) {
 mod tests {
     use super::*;
 
+    fn hex_of(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    #[test]
+    fn synthetic_depositors_are_fixed_distinct_and_sign_for_their_pubkey() {
+        assert_eq!(synthetic_depositor_pubkey(3), synthetic_depositor_pubkey(3));
+        assert_ne!(synthetic_depositor_pubkey(0), synthetic_depositor_pubkey(1));
+        let kp = synthetic_depositor_keypair(5);
+        assert_eq!(kp.pubkey().to_bytes(), synthetic_depositor_pubkey(5));
+        assert_eq!(
+            synthetic_depositor_seed(1)[..9],
+            [0xD5, 1, 0, 0, 0, 0, 0, 0, 0]
+        );
+        // Pinned: a changed seed rule would silently change the fixtures' senders.
+        assert_eq!(
+            hex_of(&synthetic_depositor_pubkey(0)),
+            "dcdd823ba8e683d0f00af5a8be7c9c1105699445798761901192743bcf114ce7"
+        );
+    }
+
     #[test]
     fn rent_exempt_matches_the_default_rent_schedule() {
         assert_eq!(rent_exempt(0), Rent::default().minimum_balance(0));
@@ -324,6 +381,30 @@ mod tests {
         let f = rome_zk_layouts::cursor::read(&acc.data).unwrap();
         assert_eq!(f.chain_id, 7);
         assert_eq!(f.next_batch, 42);
+    }
+
+    #[test]
+    fn cursor_account_for_builds_each_version_at_its_own_length() {
+        let program_id = Pubkey::new_unique();
+        let v1 = cursor_account_for(1, program_id, 7, 42);
+        assert_eq!(v1.data.len(), rome_zk_layouts::cursor::LEN);
+        assert_eq!(
+            rome_zk_layouts::cursor::read(&v1.data).unwrap().deposit,
+            None
+        );
+        let v2 = cursor_account_for(2, program_id, 7, 42);
+        assert_eq!(v2.data.len(), rome_zk_layouts::cursor::LEN_V2);
+        let f = rome_zk_layouts::cursor::read(&v2.data).unwrap();
+        assert_eq!((f.chain_id, f.next_batch), (7, 42));
+        assert_eq!(
+            f.deposit,
+            Some(rome_zk_layouts::cursor::CursorDeposit {
+                next: 0,
+                hash: [0; 32],
+                final_: 0
+            })
+        );
+        assert_eq!(cursor_account(program_id, 7, 42).data, v1.data);
     }
 
     #[test]

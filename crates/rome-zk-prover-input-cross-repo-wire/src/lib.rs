@@ -1,7 +1,8 @@
 //! The cross-repo wire proof this repo's own README (rome-zk-prover-input, "Open
 //! questions") flagged as missing — `rome_zk_prover_input::wire::RomePublicInput`/`RomeWitnessInput`
 //! encode byte-for-byte compatibly with the fork's own `guest_rome::input::{RomePublicInput,
-//! RomeWitnessInput}` (`rome-protocol/rome-zk-guest` (tag `v0.1.0`)), in both directions.
+//! RomeWitnessInput}` (`rome-protocol/zisk-eth-client`, branch `deposits-guest`: wire v3), in both
+//! directions.
 //!
 //! **Why this is its own crate, not a dev-dependency of `rome-zk-prover-input` itself:** `guest-rome`'s own
 //! `Cargo.toml` enables `alloy-primitives`'s `native-keccak` feature (the ZisK guest's accelerated keccak hook). Cargo
@@ -25,9 +26,10 @@
 //! longer a dependency of this crate either.
 //!
 //! **Depends on a checkout of the fork at `../../.fork`** (two levels up from this crate: `crates/` →
-//! the rome-zk repo root → `.fork/`) — `git clone https://github.com/rome-protocol/rome-zk-guest
-//! <repo-root>/.fork && cd <repo-root>/.fork && git checkout v0.1.0 && git submodule update --init
-//! third_party/ziskethone`. If that checkout is absent, Cargo itself refuses to resolve this crate's
+//! the rome-zk repo root → `.fork/`) — `git clone --branch deposits-guest
+//! https://github.com/rome-protocol/zisk-eth-client <repo-root>/.fork && cd <repo-root>/.fork && git
+//! submodule update --init third_party/ziskethone` (the fork is private: a box clones it from a git
+//! bundle). If that checkout is absent, Cargo itself refuses to resolve this crate's
 //! manifest (a hard requirement — no path dependency can be made conditional at the Cargo.toml level);
 //! the wrapper script this crate's README documents (`crates/rome-zk-prover-input-cross-repo-wire/run.sh`)
 //! checks for the checkout FIRST and prints a named skip line rather than letting that raw Cargo error
@@ -46,7 +48,19 @@ mod tests {
         }
     }
 
-    fn ours_public() -> ours::RomePublicInput {
+    const SETTLEMENT_PROGRAM: [u8; 32] = [0x33; 32];
+    const DEPOSIT_HASH_FROM: [u8; 32] = [0x44; 32];
+
+    /// The deposit records both sides encode: distinct values in every field, so a swapped or
+    /// mis-sized field shows up.
+    fn deposit_values() -> [([u8; 32], [u8; 20], u64); 2] {
+        [
+            ([0x11; 32], [0x22; 20], 1_000_000_000),
+            ([0x55; 32], [0x66; 20], 2),
+        ]
+    }
+
+    fn ours_public(with_deposits: bool) -> ours::RomePublicInput {
         ours::RomePublicInput {
             chain_id: 200101,
             batch: 3930,
@@ -57,10 +71,25 @@ mod tests {
             chunk_bodies: vec![vec![1, 2, 3, 4, 5]],
             parent_header: sample_header(39180),
             blocks: vec![],
+            settlement_program: SETTLEMENT_PROGRAM,
+            deposit_from: if with_deposits { 5 } else { 0 },
+            deposit_hash_from: DEPOSIT_HASH_FROM,
+            deposits: if with_deposits {
+                deposit_values()
+                    .into_iter()
+                    .map(|(sender, recipient, amount_gwei)| ours::DepositInput {
+                        sender,
+                        recipient,
+                        amount_gwei,
+                    })
+                    .collect()
+            } else {
+                vec![]
+            },
         }
     }
 
-    fn guest_public() -> guest_rome::input::RomePublicInput {
+    fn guest_public(with_deposits: bool) -> guest_rome::input::RomePublicInput {
         guest_rome::input::RomePublicInput {
             chain_id: 200101,
             batch: 3930,
@@ -71,43 +100,86 @@ mod tests {
             chunk_bodies: vec![vec![1, 2, 3, 4, 5]],
             parent_header: sample_header(39180),
             blocks: vec![],
+            settlement_program: SETTLEMENT_PROGRAM,
+            deposit_from: if with_deposits { 5 } else { 0 },
+            deposit_hash_from: DEPOSIT_HASH_FROM,
+            deposits: if with_deposits {
+                deposit_values()
+                    .into_iter()
+                    .map(
+                        |(sender, recipient, amount_gwei)| guest_rome::input::DepositInput {
+                            sender,
+                            recipient,
+                            amount_gwei,
+                        },
+                    )
+                    .collect()
+            } else {
+                vec![]
+            },
         }
     }
 
+    /// Every field of the v3 public input, one side's value against the other's, deposits included.
+    macro_rules! assert_same_public {
+        ($decoded:expr, $expected:expr) => {{
+            let (d, e) = (&$decoded, &$expected);
+            assert_eq!(d.chain_id, e.chain_id);
+            assert_eq!(d.batch, e.batch);
+            assert_eq!(d.open_slot, e.open_slot);
+            assert_eq!(d.open_unix_ts, e.open_unix_ts);
+            assert_eq!(d.max_drift_secs, e.max_drift_secs);
+            assert_eq!(d.expected_count, e.expected_count);
+            assert_eq!(d.chunk_bodies, e.chunk_bodies);
+            assert_eq!(d.parent_header, e.parent_header);
+            assert_eq!(d.blocks.len(), e.blocks.len());
+            assert_eq!(d.settlement_program, e.settlement_program);
+            assert_eq!(d.deposit_from, e.deposit_from);
+            assert_eq!(d.deposit_hash_from, e.deposit_hash_from);
+            assert_eq!(d.deposits.len(), e.deposits.len());
+            for (x, y) in d.deposits.iter().zip(e.deposits.iter()) {
+                assert_eq!(x.sender, y.sender);
+                assert_eq!(x.recipient, y.recipient);
+                assert_eq!(x.amount_gwei, y.amount_gwei);
+            }
+        }};
+    }
+
     /// Forward direction: encode with `rome_zk_prover_input::wire`, decode
-    /// with `guest_rome::input` — byte for byte, field by field. This is the correctness gap the
-    /// `rome-zk-prover-input` README's "Open questions" named as missing.
+    /// with `guest_rome::input` — byte for byte, field by field, with and without deposits. This is the
+    /// correctness gap the `rome-zk-prover-input` README's "Open questions" named as missing.
     #[test]
     fn forward_ours_encode_guest_decode() {
-        let ours = ours_public();
-        let bytes = ours.serialize();
-        let decoded = guest_rome::input::RomePublicInput::deserialize(&bytes);
-        assert_eq!(decoded.chain_id, ours.chain_id);
-        assert_eq!(decoded.batch, ours.batch);
-        assert_eq!(decoded.open_slot, ours.open_slot);
-        assert_eq!(decoded.open_unix_ts, ours.open_unix_ts);
-        assert_eq!(decoded.max_drift_secs, ours.max_drift_secs);
-        assert_eq!(decoded.expected_count, ours.expected_count);
-        assert_eq!(decoded.chunk_bodies, ours.chunk_bodies);
-        assert_eq!(decoded.parent_header, ours.parent_header);
-        assert_eq!(decoded.blocks.len(), ours.blocks.len());
+        for with_deposits in [false, true] {
+            let ours = ours_public(with_deposits);
+            let bytes = ours.serialize();
+            let decoded = guest_rome::input::RomePublicInput::deserialize(&bytes);
+            assert_same_public!(decoded, ours);
+        }
     }
 
     /// Reverse direction: encode with `guest_rome::input`, decode with `rome_zk_prover_input::wire`.
     #[test]
     fn reverse_guest_encode_ours_decode() {
-        let guest = guest_public();
-        let bytes = guest.serialize();
-        let (decoded, _): (ours::RomePublicInput, usize) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
-        assert_eq!(decoded.chain_id, guest.chain_id);
-        assert_eq!(decoded.batch, guest.batch);
-        assert_eq!(decoded.open_slot, guest.open_slot);
-        assert_eq!(decoded.open_unix_ts, guest.open_unix_ts);
-        assert_eq!(decoded.max_drift_secs, guest.max_drift_secs);
-        assert_eq!(decoded.expected_count, guest.expected_count);
-        assert_eq!(decoded.chunk_bodies, guest.chunk_bodies);
-        assert_eq!(decoded.parent_header, guest.parent_header);
+        for with_deposits in [false, true] {
+            let guest = guest_public(with_deposits);
+            let bytes = guest.serialize();
+            let (decoded, used): (ours::RomePublicInput, usize) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+            assert_eq!(used, bytes.len(), "trailing bytes after the v3 input");
+            assert_same_public!(decoded, guest);
+        }
+    }
+
+    /// The same value encodes to the same bytes on both sides.
+    #[test]
+    fn both_sides_encode_the_same_bytes() {
+        for with_deposits in [false, true] {
+            assert_eq!(
+                ours_public(with_deposits).serialize(),
+                guest_public(with_deposits).serialize()
+            );
+        }
     }
 
     /// `RomeWitnessInput`, both directions — a plain `Vec<ExecutionWitness>`, but both sides must still

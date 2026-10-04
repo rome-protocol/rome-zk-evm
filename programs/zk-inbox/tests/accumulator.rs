@@ -3,6 +3,7 @@
 //! shortcut) so `compute_units_consumed` reflects real BPF execution, not a host-native approximation —
 //! run `cargo build-sbf --manifest-path programs/zk-inbox/Cargo.toml` before `cargo test -p zk-inbox`.
 
+use rome_zk_layouts::batch::{account_len_for, header_len, leaves_offset_for};
 use rome_zk_testkit::{
     cursor_account, funded_keypair, prefund_pda, rent_exempt, root_account_with_authority,
 };
@@ -61,9 +62,10 @@ impl BatchFixture {
         finalized: bool,
     ) -> Vec<u8> {
         let n = self.expected_count;
-        let mut d = vec![0u8; zk_inbox::batch::account_len(n)];
+        let v = zk_inbox::batch::VERSION;
+        let mut d = vec![0u8; account_len_for(v, n).unwrap()];
         d[0..4].copy_from_slice(&zk_inbox::batch::MAGIC.to_le_bytes());
-        d[4] = zk_inbox::batch::VERSION;
+        d[4] = v;
         d[5..13].copy_from_slice(&self.chain_id.to_le_bytes());
         d[13..21].copy_from_slice(&self.batch.to_le_bytes());
         d[21..29].copy_from_slice(&self.open_slot.to_le_bytes());
@@ -72,8 +74,8 @@ impl BatchFixture {
         d[37] = finalized as u8;
         d[38..70].copy_from_slice(self.settlement_program.as_ref());
         d[70..102].copy_from_slice(self.authority.as_ref());
-        let lo = zk_inbox::batch::leaves_offset(n);
-        let bitmap_off = zk_inbox::batch::HEADER_LEN;
+        let lo = leaves_offset_for(v, n).unwrap();
+        let bitmap_off = header_len(v).unwrap();
         for &idx in sealed_idx {
             d[bitmap_off + (idx as usize) / 8] |= 1 << (idx % 8);
         }
@@ -196,7 +198,7 @@ async fn open_batch_creates_pda_with_clock_slot_and_correct_size() {
     assert_eq!(acct.owner, program_id);
     assert_eq!(
         acct.data.len(),
-        zk_inbox::batch::account_len(expected_count)
+        account_len_for(acct.data[zk_inbox::batch::OFF_VERSION], expected_count).unwrap()
     );
 
     let decoded = client::decode_batch_account(&acct.data).unwrap();
@@ -409,15 +411,15 @@ async fn a_v1_shaped_batch_account_is_refused_by_every_instruction() {
 
     // A *realistic* mid-flight v1 account — not the bare 202-byte magic+version+chain_id+batch stub
     // (that shape alone would not exercise the version check at all: v1's 202-byte header is already
-    // shorter than v2's own `HEADER_LEN` (210), so `read_header`'s independent `d.len() < HEADER_LEN`
+    // shorter than v2's own `HEADER_LEN_V2` (210), so `read_header`'s independent `d.len() < need`
     // clause would refuse it on length alone, masking whether the version check does anything — proven
-    // by hand: removing `|| d[OFF_VERSION] != VERSION` from `read_header` and rerunning this test against
+    // by hand: removing the version check (`header_len(version)`) from `read_header` and rerunning this test against
     // a bare 202-byte fixture left it green). Every field up to `finalize_cursor` (offset 198) sits at
     // the identical byte offset in v1 and v2 — `open_unix_ts` was *appended*, not inserted — so a v1
     // account with `expected_count` leaves already sealed is `202 + bitmap_len(expected_count) +
-    // 32*expected_count` bytes: for 5 leaves, 363 bytes, comfortably past `HEADER_LEN`, which is exactly
+    // 32*expected_count` bytes: for 5 leaves, 363 bytes, comfortably past `HEADER_LEN_V2`, which is exactly
     // the shape a real pre-reset Tiber batch would have. This is the shape that actually isolates the
-    // version check: dropping `d[OFF_VERSION] != VERSION` from `read_header` turns GrowBatch,
+    // version check: dropping the version check from `read_header` turns GrowBatch,
     // SealLeaf and FinalizeBatch's assertions below red against this fixture (`chunk Open` and
     // `AbandonBatch` decode through `rome_zk_layouts::batch::read` instead, whose own version check comes
     // before its length check regardless of size — already covered by that crate's
@@ -2691,7 +2693,7 @@ async fn seal_accepts_the_hash_of_whatever_was_actually_written_hole_included() 
         .unwrap()
         .unwrap();
     // leaves_offset/header layout mirrors batch.rs — read the one leaf hash directly.
-    let lo = rome_zk_layouts::batch::leaves_offset(1);
+    let lo = leaves_offset_for(acct.data[zk_inbox::batch::OFF_VERSION], 1).unwrap();
     let leaf_hash: [u8; 32] = acct.data[lo..lo + 32].try_into().unwrap();
     assert_eq!(
         leaf_hash, honest_hash,
@@ -3153,7 +3155,7 @@ async fn write_after_seal_is_rejected_and_bytes_unchanged() {
         .await
         .unwrap()
         .unwrap();
-    let lo = rome_zk_layouts::batch::leaves_offset(1);
+    let lo = leaves_offset_for(batch_acct.data[zk_inbox::batch::OFF_VERSION], 1).unwrap();
     let leaf_hash: [u8; 32] = batch_acct.data[lo..lo + 32].try_into().unwrap();
     assert_eq!(
         leaf_hash, original_hash,

@@ -10,7 +10,7 @@ pub mod verifier;
 pub mod wire;
 
 pub use inbox::{decode_block_range, fetch_and_verify_batch, BatchAccount, InboxError};
-pub use wire::{write_slice_frame, RomePublicInput, RomeWitnessInput};
+pub use wire::{write_slice_frame, DepositInput, RomePublicInput, RomeWitnessInput};
 
 /// `keccak(rlp(header))` — used to anchor `parent_hash` in [`build::ExpectedPublicValues`], the same hash
 /// `guest_rome::chain::header_hash` computes in-guest (kept as a tiny, independently-written duplicate

@@ -1087,6 +1087,11 @@ pub fn propose_exit_config(
         if b == Pubkey::default() {
             return Err(SettleError::BridgeProgramZero.into());
         }
+        // The bridge is set once: a chain whose exit config already holds a bridge cannot name
+        // another one, nor the same one again.
+        if fields.bridge_program != [0u8; 32] {
+            return Err(SettleError::BridgeProgramSetOnce.into());
+        }
     }
 
     // Governance is repeatable: on a repeat cycle the account is already program-owned and
@@ -1190,7 +1195,18 @@ pub fn activate_exit_config(
         fields.exit_portal = fields.pending_exit_portal;
     }
     if fields.pending_mask & exit_config::PENDING_MASK_BRIDGE != 0 {
-        fields.bridge_program = fields.pending_bridge_program;
+        if fields.bridge_program == [0u8; 32] {
+            fields.bridge_program = fields.pending_bridge_program;
+        } else {
+            // A bridge proposal made before the bridge became set-once. It may not replace a set
+            // bridge, and a pending proposal can never be cancelled, so refusing here would freeze
+            // the chain's exit config for good. Drop the bridge part, apply the rest, clear the slot.
+            msg!(
+                "chain {} exit config: dropped pending bridge program {}, the bridge is already set",
+                chain_id,
+                Pubkey::new_from_array(fields.pending_bridge_program)
+            );
+        }
     }
     if fields.pending_mask & exit_config::PENDING_MASK_CAP != 0 {
         root_fields.exit_cap_per_window = fields.pending_exit_cap;

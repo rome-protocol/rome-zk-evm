@@ -285,6 +285,13 @@ pub enum SettleError {
     /// permissionless chain registers layout-1 keys only. Refused before the registry is read or
     /// written. Rome's reserved-range chains still accept layout 2.
     HeaderFallbackNotAllowed = 85,
+
+    // --- the bridge program is set once ---
+    /// `ProposeExitConfig` named a bridge program for a chain whose exit config already holds one. A
+    /// chain's bridge program is set once and never replaced, so deposit credits and exits keep
+    /// reading the same bridge for the life of the chain. Refused before any account is created or
+    /// written. Portal, cap and bond proposals are unaffected.
+    BridgeProgramSetOnce = 86,
 }
 
 impl From<SettleError> for ProgramError {

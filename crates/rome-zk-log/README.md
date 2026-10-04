@@ -20,7 +20,12 @@ reader's larger crate, with the sequencer re-exporting it so no existing call si
 - **The record format** — `total_len:u32(LE) ‖ payload ‖ crc32:u32(LE)`, where `payload = RLP(header) ‖
   signature:[u8;65] ‖ tx_count:u32(LE) ‖ (tx_len:u32(LE) tx_bytes)*`. A record's `txs` are exactly the
   sub-block's *included* transactions — a rejected or not-yet-reached transaction never reaches this
-  format at all (see `LogWriter::append`'s module doc for what that means for a reader).
+  format at all (see `LogWriter::append`'s module doc for what that means for a reader). The first record
+  of a block that credits deposits also carries the block's withdrawals after its transactions,
+  `withdrawal_count:u32(LE) ‖ (index:u64(LE) recipient:[u8;20] amount_gwei:u64(LE))*`, and its header
+  carries an optional ninth item, `deposits_end` (the deposit queue's index after the block), which the
+  header hash and the signature cover. A record without deposits has neither and is byte for byte the
+  format above.
 - **`LogWriter`** — appends one record per sub-block, `fsync`ing the segment file (and, on a new segment,
   the containing directory) before returning; a caller must not acknowledge a sub-block until this
   returns `Ok`.

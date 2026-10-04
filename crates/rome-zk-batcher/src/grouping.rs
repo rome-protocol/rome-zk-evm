@@ -43,6 +43,45 @@ pub enum GroupingError {
         number: u64,
         max_frame_body_len: usize,
     },
+    /// A block carries a deposit end that is not above the previous value. A fifth field is only ever set where
+    /// the cumulative index rises, so this means the blocks handed in disagree with the grouper's own running
+    /// value (a wrong seed, or a repeat): a hard stop, since the stream would be refused on read.
+    #[error(
+        "block {number}: deposits_end {got} is not above the previous value {previous} (a block that \
+         credits deposits must raise the cumulative index)"
+    )]
+    DepositsEndNotIncreasing {
+        number: u64,
+        previous: u64,
+        got: u64,
+    },
+    /// One block alone credits more deposits than a whole batch may hold, so no batch can ever take it. The
+    /// sequencer's per-block cap keeps this from happening; if it does, the batcher stops.
+    #[error(
+        "block {number}: this one block credits {deposits} deposits, over the batch limit of \
+         {max_per_batch} — no batch can ever hold it"
+    )]
+    SingleBlockExceedsDepositCap {
+        number: u64,
+        deposits: u64,
+        max_per_batch: u64,
+    },
+}
+
+/// The deposit queue's per-batch limit as the batcher reads it: the active `max_per_batch`, and the pending
+/// proposal's value while one waits to activate. The batcher cannot know the slot a proposal activates at, so it
+/// keeps to the stricter of the two ([`Self::limit`]): a batch built under the smaller value is valid under either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DepositCap {
+    pub active: u64,
+    pub pending: Option<u64>,
+}
+
+impl DepositCap {
+    /// The most deposits one batch may take: the smaller of the active and pending values.
+    pub fn limit(&self) -> u64 {
+        self.pending.map_or(self.active, |p| p.min(self.active))
+    }
 }
 
 /// Accumulates [`Block`]s into groups of at most `cap` consecutive blocks each (`cap` is the chain's
@@ -142,6 +181,10 @@ pub enum CloseReason {
     /// `max_frames_per_batch` frames — the group closes *without* that block, which becomes the first
     /// block of the next group instead.
     Size,
+    /// Appending the next block would have taken the group over the deposit queue's per-batch limit
+    /// ([`DepositCap`]) — the group closes *without* that block, which becomes the first block of the next
+    /// group, exactly as for [`CloseReason::Size`].
+    Deposits,
     /// The group in progress has held at least one block for `batch_close_after_secs` (the batcher's
     /// own monotonic receipt clock, never `Block.timestamp` vs wall clock) —
     /// [`SizeCappedGrouper::close_if_stale`]'s own doc has the full rationale.
@@ -154,6 +197,7 @@ impl CloseReason {
         match self {
             CloseReason::Cap => "cap",
             CloseReason::Size => "size",
+            CloseReason::Deposits => "deposits",
             CloseReason::Age => "age",
         }
     }
@@ -166,7 +210,8 @@ pub enum PushOutcome {
     Accepted,
     /// The group in progress just closed — call [`SizeCappedGrouper::take_group`] to retrieve it.
     /// `carry_over` is `Some(block)` when the close reason is [`CloseReason::Size`] (that block was
-    /// *not* accepted — the caller must push it again after taking the group); `None` for
+    /// *not* accepted — the caller must push it again after taking the group; the same holds for
+    /// [`CloseReason::Deposits`]); `None` for
     /// [`CloseReason::Cap`] (that block *was* accepted; it is the group's own last block).
     Closed {
         reason: CloseReason,
@@ -194,6 +239,13 @@ pub struct SizeCappedGrouper {
     /// exactly once per group, never reset by a later push into the same group); cleared by
     /// [`Self::take_group`].
     first_received_at: Option<Instant>,
+    /// The deposit queue's cumulative index after the last block accepted into the group in progress, or after
+    /// the last group taken while none is in progress (the seed before anything is pushed).
+    deposits_end: u64,
+    /// The cumulative index at the start of the group in progress: the batch's `deposit_from`.
+    batch_deposit_from: u64,
+    /// The per-batch deposit limit, if the caller knows one. `None` leaves batches uncapped on deposits.
+    deposit_cap: Option<DepositCap>,
 }
 
 impl SizeCappedGrouper {
@@ -209,7 +261,28 @@ impl SizeCappedGrouper {
             max_frames,
             max_frame_body_len,
             first_received_at: None,
+            deposits_end: 0,
+            batch_deposit_from: 0,
+            deposit_cap: None,
         }
+    }
+
+    /// Seeds the deposit side: `from` is the cumulative deposit index before the first block this grouper will
+    /// see (the cursor's `deposit_next`, or the previous batch's end), and `cap` the queue's per-batch limit.
+    /// Without this call the index starts at 0 and batches are not capped on deposits, which is exactly right
+    /// for a log without deposits. Call it before the first [`Self::push`].
+    pub fn with_deposits(mut self, from: u64, cap: Option<DepositCap>) -> Self {
+        self.deposits_end = from;
+        self.batch_deposit_from = from;
+        self.deposit_cap = cap;
+        self
+    }
+
+    /// `(deposit_from, deposit_to)` of the group in progress: the cumulative index before its first block and
+    /// after its last. Equal while the group holds no deposits (and while it is empty). After
+    /// [`Self::take_group`] the range is the next group's, which starts where the taken one ended.
+    pub fn deposit_range(&self) -> (u64, u64) {
+        (self.batch_deposit_from, self.deposits_end)
     }
 
     /// Continuity is checked first (non-mutating on failure); then the block is offered to the shadow
@@ -232,7 +305,42 @@ impl SizeCappedGrouper {
                 });
             }
         }
-        match self.shadow.try_append(block.clone()) {
+        // The deposit side. A block's fifth field, when present, is the cumulative index after it; the grouper
+        // keeps its own running value and writes the field back through the channel's canonical encoder, so
+        // it is present exactly where the value changes whatever the caller handed in.
+        let previous_end = self.deposits_end;
+        let end = match block.deposits_end {
+            Some(got) if got <= previous_end => {
+                return Err(GroupingError::DepositsEndNotIncreasing {
+                    number: block.number,
+                    previous: previous_end,
+                    got,
+                });
+            }
+            Some(got) => got,
+            None => previous_end,
+        };
+        if let Some(cap) = self.deposit_cap {
+            let max_per_batch = cap.limit();
+            let deposits = end - self.batch_deposit_from;
+            if deposits > max_per_batch {
+                if self.grouper.is_empty() {
+                    return Err(GroupingError::SingleBlockExceedsDepositCap {
+                        number: block.number,
+                        deposits,
+                        max_per_batch,
+                    });
+                }
+                return Ok(PushOutcome::Closed {
+                    reason: CloseReason::Deposits,
+                    carry_over: Some(block),
+                });
+            }
+        }
+        let mut canonical = block.clone();
+        channel::set_deposits_end(std::slice::from_mut(&mut canonical), previous_end, &[end])
+            .expect("end is not below previous_end, checked above");
+        match self.shadow.try_append(canonical.clone()) {
             channel::AppendOutcome::Full => {
                 if self.grouper.is_empty() {
                     return Err(GroupingError::SingleBlockExceedsFrameBudget {
@@ -248,8 +356,9 @@ impl SizeCappedGrouper {
             channel::AppendOutcome::Added => {
                 let was_empty = self.grouper.is_empty();
                 self.grouper
-                    .push(block)
+                    .push(canonical)
                     .expect("continuity already checked above");
+                self.deposits_end = end;
                 // Setting this on every accepted push, rather than only
                 // the first into an empty group, would let a fast-arriving trickle keep pushing the age
                 // clock forward and never close — the 60 s test in this module's own test suite pins this.
@@ -275,6 +384,8 @@ impl SizeCappedGrouper {
         let group = self.grouper.take_group();
         self.shadow = ShadowCompressor::new(self.max_frames, self.max_frame_body_len);
         self.first_received_at = None;
+        // The next group starts where this one ended.
+        self.batch_deposit_from = self.deposits_end;
         group
     }
 
@@ -922,5 +1033,205 @@ mod tests {
             g.push(block(2), t0 + Duration::from_secs(61)).unwrap(),
             PushOutcome::Accepted
         ));
+    }
+
+    // ---- deposits_end ----
+
+    fn dblock(number: u64, deposits_end: Option<u64>) -> Block {
+        Block {
+            deposits_end,
+            ..block(number)
+        }
+    }
+
+    fn accepted(g: &mut SizeCappedGrouper, b: Block) {
+        assert!(
+            matches!(g.push(b, Instant::now()).unwrap(), PushOutcome::Accepted),
+            "expected the block to be accepted"
+        );
+    }
+
+    /// The fifth field is set exactly where the cumulative value changes, and it resolves back to the running
+    /// value on every block.
+    #[test]
+    fn the_fifth_field_appears_exactly_where_the_value_changes() {
+        let mut g = SizeCappedGrouper::new(10, 900, 3_681, None).with_deposits(4, None);
+        for b in [
+            dblock(0, None),
+            dblock(1, Some(6)),
+            dblock(2, None),
+            dblock(3, None),
+            dblock(4, Some(7)),
+            dblock(5, None),
+        ] {
+            accepted(&mut g, b);
+        }
+        assert_eq!(g.deposit_range(), (4, 7));
+        let group = g.take_group();
+        let fifth: Vec<Option<u64>> = group.iter().map(|b| b.deposits_end).collect();
+        assert_eq!(fifth, [None, Some(6), None, None, Some(7), None]);
+        assert_eq!(
+            channel::resolve_deposits_end(&group, 4).unwrap(),
+            [4, 6, 6, 6, 7, 7]
+        );
+        // The next group starts where this one ended.
+        assert_eq!(g.deposit_range(), (7, 7));
+    }
+
+    /// A fifth field that does not rise above the running value (a repeat, a drop, or a first block equal to the
+    /// seed) is a hard stop, and nothing is accepted.
+    #[test]
+    fn a_fifth_field_that_does_not_rise_is_refused() {
+        let mut g = SizeCappedGrouper::new(10, 900, 3_681, None).with_deposits(5, None);
+        for got in [5u64, 4] {
+            let err = g.push(dblock(0, Some(got)), Instant::now()).unwrap_err();
+            assert_eq!(
+                err,
+                GroupingError::DepositsEndNotIncreasing {
+                    number: 0,
+                    previous: 5,
+                    got
+                }
+            );
+        }
+        assert!(g.is_empty());
+        accepted(&mut g, dblock(0, Some(6)));
+        let err = g.push(dblock(1, Some(6)), Instant::now()).unwrap_err();
+        assert_eq!(
+            err,
+            GroupingError::DepositsEndNotIncreasing {
+                number: 1,
+                previous: 6,
+                got: 6
+            }
+        );
+        assert_eq!(g.len(), 1);
+    }
+
+    /// A batch closes before the block that would take it over the cap, hands that block back, and the next
+    /// batch starts where the closed one ended. Landing exactly on the cap does not close.
+    #[test]
+    fn a_batch_closes_before_a_block_that_would_pass_the_cap() {
+        let cap = DepositCap {
+            active: 4,
+            pending: None,
+        };
+        let mut g = SizeCappedGrouper::new(10, 900, 3_681, None).with_deposits(10, Some(cap));
+        accepted(&mut g, dblock(0, Some(12)));
+        accepted(&mut g, dblock(1, Some(14)));
+        assert_eq!(g.deposit_range(), (10, 14), "exactly the cap, no close");
+        let carried = match g.push(dblock(2, Some(15)), Instant::now()).unwrap() {
+            PushOutcome::Closed {
+                reason: CloseReason::Deposits,
+                carry_over: Some(b),
+            } => b,
+            other => panic!("expected a Deposits close with the block handed back, got {other:?}"),
+        };
+        assert_eq!(carried.number, 2);
+        assert_eq!(
+            g.deposit_range(),
+            (10, 14),
+            "the refused block changed nothing"
+        );
+        let group = g.take_group();
+        assert_eq!(group.len(), 2);
+        assert_eq!(channel::resolve_deposits_end(&group, 10).unwrap(), [12, 14]);
+        // The carried block opens the next batch, from 14.
+        assert_eq!(g.deposit_range(), (14, 14));
+        accepted(&mut g, carried);
+        assert_eq!(g.deposit_range(), (14, 15));
+        let next = g.take_group();
+        assert_eq!(next[0].deposits_end, Some(15));
+        assert_eq!(channel::resolve_deposits_end(&next, 14).unwrap(), [15]);
+    }
+
+    /// With a proposal waiting to activate, the stricter of the active and pending values binds, whichever
+    /// way round they are.
+    #[test]
+    fn the_stricter_of_the_active_and_pending_caps_binds() {
+        let loose_pending = DepositCap {
+            active: 3,
+            pending: Some(9),
+        };
+        let strict_pending = DepositCap {
+            active: 9,
+            pending: Some(3),
+        };
+        assert_eq!(loose_pending.limit(), 3);
+        assert_eq!(strict_pending.limit(), 3);
+        assert_eq!(
+            DepositCap {
+                active: 7,
+                pending: None
+            }
+            .limit(),
+            7
+        );
+        for cap in [loose_pending, strict_pending] {
+            let mut g = SizeCappedGrouper::new(10, 900, 3_681, None).with_deposits(0, Some(cap));
+            accepted(&mut g, dblock(0, Some(3)));
+            assert!(matches!(
+                g.push(dblock(1, Some(4)), Instant::now()).unwrap(),
+                PushOutcome::Closed {
+                    reason: CloseReason::Deposits,
+                    carry_over: Some(_)
+                }
+            ));
+        }
+    }
+
+    /// A block with no deposits never closes a batch on the cap, even one already at the cap.
+    #[test]
+    fn a_block_without_deposits_is_never_refused_by_the_cap() {
+        let cap = DepositCap {
+            active: 2,
+            pending: None,
+        };
+        let mut g = SizeCappedGrouper::new(10, 900, 3_681, None).with_deposits(0, Some(cap));
+        accepted(&mut g, dblock(0, Some(2)));
+        accepted(&mut g, dblock(1, None));
+        accepted(&mut g, dblock(2, None));
+        assert_eq!(g.deposit_range(), (0, 2));
+    }
+
+    /// One block that alone credits more than a batch may hold can never be placed: a hard, named stop rather
+    /// than an empty batch.
+    #[test]
+    fn a_single_block_over_the_cap_is_a_hard_stop() {
+        let cap = DepositCap {
+            active: 3,
+            pending: None,
+        };
+        let mut g = SizeCappedGrouper::new(10, 900, 3_681, None).with_deposits(10, Some(cap));
+        let err = g.push(dblock(0, Some(14)), Instant::now()).unwrap_err();
+        assert_eq!(
+            err,
+            GroupingError::SingleBlockExceedsDepositCap {
+                number: 0,
+                deposits: 4,
+                max_per_batch: 3
+            }
+        );
+    }
+
+    /// Without a deposit seed or cap a grouper behaves exactly as before: no fifth field is ever added, no
+    /// deposit close, and the range stays at zero.
+    #[test]
+    fn without_deposits_nothing_changes() {
+        let mut g = SizeCappedGrouper::new(3, 900, 3_681, None);
+        for n in 0..2 {
+            accepted(&mut g, block(n));
+        }
+        assert!(matches!(
+            g.push(block(2), Instant::now()).unwrap(),
+            PushOutcome::Closed {
+                reason: CloseReason::Cap,
+                carry_over: None
+            }
+        ));
+        assert_eq!(g.deposit_range(), (0, 0));
+        let group = g.take_group();
+        assert!(group.iter().all(|b| b.deposits_end.is_none()));
+        assert_eq!(group, blocks(0..3));
     }
 }

@@ -66,13 +66,35 @@ pub enum SourceError {
         index: u16,
         sub_blocks_per_block: u16,
     },
+    /// The first withdrawal index this source reads after its resume point is not the deposit cursor's
+    /// `deposit_next` (or, within one run, the previous batch's end). Deposits are credited in queue order, so
+    /// a first index that is ahead means deposits were skipped and one that is behind means they would be
+    /// credited twice: either way the batcher stops rather than post a stream the settlement program refuses.
+    #[error(
+        "block {block}: the first deposit index read after the resume point is {got}, but the deposit \
+         cursor expects {expected} — refusing to post a stream that skips or repeats deposits"
+    )]
+    FirstDepositIndexMismatch { block: u64, expected: u64, got: u64 },
+    /// Withdrawal indices must run on one after another across the whole log, inside a block and from one
+    /// block to the next. Indices are read, never counted, so a gap or a repeat in the log is a named stop.
+    #[error(
+        "block {block}: withdrawal index {got} follows a run that expects {expected} — deposit indices \
+         must run on without a gap or a repeat"
+    )]
+    DepositIndexGap { block: u64, expected: u64, got: u64 },
 }
 
 /// One fully-grouped block plus its sub-block header hashes (exposed so a later change can publish them
 /// — a challenger/indexer consumer, not this module).
 #[derive(Debug, Clone)]
 pub struct SourcedBlock {
+    /// The block as the channel stream carries it. `block.deposits_end` is `Some(end)` exactly when the block
+    /// credits deposits (its last withdrawal's index plus one) and `None` otherwise, so a log without deposits
+    /// gives the four-item block it always gave.
     pub block: Block,
+    /// The deposit queue's cumulative index after this block: `block.deposits_end` when it has one, else the
+    /// previous block's value (the resume point's `deposit_next` before the first credit).
+    pub deposits_end: u64,
     /// The 20 sub-block header hashes that make up this block, in index order.
     pub sub_block_header_hashes: Vec<B256>,
 }
@@ -109,6 +131,13 @@ pub struct BlockSource {
     /// when the peeked record legitimately starts the *next* block, it is stashed here so the following
     /// `next_block` call consumes it as that group's first record instead of re-reading it from the log.
     lookahead: Option<SubBlockRecord>,
+    /// The withdrawal index the next credited deposit must carry: the deposit cursor's `deposit_next` at the
+    /// resume point (0 unless [`Self::with_deposit_start`] says otherwise), then one past the last withdrawal
+    /// read. Indices are read off the log's withdrawals, never counted.
+    deposit_next: u64,
+    /// `true` until the first withdrawal is read after the resume point, so that first index gets its own
+    /// named error ([`SourceError::FirstDepositIndexMismatch`]).
+    first_deposit_pending: bool,
 }
 
 /// `sealer::resolve_block_timestamp_secs`'s formula, copied verbatim:
@@ -141,7 +170,17 @@ impl BlockSource {
             prev_block_timestamp_secs,
             pending: Vec::with_capacity(sub_blocks_per_block as usize),
             lookahead: None,
+            deposit_next: 0,
+            first_deposit_pending: true,
         })
+    }
+
+    /// Sets the deposit cursor's `deposit_next` at the resume point: the index the first credited deposit read
+    /// from the log must carry. The default is 0, which is right for a chain with no deposits behind it; a
+    /// caller that resumes against a cursor passes the cursor's value (or the previous batch's end).
+    pub fn with_deposit_start(mut self, deposit_next: u64) -> Self {
+        self.deposit_next = deposit_next;
+        self
     }
 
     /// Re-scans the log directory for newly-rolled segments (live tail-follow) — see
@@ -224,6 +263,43 @@ impl BlockSource {
             self.lookahead = Some(next);
         }
 
+        // Read the withdrawal indices before anything in `self` changes, so a refusal leaves the source as it
+        // was. Only an index-0 record carries withdrawals (the log refuses them anywhere else), and they run on
+        // from `deposit_next` in order.
+        let mut deposit_next = self.deposit_next;
+        let mut first_pending = self.first_deposit_pending;
+        let mut credited = false;
+        for withdrawal in self.pending.iter().flat_map(|r| r.withdrawals.iter()) {
+            if withdrawal.index != deposit_next {
+                return Err(if first_pending {
+                    SourceError::FirstDepositIndexMismatch {
+                        block: this_block,
+                        expected: deposit_next,
+                        got: withdrawal.index,
+                    }
+                } else {
+                    SourceError::DepositIndexGap {
+                        block: this_block,
+                        expected: deposit_next,
+                        got: withdrawal.index,
+                    }
+                });
+            }
+            first_pending = false;
+            credited = true;
+            // An index of u64::MAX cannot be followed by another, and a queue never gets there.
+            deposit_next = withdrawal
+                .index
+                .checked_add(1)
+                .ok_or(SourceError::DepositIndexGap {
+                    block: this_block,
+                    expected: deposit_next,
+                    got: withdrawal.index,
+                })?;
+        }
+        self.deposit_next = deposit_next;
+        self.first_deposit_pending = first_pending;
+
         let group = std::mem::take(&mut self.pending);
         let number = group[0].header.block;
         let first_sub_block_secs = group[0].header.timestamp_us / 1_000_000;
@@ -242,8 +318,9 @@ impl BlockSource {
                 timestamp,
                 gas_limit: self.block_gas_limit,
                 txs,
-                deposits_end: None,
+                deposits_end: credited.then_some(deposit_next),
             },
+            deposits_end: deposit_next,
             sub_block_header_hashes,
         }))
     }
@@ -252,8 +329,9 @@ impl BlockSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::B256;
+    use alloy::primitives::{Address, B256};
     use alloy::signers::local::PrivateKeySigner;
+    use rome_zk_executor_api::deposit_withdrawal;
     use rome_zk_sequencer::header::SubBlockHeader;
     use rome_zk_sequencer::log::LogWriter;
     use rome_zk_sequencer::signing::sign_header;
@@ -797,5 +875,177 @@ mod tests {
             matches!(err, SourceError::Io(_)),
             "must surface as the named SourceError::Io variant: {err:?}"
         );
+    }
+
+    /// Writes one two-sub-block block whose index-0 record carries the credits for `indices` (empty for a block
+    /// without deposits). Every withdrawal is built by `deposit_withdrawal`, never by hand.
+    fn write_deposit_block(
+        writer: &mut LogWriter,
+        block: u64,
+        sender: &PrivateKeySigner,
+        indices: &[u64],
+    ) {
+        let withdrawals: Vec<_> = indices
+            .iter()
+            .map(|&i| deposit_withdrawal(i, Address::repeat_byte(0x22), 1_000 + i))
+            .collect();
+        for index in 0..2u16 {
+            let header = SubBlockHeader {
+                chain_id: CHAIN_ID,
+                block,
+                index,
+                timestamp_us: 1_757_000_000_000_000 + block * 2_000_000 + index as u64 * 50_000,
+                tx_root: B256::ZERO,
+                receipts_root: B256::ZERO,
+                gas_used: 21_000,
+                prev_hash: B256::ZERO,
+                deposits_end: if index == 0 {
+                    indices.last().map(|i| i + 1)
+                } else {
+                    None
+                },
+            };
+            let signature = sign_header(&PrivateKeySigner::random(), &header);
+            let tx = signed_raw_tx(sender, CHAIN_ID, block * 10 + index as u64);
+            let credits: &[_] = if index == 0 { &withdrawals } else { &[] };
+            writer
+                .append_with_withdrawals(&header, &signature, &[tx], credits)
+                .unwrap();
+        }
+    }
+
+    fn deposit_log(blocks: &[(u64, &[u64])]) -> tempfile::TempDir {
+        let dir = tempdir().unwrap();
+        let sender = PrivateKeySigner::random();
+        let mut writer = LogWriter::open(dir.path(), 10_000).unwrap();
+        for &(block, indices) in blocks {
+            write_deposit_block(&mut writer, block, &sender, indices);
+        }
+        dir
+    }
+
+    fn deposit_source(dir: &tempfile::TempDir, from_block: u64, deposit_next: u64) -> BlockSource {
+        BlockSource::open(dir.path(), CHAIN_ID, 100_000_000, 2, from_block, 0)
+            .unwrap()
+            .with_deposit_start(deposit_next)
+    }
+
+    /// A block's `deposits_end` is its last withdrawal's index plus one, read off the log; a block without
+    /// withdrawals has no fifth field and the cumulative value carries over.
+    #[test]
+    fn deposits_end_is_the_last_index_plus_one_and_carries_over() {
+        let dir = deposit_log(&[(1, &[0, 1, 2]), (2, &[]), (3, &[3])]);
+        let mut source = deposit_source(&dir, 1, 0);
+        let b1 = source.next_block().unwrap().unwrap();
+        let b2 = source.next_block().unwrap().unwrap();
+        let b3 = source.next_block().unwrap().unwrap();
+        assert_eq!(b1.block.deposits_end, Some(3));
+        assert_eq!(b1.deposits_end, 3);
+        assert_eq!(b2.block.deposits_end, None);
+        assert_eq!(b2.deposits_end, 3);
+        assert_eq!(b3.block.deposits_end, Some(4));
+        assert_eq!(b3.deposits_end, 4);
+    }
+
+    /// The indices are read, not counted: a run that starts at the cursor's `deposit_next` (not at 0) gives
+    /// an end that is one past the last index.
+    #[test]
+    fn indices_start_at_the_cursor_not_at_zero() {
+        let dir = deposit_log(&[(1, &[40, 41]), (2, &[42])]);
+        let mut source = deposit_source(&dir, 1, 40);
+        assert_eq!(source.next_block().unwrap().unwrap().deposits_end, 42);
+        assert_eq!(source.next_block().unwrap().unwrap().deposits_end, 43);
+    }
+
+    /// A log without deposits never gets a fifth field, and the cumulative value stays at the resume point.
+    #[test]
+    fn a_log_without_deposits_has_no_fifth_field() {
+        let dir = deposit_log(&[(1, &[]), (2, &[])]);
+        let mut source = deposit_source(&dir, 1, 7);
+        for _ in 0..2 {
+            let sourced = source.next_block().unwrap().unwrap();
+            assert_eq!(sourced.block.deposits_end, None);
+            assert_eq!(sourced.deposits_end, 7);
+        }
+    }
+
+    /// The first index after the resume point must be the cursor's `deposit_next`: one ahead (a skipped deposit)
+    /// and one behind (a repeated one) are both a named stop.
+    #[test]
+    fn a_wrong_first_index_is_a_named_stop() {
+        for first in [6u64, 4] {
+            let dir = deposit_log(&[(1, &[first])]);
+            let mut source = deposit_source(&dir, 1, 5);
+            let err = source.next_block().unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    SourceError::FirstDepositIndexMismatch { block: 1, expected: 5, got } if got == first
+                ),
+                "{err:?}"
+            );
+        }
+    }
+
+    /// A gap or a repeat after the first credit is a named stop too, between blocks and inside one block.
+    #[test]
+    fn a_gap_or_a_repeat_is_a_named_stop() {
+        // Between blocks: block 1 ends at 2, block 2 starts at 3.
+        let dir = deposit_log(&[(1, &[0, 1]), (2, &[3])]);
+        let mut source = deposit_source(&dir, 1, 0);
+        source.next_block().unwrap().unwrap();
+        let err = source.next_block().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SourceError::DepositIndexGap {
+                    block: 2,
+                    expected: 2,
+                    got: 3
+                }
+            ),
+            "{err:?}"
+        );
+        // A repeat across blocks.
+        let dir = deposit_log(&[(1, &[0, 1]), (2, &[1])]);
+        let mut source = deposit_source(&dir, 1, 0);
+        source.next_block().unwrap().unwrap();
+        let err = source.next_block().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SourceError::DepositIndexGap {
+                    block: 2,
+                    expected: 2,
+                    got: 1
+                }
+            ),
+            "{err:?}"
+        );
+        // Inside one block: 0, 2.
+        let dir = deposit_log(&[(1, &[0, 2])]);
+        let mut source = deposit_source(&dir, 1, 0);
+        let err = source.next_block().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SourceError::DepositIndexGap {
+                    block: 1,
+                    expected: 1,
+                    got: 2
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// A refusal leaves the source's deposit position where it was, so nothing half-read is carried forward.
+    #[test]
+    fn a_refused_block_does_not_move_the_deposit_position() {
+        let dir = deposit_log(&[(1, &[0, 2])]);
+        let mut source = deposit_source(&dir, 1, 0);
+        source.next_block().unwrap_err();
+        assert_eq!(source.deposit_next, 0);
+        assert!(source.first_deposit_pending);
     }
 }

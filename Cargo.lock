@@ -11116,6 +11116,7 @@ dependencies = [
  "rand 0.8.8",
  "rome-zk-channel",
  "rome-zk-derive",
+ "rome-zk-executor-api",
  "rome-zk-layouts",
  "rome-zk-log",
  "rome-zk-merkle",

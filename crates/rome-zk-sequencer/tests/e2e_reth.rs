@@ -9,22 +9,18 @@ use alloy::signers::local::PrivateKeySigner;
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::http_client::HttpClientBuilder;
 use rome_zk_sequencer::testutil::signed_raw_tx;
-use std::net::TcpListener;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
+
+mod common;
 
 const CHAIN_ID: u64 = 424_243;
 const SENDERS: usize = 50;
 const TXS_PER_SENDER: usize = 40; // 50 * 40 = 2,000
 const TOTAL_TXS: usize = SENDERS * TXS_PER_SENDER;
 const GENESIS_BALANCE_HEX: &str = "0x33b2e3c9fd0803ce8000000"; // matches genesis.json.template
-
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
-}
 
 struct ChildGuard(Child);
 impl Drop for ChildGuard {
@@ -88,7 +84,7 @@ async fn e2e_2000_txs_from_50_senders_with_reth_executor_preconf_p99_under_100ms
             "shanghaiTime": 0, "cancunTime": 0, "pragueTime": 0
         },
         "nonce": "0x0", "timestamp": "0x0", "extraData": "0x",
-        "gasLimit": "0x2540be400", "difficulty": "0x0",
+        "gasLimit": "0x5f5e100", "difficulty": "0x0",
         "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
         "coinbase": "0x0000000000000000000000000000000000000000",
         "alloc": alloc,
@@ -99,16 +95,14 @@ async fn e2e_2000_txs_from_50_senders_with_reth_executor_preconf_p99_under_100ms
     let genesis_path = dir.path().join("genesis.json");
     std::fs::write(&genesis_path, genesis.to_string()).unwrap();
 
-    let rpc_port = free_port();
-    let metrics_port = free_port();
     let config_path = dir.path().join("config.toml");
     std::fs::write(
         &config_path,
         format!(
             r#"
             chain_id = {CHAIN_ID}
-            rpc_addr = "127.0.0.1:{rpc_port}"
-            metrics_addr = "127.0.0.1:{metrics_port}"
+            rpc_addr = "127.0.0.1:0"
+            metrics_addr = "127.0.0.1:0"
             log_dir = "{}"
             sequencer_key_path = "{}"
 
@@ -130,16 +124,11 @@ async fn e2e_2000_txs_from_50_senders_with_reth_executor_preconf_p99_under_100ms
     )
     .unwrap();
 
-    let bin = env!("CARGO_BIN_EXE_rome-zk-sequencer");
-    let child = Command::new(bin)
-        .arg("--config")
-        .arg(&config_path)
-        .arg("--executor")
-        .arg("reth")
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn rome-zk-sequencer binary");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rome-zk-sequencer"));
+    cmd.arg("--config").arg(&config_path);
+    cmd.arg("--executor").arg("reth");
+    let (child, ports) = common::spawn_reporting_ports(&mut cmd);
+    let (rpc_port, metrics_port) = (ports.rpc, ports.metrics);
     let _guard = ChildGuard(child);
 
     wait_for_port(rpc_port, Duration::from_secs(20)).await;

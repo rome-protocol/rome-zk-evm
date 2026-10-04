@@ -68,8 +68,10 @@ struct LogBlocks {
     blocks: Vec<Block>,
 }
 
-fn leaf_present(raw: &[u8], idx: u32) -> bool {
-    raw.get(rome_zk_layouts::batch::HEADER_LEN + (idx as usize) / 8)
+/// Whether leaf `idx` is marked present in the batch account's bitmap, which starts at `bitmap_off`
+/// (the header length of the account's own version).
+fn leaf_present(raw: &[u8], bitmap_off: usize, idx: u32) -> bool {
+    raw.get(bitmap_off + (idx as usize) / 8)
         .is_some_and(|byte| (byte >> (idx % 8)) & 1 == 1)
 }
 
@@ -81,10 +83,11 @@ fn present_leaves_match(open: &OpenBatch, frames: &[Frame]) -> Result<(), Pipeli
     if open.account.finalize_cursor == 0 {
         return pipeline::verify_presealed_leaves(&open.raw, expected_count, frames);
     }
-    let leaves_off = rome_zk_layouts::batch::leaves_offset(expected_count);
+    let (bitmap_off, leaves_off) = rome_zk_layouts::batch::leaf_offsets(&open.raw, expected_count)
+        .map_err(|e| PipelineError::Rederive(format!("batch account header: {e:?}")))?;
     for frame in frames {
         let idx = frame.frame_no as u32;
-        if idx >= expected_count || !leaf_present(&open.raw, idx) {
+        if idx >= expected_count || !leaf_present(&open.raw, bitmap_off, idx) {
             continue;
         }
         let slot = leaves_off + 32 * idx as usize;
@@ -455,10 +458,13 @@ pub async fn resume_open_batches<A: AccountOps, S: Sender>(
             chain_id: w.chain_id,
             batch: ob.batch,
         };
+        let (bitmap_off, _) =
+            rome_zk_layouts::batch::leaf_offsets(&ob.raw, ob.account.expected_count)
+                .map_err(|e| PipelineError::Rederive(format!("batch account header: {e:?}")))?;
         let missing: Vec<Frame> = chosen
             .frames
             .iter()
-            .filter(|f| !leaf_present(&ob.raw, f.frame_no as u32))
+            .filter(|f| !leaf_present(&ob.raw, bitmap_off, f.frame_no as u32))
             .cloned()
             .collect();
         tracing::warn!(

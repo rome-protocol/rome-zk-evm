@@ -24,7 +24,7 @@ uint256(0)))` via an Ethereum Merkle-Patricia proof (`eth_getProof`) against the
 
 **ETH stays in this contract.** There is no `withdraw`, no `receive()`, no `fallback()` — a plain
 transfer reverts. The L2 balance is burned by construction; the Solana-side twin asset is released from
-an off-chain vault (`programs/zk-bridge`) once `ProveExit` succeeds.
+the chain's vault in `programs/zk-bridge`, on Solana, once `ProveExit` succeeds.
 
 ## Bound: censorship
 
@@ -34,22 +34,16 @@ sequencer can refuse to include an `initiateExit` transaction, and there is no a
 
 ## Build and test
 
-Every `forge`/`anvil` invocation runs inside the pinned image `ghcr.io/foundry-rs/foundry:v1.3.6`
-(digest `sha256:7026b071fb16606a14426acc0a0e2cd57f80b96abd7e7d371fef8dafe1712cdf`) on a build machine — never
-a developer's own forge/anvil. From a checkout on that machine:
+Run `forge` inside the pinned image `ghcr.io/foundry-rs/foundry:v1.3.6` (digest
+`sha256:7026b071fb16606a14426acc0a0e2cd57f80b96abd7e7d371fef8dafe1712cdf`) rather than a locally installed
+forge, so the bytecode matches the committed runtime hex. From the repository root:
 
 ```
-cd <checkout>
-sudo docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD":/work -w /work/contracts/exit-portal \
+docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD":/work -w /work/contracts/exit-portal \
   ghcr.io/foundry-rs/foundry:v1.3.6 "forge test -vvv"
 ```
 
-Runs as the invoking user (never `--user root`, never a `chown` cleanup after — the same shape the CI
-`contracts` job and `make exit-fixtures` both use). Plain `sudo` is fine here: nothing this command needs
-is read back out of the *invoking shell's* own environment by a bare `-e VAR` — `-e HOME=/tmp` is a
-literal value on docker's own argv. Contrast the deploy script's `-e PRIVATE_KEY`,
-which *is* a passthrough of the caller's own env var and so needs `sudo --preserve-env=PRIVATE_KEY`
-specifically.
+The container runs as your own user, so the files it writes stay yours.
 
 `foundry.toml` pins `solc_version = 0.8.28`, `evm_version = cancun`, `optimizer = true` /
 `optimizer_runs = 200`, `bytecode_hash = none`, `cbor_metadata = false` — the runtime bytecode is
@@ -59,32 +53,29 @@ rebuilt fresh at deploy time.
 
 ## Regenerating fixtures
 
-`make exit-fixtures` runs `contracts/exit-portal/script/fixtures.sh` inside the pinned image on a build
-machine, then pulls the results back into this checkout: `fixtures/exit/*` and
-`contracts/exit-portal/RomeExitPortal.runtime.hex`. See `fixtures/exit/README.md` for what each file is
-and the one field (`anvil_state_root.json`'s `block_hash`) that does not reproduce byte-for-byte, and why.
+`script/fixtures.sh` regenerates `fixtures/exit/*` and `contracts/exit-portal/RomeExitPortal.runtime.hex`. Run
+it the same way, inside the pinned image, from the repository root:
 
-## Deploying to Tiber (no reset)
+```
+docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD":/work -w /work/contracts/exit-portal \
+  ghcr.io/foundry-rs/foundry:v1.3.6 "bash script/fixtures.sh"
+```
 
-The operator's deploy script for Tiber has a `--dry-run` mode that prints exactly what a real deploy would run
-without fetching any key or touching the network. `--confirm` is the operator's go step: it runs on the Tiber
-VM itself, where the VM's own service account can read the deployer key from the secret store. The deployer
-key never touches this repo, argv, or disk — see the script's own header for the exact mechanism.
+See `fixtures/exit/README.md` for what each file is and the one field (`anvil_state_root.json`'s
+`block_hash`) that does not reproduce byte-for-byte, and why.
 
 ## Greenfield predeploy
 
-A new chain's `genesis.json` (rendered by the operator's genesis render script from
-`genesis.json.template`) carries `RomeExitPortal`'s runtime bytecode pre-deployed at
-`0x4200000000000000000000000000000000000016`, sourced from the committed
-`RomeExitPortal.runtime.hex` — refused by name (`ExitPortalRuntimeMissing`) if that file is absent or
-not valid hex.
+`./rollup init` in [`deploy/rollup`](../../deploy/rollup) renders a new chain's genesis from
+`deploy/rollup/genesis.json.template`, with `RomeExitPortal`'s runtime bytecode, read from the committed
+`RomeExitPortal.runtime.hex`, pre-deployed at `0x4200000000000000000000000000000000000016` with a balance of
+0. It refuses by name (`ExitPortalRuntimeMissing`) if that file is absent, empty or not valid hex.
 
-**Tiber itself never gets this predeploy from a routine render.** The genesis renderer only writes a fresh
-`genesis.json` where none exists (or where the render is byte-identical). Against Tiber's tracked,
-live, dev-account-only `genesis.json` a fresh render differs (this predeploy) — the routine file push
-therefore calls it with `--keep-existing`: the file is kept byte-for-byte, one line reports
-`differs in: alloc[0x42…16]`, and the push continues; a bare run refuses by name (`GenesisDrift`). So a
-routine push can never swap the live genesis for one carrying the portal (a `reth` node refuses to start
-on a genesis-hash mismatch against its own chain state). Tiber gets the portal the way any contract
-reaches a live chain: the deploy script's `--confirm` run (see above). Only a full reset
-renders fresh — it removes the existing `genesis.json` before re-deploying.
+## An existing chain
+
+A chain's genesis cannot change once the chain is running: a reth node refuses to start on a genesis whose
+hash differs from its own chain state. A chain started without the predeploy gets the portal as an ordinary
+contract deployment instead (`script/DeployRomeExitPortal.s.sol`, which reads the deployer key from the
+`PRIVATE_KEY` environment variable), at whatever address that deployment produces. The chain's exit
+configuration then names that address, and the exit prover's `portal_from_block` is set to the block the
+portal was deployed in.

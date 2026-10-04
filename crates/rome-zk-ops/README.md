@@ -24,7 +24,8 @@ rome-zk-ops [--rpc-url URL] [--confirm | --dry-run | --offline] <command>
 | `vault show --settlement P --bridge P --chain-id N` | Prints the vault's configuration and token balance, or that it is not initialised. Sends nothing. |
 | `release-exit --settlement P --bridge P --chain-id N --message-hash 0x... --payer-keypair F` | Reads a proved exit record, creates the recipient's token account if it is missing, and sends `ReleaseExit` in the same transaction. A record that does not exist, or is not proved, is refused by name. |
 
-Run `rome-zk-ops <command> --help` for every flag.
+Run `rome-zk-ops <command> --help` for every flag. `--rpc-url` defaults to the public Solana devnet endpoint,
+`https://api.devnet.solana.com`.
 
 ## Three rules
 
@@ -32,7 +33,10 @@ Run `rome-zk-ops <command> --help` for every flag.
   would check, builds and signs the transaction against an all-zero blockhash, prints it (base64, the decoded
   instruction and its discriminant) and sends nothing. That transaction can never land, because the cluster
   refuses a blockhash it has not seen. `--offline` is a dry run with no RPC at all: the checks that need the
-  chain are skipped and the output says so. `--confirm` and `--dry-run` or `--offline` together are refused.
+  chain are skipped and the output says so. `--offline` is for commands that send: the read-only commands
+  (`chain-id`, `exit-config show`, `vault show`) need an RPC and fail by name without one. `--confirm` and
+  `--dry-run` or `--offline` together are refused. A command run with `--confirm` waits until its
+  transaction reaches `confirmed`, not `finalized`.
 - **V1 transactions only.** Every transaction goes out through `rome-zk-solana-sender`. This crate has no
   other send path and no legacy transaction constructor. Where a command needs a second signer (a reserved
   registration, a proposal paid by a different key), the sender signs for all of them.
@@ -59,8 +63,9 @@ the same V1 path.
 ## In the node image
 
 The root `Dockerfile` builds `rome-zk-ops` next to the sequencer, batcher and derive binaries and installs it at
-`/usr/local/bin/rome-zk-ops`, so `docker run --entrypoint rome-zk-ops <image> --help` works. The image runs as
-uid and gid 999.
+`/usr/local/bin/rome-zk-ops`, so `docker run --entrypoint rome-zk-ops <image> --help` works on an image built
+from this tree. The image runs as uid and gid 999. Published node images up to `v0.1.3` do not include it; the
+first tag after `v0.1.3` will. Until then, build it with `cargo build --release -p rome-zk-ops`.
 
 ## Tests
 

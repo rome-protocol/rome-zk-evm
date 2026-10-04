@@ -43,7 +43,7 @@ struct ScriptedChain {
 
 fn batch_header(expected_count: u32, finalized: bool) -> Vec<u8> {
     use rome_zk_layouts::batch as b;
-    let mut d = vec![0u8; b::account_len(expected_count)];
+    let mut d = vec![0u8; b::account_len_for(b::VERSION, expected_count).unwrap()];
     d[0..4].copy_from_slice(&b::MAGIC.to_le_bytes());
     d[b::OFF_VERSION] = b::VERSION;
     d[b::OFF_EXPECTED_COUNT..b::OFF_EXPECTED_COUNT + 4]

@@ -1,8 +1,8 @@
 # rome-zk-prover-input-cross-repo-wire
 
 Proves `rome-zk-prover-input`'s `wire::RomePublicInput`/`RomeWitnessInput` encode byte-for-byte
-compatibly with `rome-zk-guest`'s own `guest_rome::input::{RomePublicInput,
-RomeWitnessInput}` (`rome-protocol/rome-zk-guest` (tag `v0.1.0`),
+compatibly with the guest's own `guest_rome::input::{RomePublicInput,
+RomeWitnessInput}` (wire v3; `rome-protocol/zisk-eth-client`, branch `deposits-guest`,
 `crates/clients/rome/guest/src/input.rs`) — in both directions. This is the correctness gap
 `rome-zk-prover-input/README.md`'s "Open questions" named as missing.
 
@@ -29,8 +29,8 @@ exercised by this proof, so the test binary links on a native host.
 root:
 
 ```sh
-git clone https://github.com/rome-protocol/rome-zk-guest <repo-root>/.fork
-cd <repo-root>/.fork && git checkout v0.1.0
+git clone --branch deposits-guest https://github.com/rome-protocol/zisk-eth-client <repo-root>/.fork
+cd <repo-root>/.fork
 git submodule update --init third_party/ziskethone
 ```
 
@@ -51,8 +51,9 @@ crate uses instead of letting that raw error stand as the only signal:
 ## What the tests prove
 
 - `forward_ours_encode_guest_decode` — encode with `rome_zk_prover_input::wire`, decode with
-  `guest_rome::input`, assert every field.
+  `guest_rome::input`, assert every field (the v3 deposit range included, with and without deposits).
 - `reverse_guest_encode_ours_decode` — the opposite direction.
+- `both_sides_encode_the_same_bytes` — one value, both encoders, identical bytes.
 - `witness_input_round_trips_both_directions` — `RomeWitnessInput`, both ways (a second, separately-read
   bincode frame in the guest's own two-read contract).
 
@@ -78,3 +79,14 @@ assertion `left == right` failed
 (`182706`/`3930` are `open_slot`/`batch` from the test's own sample input — decoded back swapped, exactly
 the silent-corruption failure mode this proof exists to catch.) The edit was reverted with `git checkout
 --` immediately after capturing this output, and the rerun after the revert was green again.
+
+## Wire v3 re-check, and the lockfile
+
+Re-run for wire v3 (the deposit range after `blocks`): swapping the declarations of `settlement_program` and
+`deposit_hash_from` in `rome-zk-prover-input/src/wire.rs` (same type, so decode never errors) turned
+`forward_ours_encode_guest_decode`, `reverse_guest_encode_ours_decode` and `both_sides_encode_the_same_bytes`
+red (`left: [68, 68, ...]`, `right: [51, 51, ...]`), and restoring the order turned them green again.
+
+`Cargo.lock` here was regenerated against the guest-v3 checkout, seeded from `rome-zk-prover-input/Cargo.lock`:
+the old lock predated that crate's Solana 4.3 bump, and a fresh resolve (no seed) picks a
+`solana-signature`/`solana-keypair` pair that does not compile. If the lock goes stale again, seed it the same way.

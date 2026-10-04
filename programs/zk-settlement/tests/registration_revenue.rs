@@ -77,7 +77,14 @@ fn inbox_batch_account(
     acc: [u8; 32],
 ) -> Account {
     let expected_count: u32 = 1;
-    let mut d = vec![0u8; rome_zk_layouts::batch::account_len(expected_count)];
+    let mut d = vec![
+        0u8;
+        rome_zk_layouts::batch::account_len_for(
+            rome_zk_layouts::batch::VERSION,
+            expected_count
+        )
+        .unwrap()
+    ];
     d[0..4].copy_from_slice(&rome_zk_layouts::batch::MAGIC.to_le_bytes());
     d[4] = rome_zk_layouts::batch::VERSION;
     d[5..13].copy_from_slice(&chain_id.to_le_bytes());

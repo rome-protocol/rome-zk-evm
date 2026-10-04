@@ -17,8 +17,8 @@
 //! call for both fields) — the anchor `rome-zk-derive`'s one-sided drift bound
 //! (`block.timestamp <= open_unix_ts + max_drift_secs`) checks every block against. It is appended after
 //! `finalize_cursor`, **not** inserted mid-header, so every existing offset (`OFF_MAGIC` through
-//! `OFF_FINALIZE_CURSOR`) is unchanged — only `HEADER_LEN` (and everything derived from it:
-//! `bitmap_len`/`leaves_offset`/`account_len`) moves. It is not part of `acc`: the accumulator still
+//! `OFF_FINALIZE_CURSOR`) is unchanged — only `HEADER_LEN_V2` (and everything derived from it:
+//! `bitmap_len`/`leaves_offset_for`/`account_len_for`) moves. It is not part of `acc`: the accumulator still
 //! binds only the DA bytes (`chain_id ‖ batch ‖ open_slot ‖ expected_count ‖ root ‖ forced_root`) — the
 //! clock reading is authoritative because the program wrote it, not because it is committed into the
 //! Merkle/acc chain. There is no migration: a v1 account (`OFF_VERSION == 1`) is refused by every reader
@@ -34,9 +34,10 @@
 //!
 //! The header goes from 210 to 290 bytes and every v2 offset stays where it is. [`read`] accepts v2 and
 //! v3. [`write_header`] still writes v2 (the inbox keeps writing v2 until it learns deposits) and
-//! [`write_header_v3`] writes v3. Because the header length now depends on the account's version, the
-//! version-taking [`header_len`], [`leaves_offset_for`] and [`account_len_for`] sit beside the old
-//! one-version names, which stay for v2 until every caller passes its version.
+//! [`write_header_v3`] writes v3. Because the header length depends on the account's version, the
+//! version-taking [`header_len`], [`leaves_offset_for`] and [`account_len_for`] are the only way to get a
+//! length or an offset, so a reader has to say which version it is reading; [`leaf_offsets`] does that
+//! from a raw account's own version byte.
 
 pub const MAGIC: u32 = 0x5a4b_4254; // "ZKBT"
 /// The version [`write_header`] produces.
@@ -71,14 +72,14 @@ pub const OFF_DEPOSIT_HASH_FROM: usize = 226;
 pub const OFF_DEPOSIT_HASH_TO: usize = 258;
 /// End of the fixed v2 header; the presence bitmap starts here. v1 was 202 (no `open_unix_ts`); every v1
 /// account is refused (`BadVersion`), never read at the old length. A v3 header is [`HEADER_LEN_V3`].
-pub const HEADER_LEN: usize = 210;
+pub const HEADER_LEN_V2: usize = 210;
 /// End of the fixed v3 header (v2's 210 plus the 80-byte deposit range).
 pub const HEADER_LEN_V3: usize = 290;
 
 /// Fixed header length for the account's `version` byte (2 or 3); `BadVersion` for any other.
 pub fn header_len(version: u8) -> Result<usize, crate::LayoutError> {
     match version {
-        VERSION => Ok(HEADER_LEN),
+        VERSION => Ok(HEADER_LEN_V2),
         VERSION_V3 => Ok(HEADER_LEN_V3),
         _ => Err(crate::LayoutError::BadVersion),
     }
@@ -89,24 +90,31 @@ pub fn bitmap_len(expected_count: u32) -> usize {
     (expected_count as usize).div_ceil(8)
 }
 
-/// Byte offset where `leaf_hashes` begins (`HEADER_LEN + bitmap_len(expected_count)`).
-pub fn leaves_offset(expected_count: u32) -> usize {
-    HEADER_LEN + bitmap_len(expected_count)
-}
-
-/// Total account size for `expected_count` leaves.
-pub fn account_len(expected_count: u32) -> usize {
-    leaves_offset(expected_count) + 32 * expected_count as usize
-}
-
-/// [`leaves_offset`] for an account of `version` (2 or 3).
+/// Byte offset where `leaf_hashes` begins for an account of `version` (2 or 3):
+/// `header_len(version) + bitmap_len(expected_count)`.
 pub fn leaves_offset_for(version: u8, expected_count: u32) -> Result<usize, crate::LayoutError> {
     Ok(header_len(version)? + bitmap_len(expected_count))
 }
 
-/// [`account_len`] for an account of `version` (2 or 3).
+/// Total account size for `expected_count` leaves, for an account of `version` (2 or 3).
 pub fn account_len_for(version: u8, expected_count: u32) -> Result<usize, crate::LayoutError> {
     Ok(leaves_offset_for(version, expected_count)? + 32 * expected_count as usize)
+}
+
+/// Where the presence bitmap and the leaf hashes start in a raw batch account, `(bitmap_offset,
+/// leaves_offset)`, taken from the account's own version byte. For a reader that indexes the raw bytes
+/// directly instead of going through [`read`]: it cannot take the offsets from a constant, because v2 and
+/// v3 headers differ in length. `BadVersion` for any other version byte, `TooShort` when `d` is too short
+/// to hold the version byte.
+pub fn leaf_offsets(d: &[u8], expected_count: u32) -> Result<(usize, usize), crate::LayoutError> {
+    let version = *d.get(OFF_VERSION).ok_or(crate::LayoutError::TooShort {
+        need: OFF_VERSION + 1,
+        got: d.len(),
+    })?;
+    Ok((
+        header_len(version)?,
+        leaves_offset_for(version, expected_count)?,
+    ))
 }
 
 /// `["batch", settlement_program, chain_id, batch]` — owned by the inbox program. The settlement program is
@@ -140,7 +148,7 @@ pub fn pda(
 }
 
 /// Field-for-field decode of a batch account's fixed header (not the bitmap or leaf hashes, which the
-/// caller indexes directly via [`leaves_offset`]). Layout structs carry raw `[u8; 32]`; only `pda()` uses
+/// caller indexes directly via [`leaves_offset_for`]). Layout structs carry raw `[u8; 32]`; only `pda()` uses
 /// `solana_program::Pubkey`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchFields {
@@ -178,7 +186,7 @@ pub struct BatchDeposit {
 /// account's owner — callers hold `program_id` and must check that themselves.
 ///
 /// **Check order matters for v1 (there is no migration).** A v1 account is exactly 202 bytes — short
-/// of v2's 210-byte `HEADER_LEN` — but magic and every field up to `finalize_cursor` are still valid v1
+/// of v2's 210-byte `HEADER_LEN_V2` — but magic and every field up to `finalize_cursor` are still valid v1
 /// bytes; a length check ahead of the version check would report a v1 account as merely `TooShort`
 /// rather than naming the real cause. So magic and version are checked as soon as there are enough bytes
 /// to read them (`OFF_VERSION + 1`), and only a header that passes both is then checked against the full
@@ -189,7 +197,7 @@ pub struct BatchDeposit {
 pub fn read(d: &[u8]) -> Result<BatchFields, crate::LayoutError> {
     if d.len() < OFF_VERSION + 1 {
         return Err(crate::LayoutError::TooShort {
-            need: HEADER_LEN,
+            need: HEADER_LEN_V2,
             got: d.len(),
         });
     }
@@ -229,12 +237,12 @@ pub fn read(d: &[u8]) -> Result<BatchFields, crate::LayoutError> {
 
 /// Encodes a **v2** batch account's fixed header (the inverse of [`read`] for a v2 header, for the
 /// header portion only — the caller writes the presence bitmap and leaf hashes itself via
-/// [`leaves_offset`]). Returns exactly [`HEADER_LEN`] bytes. A v2 header cannot carry a deposit
+/// [`leaves_offset_for`]). Returns exactly [`HEADER_LEN_V2`] bytes. A v2 header cannot carry a deposit
 /// range, so `f.deposit` must be `None`; use [`write_header_v3`] for one that has it.
 #[inline]
-pub fn write_header(f: &BatchFields) -> [u8; HEADER_LEN] {
+pub fn write_header(f: &BatchFields) -> [u8; HEADER_LEN_V2] {
     debug_assert!(f.deposit.is_none(), "a v2 header has no deposit range");
-    let mut d = [0u8; HEADER_LEN];
+    let mut d = [0u8; HEADER_LEN_V2];
     d[OFF_MAGIC..OFF_MAGIC + 4].copy_from_slice(&MAGIC.to_le_bytes());
     d[OFF_VERSION] = VERSION;
     d[OFF_CHAIN_ID..OFF_CHAIN_ID + 8].copy_from_slice(&f.chain_id.to_le_bytes());
@@ -261,7 +269,7 @@ pub fn write_header(f: &BatchFields) -> [u8; HEADER_LEN] {
 pub fn write_header_v3(f: &BatchFields) -> Option<[u8; HEADER_LEN_V3]> {
     let dep = f.deposit.as_ref()?;
     let mut d = [0u8; HEADER_LEN_V3];
-    d[..HEADER_LEN].copy_from_slice(&write_header(&BatchFields {
+    d[..HEADER_LEN_V2].copy_from_slice(&write_header(&BatchFields {
         deposit: None,
         ..f.clone()
     }));
@@ -303,7 +311,7 @@ mod tests {
         };
         let d = write_header(&f);
         #[rustfmt::skip]
-        let expected: [u8; HEADER_LEN] = [
+        let expected: [u8; HEADER_LEN_V2] = [
             // magic 'ZKBT' = 0x5a4b_4254 LE
             0x54, 0x42, 0x4b, 0x5a,
             // version = 2
@@ -463,10 +471,10 @@ mod tests {
         // v3 and v2 differ only in the version byte and the appended range.
         let d3 = write_header_v3(&v3).unwrap();
         assert_eq!(d3[..OFF_VERSION], d[..OFF_VERSION]);
-        assert_eq!(d3[OFF_VERSION + 1..HEADER_LEN], d[OFF_VERSION + 1..]);
+        assert_eq!(d3[OFF_VERSION + 1..HEADER_LEN_V2], d[OFF_VERSION + 1..]);
         // A v2 account whose allocation is longer than the header (bitmap, leaves) is still v2.
         let mut full = d.to_vec();
-        full.resize(account_len(5), 0xee);
+        full.resize(account_len_for(2, 5).unwrap(), 0xee);
         assert_eq!(read(&full).unwrap().deposit, None);
     }
 
@@ -513,14 +521,15 @@ mod tests {
     }
 
     #[test]
-    fn version_taking_lengths_match_the_old_names_for_v2_and_add_80_for_v3() {
+    fn version_taking_lengths_follow_the_formula_and_v3_adds_80() {
         assert_eq!(header_len(2), Ok(210));
         assert_eq!(header_len(3), Ok(290));
         for n in [0u32, 1, 8, 9, 900] {
-            assert_eq!(leaves_offset_for(2, n), Ok(leaves_offset(n)));
-            assert_eq!(account_len_for(2, n), Ok(account_len(n)));
-            assert_eq!(leaves_offset_for(3, n), Ok(leaves_offset(n) + 80));
-            assert_eq!(account_len_for(3, n), Ok(account_len(n) + 80));
+            let v2_leaves = HEADER_LEN_V2 + bitmap_len(n);
+            assert_eq!(leaves_offset_for(2, n), Ok(v2_leaves));
+            assert_eq!(account_len_for(2, n), Ok(v2_leaves + 32 * n as usize));
+            assert_eq!(leaves_offset_for(3, n), Ok(v2_leaves + 80));
+            assert_eq!(account_len_for(3, n), Ok(v2_leaves + 80 + 32 * n as usize));
         }
     }
 
@@ -552,12 +561,27 @@ mod tests {
         assert_eq!(bitmap_len(1), 1);
         assert_eq!(bitmap_len(8), 1);
         assert_eq!(bitmap_len(9), 2);
-        assert_eq!(leaves_offset(9), HEADER_LEN + 2);
-        assert_eq!(account_len(9), HEADER_LEN + 2 + 32 * 9);
+        assert_eq!(leaves_offset_for(2, 9), Ok(HEADER_LEN_V2 + 2));
+        assert_eq!(account_len_for(2, 9), Ok(HEADER_LEN_V2 + 2 + 32 * 9));
+    }
+
+    #[test]
+    fn leaf_offsets_follow_the_accounts_own_version_byte() {
+        let mut d = vec![0u8; account_len_for(VERSION_V3, 9).unwrap()];
+        d[OFF_VERSION] = VERSION;
+        assert_eq!(leaf_offsets(&d, 9), Ok((210, 212)));
+        d[OFF_VERSION] = VERSION_V3;
+        assert_eq!(leaf_offsets(&d, 9), Ok((290, 292)));
+        d[OFF_VERSION] = 1;
+        assert_eq!(leaf_offsets(&d, 9), Err(crate::LayoutError::BadVersion));
+        assert!(matches!(
+            leaf_offsets(&d[..OFF_VERSION], 9),
+            Err(crate::LayoutError::TooShort { .. })
+        ));
     }
 
     fn build(chain_id: u64, batch: u64, expected_count: u32) -> Vec<u8> {
-        let mut d = vec![0u8; account_len(expected_count)];
+        let mut d = vec![0u8; account_len_for(VERSION, expected_count).unwrap()];
         d[OFF_MAGIC..OFF_MAGIC + 4].copy_from_slice(&MAGIC.to_le_bytes());
         d[OFF_VERSION] = VERSION;
         d[OFF_CHAIN_ID..OFF_CHAIN_ID + 8].copy_from_slice(&chain_id.to_le_bytes());
@@ -588,7 +612,7 @@ mod tests {
     fn read_rejects_too_short() {
         // Correct magic and version so this test isolates the length check itself (checked last, after
         // magic/version) — a buffer this short with garbage magic/version would hit those checks first.
-        let mut d = vec![0u8; HEADER_LEN - 1];
+        let mut d = vec![0u8; HEADER_LEN_V2 - 1];
         d[OFF_MAGIC..OFF_MAGIC + 4].copy_from_slice(&MAGIC.to_le_bytes());
         d[OFF_VERSION] = VERSION;
         assert!(matches!(

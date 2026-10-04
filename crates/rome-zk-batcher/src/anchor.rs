@@ -752,7 +752,14 @@ mod tests {
             .map(|f| solana_program::keccak::hashv(&[&f.to_bytes()]).to_bytes())
             .collect();
         let (_, _, acc) = zk_inbox_client::reference_commitment(chain_id, batch, 0, &chunk_hashes);
-        let mut d = vec![0u8; rome_zk_layouts::batch::account_len(frames.len() as u32)];
+        let mut d = vec![
+            0u8;
+            rome_zk_layouts::batch::account_len_for(
+                rome_zk_layouts::batch::VERSION,
+                frames.len() as u32
+            )
+            .unwrap()
+        ];
         d[0..4].copy_from_slice(&rome_zk_layouts::batch::MAGIC.to_le_bytes());
         d[4] = rome_zk_layouts::batch::VERSION;
         d[rome_zk_layouts::batch::OFF_CHAIN_ID..rome_zk_layouts::batch::OFF_CHAIN_ID + 8]
@@ -1254,7 +1261,11 @@ mod tests {
         let (root_pda, _) = zk_settlement_client::root_pda(&SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(root_pda, root_bytes(CHAIN_ID, 0, 0));
         let (batch_pda, _) = zk_inbox_client::batch_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID, 0);
-        let mut d = vec![0u8; rome_zk_layouts::batch::account_len(0)];
+        let mut d = vec![
+            0u8;
+            rome_zk_layouts::batch::account_len_for(rome_zk_layouts::batch::VERSION, 0)
+                .unwrap()
+        ];
         d[0..4].copy_from_slice(&rome_zk_layouts::batch::MAGIC.to_le_bytes());
         d[4] = rome_zk_layouts::batch::VERSION;
         chain.set_account(batch_pda, d); // finalized = 0
@@ -1406,7 +1417,11 @@ mod tests {
         // batch 0 is Finalized (real header, finalized=1) but its chunks were never seeded — `Missing`
         // from the walk's point of view — and head_final_batch (1) >= batch (0): the chunks were
         // legitimately reclaimed.
-        let mut d = vec![0u8; rome_zk_layouts::batch::account_len(2)];
+        let mut d = vec![
+            0u8;
+            rome_zk_layouts::batch::account_len_for(rome_zk_layouts::batch::VERSION, 2)
+                .unwrap()
+        ];
         d[0..4].copy_from_slice(&rome_zk_layouts::batch::MAGIC.to_le_bytes());
         d[4] = rome_zk_layouts::batch::VERSION;
         d[rome_zk_layouts::batch::OFF_EXPECTED_COUNT
@@ -1447,7 +1462,12 @@ mod tests {
         let chain = FakeChain::default();
         let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(cursor_pda, cursor_bytes(CHAIN_ID, 2));
-        let mut d1 = vec![0u8; rome_zk_layouts::batch::account_len(2)];
+        let mut d1 =
+            vec![
+                0u8;
+                rome_zk_layouts::batch::account_len_for(rome_zk_layouts::batch::VERSION, 2)
+                    .unwrap()
+            ];
         d1[0..4].copy_from_slice(&rome_zk_layouts::batch::MAGIC.to_le_bytes());
         d1[4] = rome_zk_layouts::batch::VERSION;
         d1[rome_zk_layouts::batch::OFF_EXPECTED_COUNT

@@ -119,13 +119,18 @@ through this cycle.
    next `ProposeExitConfig` starts a fresh cycle against the same `exit_config` account (it is created once,
    on the chain's first proposal, and never closed). Writes only the `exit_config` account's PENDING
    fields; the CURRENT `exit_portal`/`bridge_program` are untouched, so a proposal is invisible to
-   `ProveExit` (below) until it is activated.
+   `ProveExit` (below) until it is activated. **The bridge program is set once:** once
+   `exit_config.bridge_program` is non-zero, a proposal that names a bridge, the same one included, is
+   refused (`BridgeProgramSetOnce`); portal, cap and bond proposals are unaffected.
 2. **`ActivateExitConfig`** — permissionless; anyone may call it once `Clock::slot >= exit_config.activation_slot`
    (`ActivationNotReached` before then; `NoPendingExitConfig` if nothing is pending). Copies the pending
    portal/bridge-program into `exit_config`'s current fields, and the pending cap/bond into the **root
    account's own** `exit_cap_per_window`/`poster_bond` fields (the root stays the one source of truth for
    both numbers — its byte layout is unchanged by this pair of instructions), then clears every pending
-   field, `activation_slot` and the mask back to zero.
+   field, `activation_slot` and the mask back to zero. A pending proposal made before the bridge became
+   set-once may still carry a bridge part over a bridge that is already set: activation drops that part (the
+   current bridge stays and the dropped one is logged), applies the portal, cap and bond parts and clears the
+   slot. It never refuses over it, because a pending proposal cannot be cancelled.
 
 The poster bond is recorded as a plain number in this program — no escrow, no unit reconciliation against the
 gwei-denominated exit cap (that ships later); see the security notes below.

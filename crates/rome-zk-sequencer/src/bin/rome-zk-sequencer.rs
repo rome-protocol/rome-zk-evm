@@ -2,7 +2,7 @@
 
 use clap::{Parser, ValueEnum};
 use rome_zk_sequencer::executor::{Executor, MockExecutor};
-use rome_zk_sequencer::metrics::{serve_metrics, Metrics};
+use rome_zk_sequencer::metrics::{spawn_metrics, Metrics};
 use rome_zk_sequencer::profile::ProfileIdentity;
 use rome_zk_sequencer::recovery::{
     reconcile_profile_identity, replay_into_executor, RecoveryError,
@@ -173,7 +173,7 @@ async fn run<E: Executor + 'static>(
     resume: ResumePoint,
 ) -> ExitCode {
     let metrics = Metrics::new();
-    tokio::spawn(serve_metrics(config.metrics_addr, metrics.clone()));
+    let metrics_addr = spawn_metrics(config.metrics_addr, metrics.clone()).await;
 
     let fee_recipient = match fee_recipient_from_config(&config) {
         Ok(v) => v,
@@ -217,10 +217,7 @@ async fn run<E: Executor + 'static>(
                 return ExitCode::FAILURE;
             }
         };
-    tracing::info!(
-        "rome-zk-sequencer listening on {rpc_addr}, metrics on {}",
-        config.metrics_addr
-    );
+    tracing::info!("rome-zk-sequencer listening on {rpc_addr}, metrics on {metrics_addr}");
 
     // The actor's JoinHandle resolves Err(SequencerFatal) on a clean
     // fatal shutdown, or Err(JoinError) if the task itself panicked (which the actor is designed never to
@@ -298,7 +295,7 @@ async fn run_with_node_rpc(
     let chain_spec = executor.chain_spec();
 
     let metrics = Metrics::new();
-    tokio::spawn(serve_metrics(config.metrics_addr, metrics.clone()));
+    let metrics_addr = spawn_metrics(config.metrics_addr, metrics.clone()).await;
 
     let fee_recipient = match fee_recipient_from_config(&config) {
         Ok(v) => v,
@@ -351,7 +348,7 @@ async fn run_with_node_rpc(
         "rome-zk-sequencer (reth node RPC) listening on http {} / ws {}, metrics on {}",
         node_handle.addrs.http,
         node_handle.addrs.ws,
-        config.metrics_addr
+        metrics_addr
     );
 
     let join_result = sequencer_join.await;

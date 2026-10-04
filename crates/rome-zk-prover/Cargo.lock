@@ -5315,6 +5315,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rome-zk-executor-api"
+version = "0.1.0"
+dependencies = [
+ "alloy-eips",
+ "alloy-primitives",
+ "alloy-trie",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "rome-zk-layouts"
 version = "0.1.0"
 dependencies = [
@@ -5410,11 +5420,14 @@ dependencies = [
  "alloy-rpc-types-debug",
  "alloy-rpc-types-eth",
  "anyhow",
+ "base64 0.22.1",
  "bincode 2.0.1",
  "clap",
  "hex",
+ "hmac 0.12.1",
  "reth-ethereum-primitives",
  "rome-zk-channel",
+ "rome-zk-executor-api",
  "rome-zk-layouts",
  "rome-zk-merkle",
  "serde",

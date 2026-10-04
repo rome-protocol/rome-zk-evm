@@ -19,6 +19,11 @@ description = "Host-only input generator for the batch guest: reads a finalized 
 name = "rome-zk-prover-input"
 path = "src/bin/rome_zk_prover_input.rs"
 
+[[bin]]
+name = "synth-deposit-batch"
+path = "src/bin/synth_deposit_batch.rs"
+required-features = ["synth"]
+
 [dependencies]
 # --- Solana side: the batch account + chunk bodies, exactly rome-zk-derive::inbox's own read path
 # (never a field-by-field re-decode). "devnet-driver" for the RPC client.
@@ -36,7 +41,13 @@ solana-client = "=4.3.0"
 solana-sdk = "=4.1.0"
 solana-commitment-config = "=3.1.1"
 rome-zk-layouts = { path = "../rome-zk-layouts" }
+# The fixed settlement program id and the fixed-seed depositor keypairs `synth-deposit-batch` builds its batches with —
+# the same functions the program tests call, so both sides get one value.
+rome-zk-testkit = { path = "../rome-zk-testkit", optional = true }
 rome-zk-merkle = { path = "../rome-zk-merkle" }
+# `deposit_withdrawal` / `canonical_header_rule_with_withdrawals`: the one withdrawals rule `synth-deposit-batch` builds its
+# blocks with (the same functions the sequencer, derive and the guest call).
+rome-zk-executor-api = { path = "../rome-zk-executor-api" }
 # The channel decoder, to learn the batch's own first..=last block range from the DA bytes before any
 # verifier RPC is made — "zstd-c" (the real C codec) is fine here: this is a host tool, not the
 # ZisK guest target.
@@ -77,6 +88,9 @@ hex = "0.4"
 # prints for the identical genesis file, so a sidecar and the ELF it was captured against can be checked
 # against one shared genesis fact.
 sha2 = "0.10"
+# `synth-deposit-batch` only: the Engine API's HS256 JWT (a local, per-run secret) for the node it drives.
+hmac = "0.12"
+base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 thiserror = "1"
@@ -89,3 +103,8 @@ url = "2.5"
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 
 [dev-dependencies]
+
+[features]
+# The synthetic deposit batch generator only: it uses the test-only fixed ids and depositors from rome-zk-testkit,
+# which never reach the prover service build.
+synth = ["dep:rome-zk-testkit"]

@@ -118,7 +118,7 @@ fn unique_loaded_accounts(ixs: &[Instruction], fee_payer: &Pubkey) -> usize {
 /// config value covers every tuning this binary builds (no chunk-vs-finalize split
 /// for this field). `program_account_len` and `programdata_len` are the live target's own account sizes
 /// (read by [`run`], supplied directly by [`check`]'s own tests) — SIMD-0186's 64-B-per-account overhead
-/// plus each shape's own account data (the batch account at `rome_zk_layouts::batch::account_len`, plus
+/// plus each shape's own account data (the batch account at `rome_zk_layouts::batch::account_len_for`, plus
 /// the chunk account for the chunk-lane shape) is computed here from the real instruction builders, never
 /// hand-counted.
 pub fn required_loaded_accounts_data_size(
@@ -134,7 +134,13 @@ pub fn required_loaded_accounts_data_size(
     let loaded_account_base_bytes = rome_zk_solana_sender::LOADED_ACCOUNT_BASE_BYTES as usize;
     let placeholder = Pubkey::new_from_array([1u8; 32]);
 
-    let batch_len = rome_zk_layouts::batch::account_len(max_frames_per_batch);
+    // Sized for the version `OpenBatch` writes (v2); the account is never larger than this until the
+    // inbox writes the next header version.
+    let batch_len = rome_zk_layouts::batch::account_len_for(
+        rome_zk_layouts::batch::VERSION,
+        max_frames_per_batch,
+    )
+    .expect("the version OpenBatch writes is a known batch version");
     // Counted as a cushion, not a modeled real load: the chunk PDA this term's bytes belong to is created by this
     // very transaction's own `Open` instruction, so it does not exist yet — and SIMD-0186 does not charge a load for
     // an account that doesn't exist — at the point the runtime measures loaded-accounts size. Charging its full

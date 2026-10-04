@@ -10,10 +10,9 @@ repo_root="$(cd "$here/../.." && pwd)"
 fork_guest="$repo_root/.fork/crates/clients/rome/guest"
 
 if [ ! -d "$fork_guest" ]; then
-  echo "SKIPPED: the cross-repo wire proof needs a checkout of rome-protocol/rome-zk-guest (tag" >&2
-  echo "v0.1.0) at $repo_root/.fork — not found." >&2
-  echo "  git clone https://github.com/rome-protocol/rome-zk-guest $repo_root/.fork" >&2
-  echo "  cd $repo_root/.fork && git checkout v0.1.0" >&2
+  echo "SKIPPED: the cross-repo wire proof needs a checkout of rome-protocol/zisk-eth-client (branch" >&2
+  echo "deposits-guest) at $repo_root/.fork — not found." >&2
+  echo "  git clone --branch deposits-guest https://github.com/rome-protocol/zisk-eth-client $repo_root/.fork" >&2
   echo "  git submodule update --init third_party/ziskethone" >&2
   echo "then rerun this script. .fork/ must never be committed into rome-zk (.gitignore excludes it)." >&2
   exit 0

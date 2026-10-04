@@ -29,9 +29,13 @@ the proof to a block, batch or chain. Those checks belong to
 `zk-settlement` links Veritas with `no-entrypoint` and calls `verify_zisk` inside `PostRootProved`.
 The prover links the same library and checks each proof before posting it.
 
+The standalone program is deployed on Solana devnet at `2cLGd9FKC7TiZrEHCvpw291AwXNcGgP9nDT4W3PHLe5k`,
+with the other shared programs in [`deploy/rollup/programs.devnet.json`](../../deploy/rollup/programs.devnet.json).
+Settlement does not call that program: it runs the same code linked into itself.
+
 ## How to test
 
-From the repository root, on a build machine:
+From the repository root:
 
 ```sh
 cargo build-sbf --arch v3 --manifest-path programs/veritas/Cargo.toml --sbf-out-dir target/deploy

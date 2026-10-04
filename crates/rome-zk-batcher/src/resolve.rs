@@ -564,7 +564,14 @@ mod tests {
     }
 
     fn open_not_finalized_bytes(expected_count: u32, leaves_present: u32) -> Vec<u8> {
-        let mut d = vec![0u8; rome_zk_layouts::batch::account_len(expected_count)];
+        let mut d = vec![
+            0u8;
+            rome_zk_layouts::batch::account_len_for(
+                rome_zk_layouts::batch::VERSION,
+                expected_count
+            )
+            .unwrap()
+        ];
         d[0..4].copy_from_slice(&rome_zk_layouts::batch::MAGIC.to_le_bytes());
         d[4] = rome_zk_layouts::batch::VERSION;
         d[rome_zk_layouts::batch::OFF_EXPECTED_COUNT
@@ -584,7 +591,14 @@ mod tests {
             .collect();
         let (_, _, acc) = zk_inbox_client::reference_commitment(chain_id, batch, 0, &chunk_hashes);
 
-        let mut d = vec![0u8; rome_zk_layouts::batch::account_len(frames.len() as u32)];
+        let mut d = vec![
+            0u8;
+            rome_zk_layouts::batch::account_len_for(
+                rome_zk_layouts::batch::VERSION,
+                frames.len() as u32
+            )
+            .unwrap()
+        ];
         d[0..4].copy_from_slice(&rome_zk_layouts::batch::MAGIC.to_le_bytes());
         d[4] = rome_zk_layouts::batch::VERSION;
         d[rome_zk_layouts::batch::OFF_CHAIN_ID..rome_zk_layouts::batch::OFF_CHAIN_ID + 8]

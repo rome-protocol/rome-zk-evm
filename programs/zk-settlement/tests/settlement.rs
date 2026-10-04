@@ -64,7 +64,14 @@ fn inbox_batch_account(
     acc: [u8; 32],
 ) -> Account {
     let expected_count: u32 = 3;
-    let mut d = vec![0u8; rome_zk_layouts::batch::account_len(expected_count)];
+    let mut d = vec![
+        0u8;
+        rome_zk_layouts::batch::account_len_for(
+            rome_zk_layouts::batch::VERSION,
+            expected_count
+        )
+        .unwrap()
+    ];
     d[0..4].copy_from_slice(&rome_zk_layouts::batch::MAGIC.to_le_bytes());
     d[4] = rome_zk_layouts::batch::VERSION;
     d[5..13].copy_from_slice(&chain_id.to_le_bytes());
@@ -1364,7 +1371,7 @@ async fn post_root_rejects_wrong_inbox_owner() {
 /// otherwise valid and matching — with only the version byte flipped to 1, so a decode that silently accepted
 /// version 1 would let this batch through as if it had genuinely settled, not merely fail differently. Making
 /// `rome-zk-layouts::batch::read` accept version 1 turns this red: the account is long enough (built at the
-/// real `account_len`) that removing the version check does not merely swap which decode error fires, it
+/// real `account_len_for`) that removing the version check does not merely swap which decode error fires, it
 /// makes decode succeed outright.
 #[tokio::test]
 async fn post_root_rejects_a_v1_shaped_inbox_batch_account() {
@@ -1381,7 +1388,7 @@ async fn post_root_rejects_a_v1_shaped_inbox_batch_account() {
         true,
         acc,
     );
-    v1_account.data[4] = 1; // version 1, everything else (still the real account_len) unchanged
+    v1_account.data[4] = 1; // version 1, everything else (still the real account_len_for) unchanged
     ctx.set_account(&inbox_pda, &v1_account.into());
 
     let args = happy_post_root_args(&c, acc).await;

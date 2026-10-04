@@ -237,7 +237,7 @@ async fn main() {
     }
 
     // --- OpenBatch (+ however many GrowBatch calls `n` needs), one transaction — `open_batch_ix` alone only
-    // reaches `account_len(n)` up to the single-CPI `MAX_PERMITTED_DATA_INCREASE` ceiling (~312 leaves);
+    // reaches `account_len_for(version, n)` up to the single-CPI `MAX_PERMITTED_DATA_INCREASE` ceiling (~312 leaves);
     // `open_and_grow_batch_ixs` builds the whole plan.
     let open_batch_sig = send(
         &rpc,

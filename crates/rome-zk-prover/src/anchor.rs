@@ -520,7 +520,25 @@ mod tests {
         expected_count: u32,
         finalized: bool,
     ) -> Vec<u8> {
-        rome_zk_layouts::batch::write_header(&rome_zk_layouts::batch::BatchFields {
+        encode_inbox_batch_header(
+            rome_zk_layouts::batch::VERSION,
+            chain_id,
+            batch,
+            expected_count,
+            finalized,
+        )
+    }
+
+    /// The batch account's fixed header for `version` (2 or 3), with no bitmap or leaves after it. A v3
+    /// header carries a non-empty deposit range.
+    fn encode_inbox_batch_header(
+        version: u8,
+        chain_id: u64,
+        batch: u64,
+        expected_count: u32,
+        finalized: bool,
+    ) -> Vec<u8> {
+        let fields = rome_zk_layouts::batch::BatchFields {
             chain_id,
             batch,
             open_slot: 1,
@@ -535,8 +553,38 @@ mod tests {
             finalize_cursor: expected_count,
             open_unix_ts: 1,
             deposit: None,
-        })
-        .to_vec()
+        };
+        if version == rome_zk_layouts::batch::VERSION_V3 {
+            rome_zk_layouts::batch::write_header_v3(&rome_zk_layouts::batch::BatchFields {
+                deposit: Some(rome_zk_layouts::batch::BatchDeposit {
+                    from: 4,
+                    to: 9,
+                    hash_from: [0xAA; 32],
+                    hash_to: [0xBB; 32],
+                }),
+                ..fields
+            })
+            .expect("a deposit range is set")
+            .to_vec()
+        } else {
+            rome_zk_layouts::batch::write_header(&fields).to_vec()
+        }
+    }
+
+    /// A whole batch account of `version`: its header, then the bitmap and leaves at that version's own
+    /// offsets (all leaves present and zero), sized with that version's own length.
+    fn encode_inbox_batch_account(
+        version: u8,
+        chain_id: u64,
+        batch: u64,
+        expected_count: u32,
+        finalized: bool,
+    ) -> Vec<u8> {
+        let header = encode_inbox_batch_header(version, chain_id, batch, expected_count, finalized);
+        let mut d =
+            vec![0u8; rome_zk_layouts::batch::account_len_for(version, expected_count).unwrap()];
+        d[..header.len()].copy_from_slice(&header);
+        d
     }
 
     /// A loader-v3 "Program" account's own encoding (36 B: tag `2` LE + the ProgramData address) —
@@ -692,6 +740,61 @@ mod tests {
             12,
             "post_root_accounts' 10 accounts + program + ProgramData"
         );
+    }
+
+    /// A v3 inbox batch (290-byte header, deposit range set) anchors like a v2 one, and the account's own
+    /// length, not a v2 length, is what the loaded-accounts requirement is built from.
+    #[test]
+    fn a_v3_inbox_batch_anchors_and_its_length_is_the_v3_length() {
+        let mut f = Fixture::happy_path();
+        let inbox_batch_pda = zk_settlement_client::inbox_batch_pda(
+            &f.inbox_program,
+            &f.settlement_program,
+            f.chain_id,
+            f.candidate_batch,
+        );
+        f.fetch.accounts.insert(
+            inbox_batch_pda,
+            encode_inbox_batch_account(
+                rome_zk_layouts::batch::VERSION_V3,
+                f.chain_id,
+                f.candidate_batch,
+                1,
+                true,
+            ),
+        );
+        let a = f.anchor().expect("a v3 batch anchors");
+        assert_eq!(a.inbox_batch_head_plus_1.batch, 1);
+        assert_eq!(a.inbox_batch_head_plus_1.expected_count, 1);
+        assert!(a.inbox_batch_head_plus_1.finalized);
+        assert_eq!(
+            a.account_data_lens[5],
+            rome_zk_layouts::batch::HEADER_LEN_V3 + 1 + 32,
+            "the 290-byte v3 header, one bitmap byte and one leaf"
+        );
+    }
+
+    /// A v3 header cut to the v2 length is short for its own version: refused by name, never read as v2.
+    #[test]
+    fn a_v3_inbox_batch_cut_to_the_v2_length_is_an_inbox_decode_error() {
+        let mut f = Fixture::happy_path();
+        let inbox_batch_pda = zk_settlement_client::inbox_batch_pda(
+            &f.inbox_program,
+            &f.settlement_program,
+            f.chain_id,
+            f.candidate_batch,
+        );
+        let mut d = encode_inbox_batch_account(
+            rome_zk_layouts::batch::VERSION_V3,
+            f.chain_id,
+            f.candidate_batch,
+            1,
+            true,
+        );
+        d.truncate(rome_zk_layouts::batch::HEADER_LEN_V2);
+        f.fetch.accounts.insert(inbox_batch_pda, d);
+        let err = f.anchor().unwrap_err();
+        assert!(matches!(err, AnchorError::InboxDecode(..)), "got {err:?}");
     }
 
     /// RED: a transient snapshot-fetch failure is a named
@@ -963,7 +1066,7 @@ mod tests {
             0,
             rome_zk_layouts::pending::PENDING_LEN,
             rome_zk_layouts::registry::REGISTRY_LEN_V2,
-            rome_zk_layouts::batch::account_len(1),
+            rome_zk_layouts::batch::account_len_for(rome_zk_layouts::batch::VERSION, 1).unwrap(),
             rome_zk_layouts::chain_config::LEN_V2,
             rome_zk_layouts::global_config::LEN,
             0,
@@ -994,7 +1097,7 @@ mod tests {
             0,
             rome_zk_layouts::pending::PENDING_LEN,
             rome_zk_layouts::registry::REGISTRY_LEN_V2,
-            rome_zk_layouts::batch::account_len(1),
+            rome_zk_layouts::batch::account_len_for(rome_zk_layouts::batch::VERSION, 1).unwrap(),
             rome_zk_layouts::chain_config::LEN_V2,
             rome_zk_layouts::global_config::LEN,
             0,

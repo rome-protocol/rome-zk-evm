@@ -184,7 +184,14 @@ impl FakeChain {
     }
 
     fn encode_batch_account(&self, batch: u64, b: &FakeBatchState) -> Vec<u8> {
-        let mut d = vec![0u8; rome_zk_layouts::batch::account_len(b.expected_count)];
+        let mut d = vec![
+            0u8;
+            rome_zk_layouts::batch::account_len_for(
+                rome_zk_layouts::batch::VERSION,
+                b.expected_count
+            )
+            .unwrap()
+        ];
         d[0..4].copy_from_slice(&rome_zk_layouts::batch::MAGIC.to_le_bytes());
         d[4] = rome_zk_layouts::batch::VERSION;
         d[rome_zk_layouts::batch::OFF_CHAIN_ID..rome_zk_layouts::batch::OFF_CHAIN_ID + 8]
@@ -208,11 +215,15 @@ impl FakeChain {
         // Pre-finalize leaf bytes (`verify_presealed_leaves`'s own format: keccak(frame.to_bytes()) per
         // sealed idx) — irrelevant once finalized (`finalize_and_verify` never reads them then).
         if !b.finalized {
-            let leaves_off = rome_zk_layouts::batch::leaves_offset(b.expected_count);
+            let leaves_off = rome_zk_layouts::batch::leaves_offset_for(
+                rome_zk_layouts::batch::VERSION,
+                b.expected_count,
+            )
+            .unwrap();
             for (&idx, body) in &b.chunk_bodies {
                 let hash = solana_program::keccak::hashv(&[body]).to_bytes();
                 let slot = leaves_off + 32 * idx as usize;
-                let bitmap_off = rome_zk_layouts::batch::HEADER_LEN;
+                let bitmap_off = rome_zk_layouts::batch::HEADER_LEN_V2;
                 d[bitmap_off + (idx as usize) / 8] |= 1 << (idx % 8);
                 d[slot..slot + 32].copy_from_slice(&hash);
             }

@@ -557,8 +557,9 @@ pub fn verify_presealed_leaves(
 ) -> Result<(), PipelineError> {
     let by_idx: std::collections::HashMap<u32, &Frame> =
         frames.iter().map(|f| (f.frame_no as u32, f)).collect();
-    let bitmap_off = rome_zk_layouts::batch::HEADER_LEN;
-    let leaves_off = rome_zk_layouts::batch::leaves_offset(expected_count);
+    let (bitmap_off, leaves_off) =
+        rome_zk_layouts::batch::leaf_offsets(raw_batch_account_data, expected_count)
+            .map_err(|e| PipelineError::Rederive(format!("batch account header: {e:?}")))?;
     for idx in 0..expected_count {
         let byte = raw_batch_account_data
             .get(bitmap_off + (idx as usize) / 8)
@@ -1609,14 +1610,27 @@ mod tests {
     /// `(idx, leaf_hash)` pairs marked present in the bitmap — everything else (including any leaf not
     /// listed) left absent, matching a batch mid-flight before every leaf is sealed.
     fn build_batch_account_bytes(expected_count: u32, sealed: &[(u32, [u8; 32])]) -> Vec<u8> {
-        let mut d = vec![0u8; rome_zk_layouts::batch::account_len(expected_count)];
+        build_batch_account_bytes_for(rome_zk_layouts::batch::VERSION, expected_count, sealed)
+    }
+
+    /// Like [`build_batch_account_bytes`] for a header of `version` (2 or 3): the version byte is set,
+    /// the account is that version's own length, and the bitmap and leaves sit at that version's own
+    /// offsets (a v3 header is 80 bytes longer than a v2 one).
+    fn build_batch_account_bytes_for(
+        version: u8,
+        expected_count: u32,
+        sealed: &[(u32, [u8; 32])],
+    ) -> Vec<u8> {
+        let mut d =
+            vec![0u8; rome_zk_layouts::batch::account_len_for(version, expected_count).unwrap()];
         d[0..4].copy_from_slice(&rome_zk_layouts::batch::MAGIC.to_le_bytes());
-        d[4] = rome_zk_layouts::batch::VERSION;
+        d[4] = version;
         d[rome_zk_layouts::batch::OFF_EXPECTED_COUNT
             ..rome_zk_layouts::batch::OFF_EXPECTED_COUNT + 4]
             .copy_from_slice(&expected_count.to_le_bytes());
-        let bitmap_off = rome_zk_layouts::batch::HEADER_LEN;
-        let leaves_off = rome_zk_layouts::batch::leaves_offset(expected_count);
+        let bitmap_off = rome_zk_layouts::batch::header_len(version).unwrap();
+        let leaves_off =
+            rome_zk_layouts::batch::leaves_offset_for(version, expected_count).unwrap();
         for (idx, hash) in sealed {
             d[bitmap_off + (*idx as usize) / 8] |= 1 << (*idx % 8);
             let slot = leaves_off + 32 * (*idx as usize);
@@ -1642,6 +1656,63 @@ mod tests {
         let hash = solana_program::keccak::hashv(&[&frames[0].to_bytes()]).to_bytes();
         let data = build_batch_account_bytes(1, &[(0, hash)]);
         verify_presealed_leaves(&data, 1, &frames).expect("matching leaf must verify");
+    }
+
+    /// A v3 account (290-byte header) has its bitmap and leaves 80 bytes further in than a v2 one; the
+    /// check reads them there, so a matching leaf verifies and a tampered one is still caught.
+    #[test]
+    fn verify_presealed_leaves_reads_a_v3_account_at_the_v3_offsets() {
+        let frames = vec![frame(0, false, vec![1, 2, 3]), frame(1, true, vec![4, 5])];
+        let hash0 = solana_program::keccak::hashv(&[&frames[0].to_bytes()]).to_bytes();
+        let hash1 = solana_program::keccak::hashv(&[&frames[1].to_bytes()]).to_bytes();
+        let data = build_batch_account_bytes_for(
+            rome_zk_layouts::batch::VERSION_V3,
+            2,
+            &[(0, hash0), (1, hash1)],
+        );
+        assert_eq!(
+            data.len(),
+            rome_zk_layouts::batch::HEADER_LEN_V3 + 1 + 64,
+            "the 290-byte v3 header, one bitmap byte and two leaves"
+        );
+        verify_presealed_leaves(&data, 2, &frames).expect("matching v3 leaves must verify");
+
+        let tampered = vec![frame(0, false, vec![9, 9, 9]), frame(1, true, vec![4, 5])];
+        match verify_presealed_leaves(&data, 2, &tampered).unwrap_err() {
+            PipelineError::PreFinalizeLeafMismatch { idx, .. } => assert_eq!(idx, 0),
+            other => panic!("expected PreFinalizeLeafMismatch, got {other:?}"),
+        }
+    }
+
+    /// A v3 account whose bitmap and leaf were written at the old v2 offsets reads as nothing present,
+    /// so the check cannot be satisfied by a v2-shaped body under a v3 version byte.
+    #[test]
+    fn verify_presealed_leaves_does_not_read_a_v3_account_at_the_v2_offsets() {
+        let frames = vec![frame(0, true, vec![1, 2, 3])];
+        let hash = solana_program::keccak::hashv(&[&frames[0].to_bytes()]).to_bytes();
+        let mut data = build_batch_account_bytes_for(rome_zk_layouts::batch::VERSION_V3, 1, &[]);
+        // The leaf is marked present and written where a v2 header would put them.
+        data[rome_zk_layouts::batch::HEADER_LEN_V2] |= 1;
+        let v2_leaf = rome_zk_layouts::batch::HEADER_LEN_V2 + 1;
+        data[v2_leaf..v2_leaf + 32].copy_from_slice(&[0xEE; 32]);
+        // At the v3 offsets nothing is present, so there is nothing to compare and nothing mismatches.
+        verify_presealed_leaves(&data, 1, &frames).expect("the v3 bitmap is empty");
+        // Marked at the v3 offset with the right hash, it verifies.
+        let ok = build_batch_account_bytes_for(rome_zk_layouts::batch::VERSION_V3, 1, &[(0, hash)]);
+        verify_presealed_leaves(&ok, 1, &frames)
+            .expect("v3 bitmap and leaf are read at v3 offsets");
+    }
+
+    /// A version byte that is neither 2 nor 3 is refused by name, never read at a guessed offset.
+    #[test]
+    fn verify_presealed_leaves_refuses_an_unknown_version_byte() {
+        let frames = vec![frame(0, true, vec![1, 2, 3])];
+        let mut data = build_batch_account_bytes(1, &[]);
+        data[rome_zk_layouts::batch::OFF_VERSION] = 4;
+        assert!(matches!(
+            verify_presealed_leaves(&data, 1, &frames).unwrap_err(),
+            PipelineError::Rederive(_)
+        ));
     }
 
     /// A leaf whose on-chain (pre-finalize) hash does not

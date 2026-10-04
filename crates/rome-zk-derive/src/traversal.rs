@@ -196,7 +196,27 @@ mod tests {
         expected_count: u32,
         finalized: bool,
     ) -> Vec<u8> {
-        let header = rome_zk_layouts::batch::write_header(&rome_zk_layouts::batch::BatchFields {
+        batch_account_bytes_for(
+            rome_zk_layouts::batch::VERSION,
+            chain_id,
+            batch,
+            open_slot,
+            expected_count,
+            finalized,
+        )
+    }
+
+    /// A batch account of `version` (2 or 3), sized with that version's own length. A v3 account
+    /// carries a non-empty deposit range, so a reader that took it for v2 would see wrong offsets.
+    fn batch_account_bytes_for(
+        version: u8,
+        chain_id: u64,
+        batch: u64,
+        open_slot: u64,
+        expected_count: u32,
+        finalized: bool,
+    ) -> Vec<u8> {
+        let fields = rome_zk_layouts::batch::BatchFields {
             chain_id,
             batch,
             open_slot,
@@ -211,9 +231,26 @@ mod tests {
             finalize_cursor: 0,
             open_unix_ts: PLAUSIBLE_OPEN_UNIX_TS,
             deposit: None,
-        });
-        let mut d = vec![0u8; rome_zk_layouts::batch::account_len(expected_count)];
-        d[..rome_zk_layouts::batch::HEADER_LEN].copy_from_slice(&header);
+        };
+        let mut d =
+            vec![0u8; rome_zk_layouts::batch::account_len_for(version, expected_count).unwrap()];
+        if version == rome_zk_layouts::batch::VERSION_V3 {
+            let header =
+                rome_zk_layouts::batch::write_header_v3(&rome_zk_layouts::batch::BatchFields {
+                    deposit: Some(rome_zk_layouts::batch::BatchDeposit {
+                        from: 4,
+                        to: 9,
+                        hash_from: [0xAA; 32],
+                        hash_to: [0xBB; 32],
+                    }),
+                    ..fields
+                })
+                .unwrap();
+            d[..header.len()].copy_from_slice(&header);
+        } else {
+            let header = rome_zk_layouts::batch::write_header(&fields);
+            d[..header.len()].copy_from_slice(&header);
+        }
         d
     }
 
@@ -279,6 +316,56 @@ mod tests {
         // Batch 1's account was never seeded and no cursor exists — not finalized (indeed, doesn't
         // exist) yet, not an abandoned id.
         assert_eq!(t.next().await.unwrap(), None);
+    }
+
+    /// A v3 batch account (290-byte header, deposit range set) is read at the v3 offsets: the batch ref
+    /// matches what the same batch gives as v2.
+    #[tokio::test]
+    async fn a_v3_batch_account_gives_the_same_batch_ref_as_a_v2_one() {
+        let program_id = Pubkey::new_unique();
+        let settlement_program = Pubkey::new_unique();
+        let (pda, _) = zk_inbox_client::batch_pda(&program_id, &settlement_program, 7, 0);
+        let mut reader = FakeReader::default();
+        let v3 = batch_account_bytes_for(rome_zk_layouts::batch::VERSION_V3, 7, 0, 100, 3, true);
+        assert_eq!(
+            v3.len(),
+            rome_zk_layouts::batch::HEADER_LEN_V3 + 1 + 32 * 3,
+            "a v3 account is the 290-byte header, one bitmap byte and three leaves"
+        );
+        reader.accounts.insert(pda, v3);
+        let mut t = SolanaTraversal::new(reader, program_id, settlement_program, 7, 0);
+        let got = t.next().await.unwrap().expect("batch 0 is finalized");
+        assert_eq!(
+            got,
+            BatchRef {
+                chain_id: 7,
+                batch: 0,
+                open_slot: 100,
+                open_unix_ts: PLAUSIBLE_OPEN_UNIX_TS,
+                expected_count: 3,
+                root: [0u8; 32],
+                forced_root: [0u8; 32],
+                acc: [0u8; 32],
+            }
+        );
+    }
+
+    /// A v3 header cut to the v2 length is short for its own version: refused, never read as v2.
+    #[tokio::test]
+    async fn a_v3_header_cut_to_the_v2_length_is_a_critical_decode_failure() {
+        let program_id = Pubkey::new_unique();
+        let settlement_program = Pubkey::new_unique();
+        let (pda, _) = zk_inbox_client::batch_pda(&program_id, &settlement_program, 7, 0);
+        let mut reader = FakeReader::default();
+        let mut v3 =
+            batch_account_bytes_for(rome_zk_layouts::batch::VERSION_V3, 7, 0, 100, 3, true);
+        v3.truncate(rome_zk_layouts::batch::HEADER_LEN_V2);
+        reader.accounts.insert(pda, v3);
+        let mut t = SolanaTraversal::new(reader, program_id, settlement_program, 7, 0);
+        assert!(matches!(
+            t.next().await.unwrap_err(),
+            PipelineError::Critical(_)
+        ));
     }
 
     #[tokio::test]

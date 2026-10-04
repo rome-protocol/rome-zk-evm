@@ -12,8 +12,8 @@ checks the compiled artifacts.
 ## Components at a glance
 
 The code contains four Solana programs, one contract for the rollup, and the off-chain services below.
-The production ZisK guest lives in a separate repository. This is a logical data-flow diagram, not a
-record of live deployments.
+The production ZisK guest lives in a separate repository. The diagram shows how data flows between
+the parts; [Deployment](#deployment) says what runs on Solana devnet today.
 
 | Part | Components | Purpose |
 |---|---|---|
@@ -87,8 +87,9 @@ The public RPC is served by the sequencer, which embeds a separate reth instance
 
 ## Components
 
-“Who runs it” describes the role in a chain deployment. It does not imply that a public deployment is
-already available. Each linked directory has a README with the component's configuration and tests.
+“Who runs it” describes the role in a chain deployment. On Solana devnet the four programs are shared:
+Rome deployed them and holds their upgrade authority, and each chain operator runs its own services.
+Each linked directory has a README with the component's configuration and tests.
 
 | Component | Code | What it does | Who runs it |
 |---|---|---|---|
@@ -101,7 +102,8 @@ already available. Each linked directory has a README with the component's confi
 | Prover input generator | [`crates/rome-zk-prover-input`](../crates/rome-zk-prover-input) | Fetches inbox data, blocks and execution witnesses and writes the guest's two input files. Available as a library and CLI. | Inside the prover, or invoked separately |
 | Batch guest | `rome-protocol/rome-zk-guest`, `crates/clients/rome/guest` (`guest-rome`) | Checks that blocks match inbox data and execute correctly, then commits the batch's public values. The chain's genesis and fee recipient are compiled into the guest. | Executed by ZisK during proving |
 | Settlement watcher | [`crates/rome-zk-settlement-watcher`](../crates/rome-zk-settlement-watcher) | Reads inbox and settlement transaction history into Postgres and derives batch and exit status. Never writes to Solana. | Chain operator or an independent observer |
-| Operator CLI | [`crates/rome-zk-ops`](../crates/rome-zk-ops) | One binary for operator actions on a chain's Solana accounts: chain id, registration, deposit refund, exit configuration, migrations, the bridge vault (`vault init`, `vault fund`, `vault show`) and `release-exit`. A dry run unless `--confirm`; every transaction goes out as a V1 transaction through `rome-zk-solana-sender`. Ships in the node image. | Chain operator |
+| Operator CLI | [`crates/rome-zk-ops`](../crates/rome-zk-ops) | One binary for operator actions on a chain's Solana accounts: chain id, registration, deposit refund, exit configuration, the one-time migration, creating the batch cursor (`init-cursor`), the bridge vault (`vault init`, `vault fund`, `vault show`) and `release-exit`. A dry run unless `--confirm`; every transaction goes out as a V1 transaction through `rome-zk-solana-sender`. The registry-authority commands (global configuration, verifier registry) are not in this binary; they stay in the `governance` example of `zk-settlement-client`. The root `Dockerfile` builds it into the node image; published images up to `v0.1.3` do not include it. | Chain operator |
+| Rollup runner | [`deploy/rollup`](../deploy/rollup) | `./rollup init`, `register`, `up` and `check`: renders a chain's configuration and genesis, registers the chain, and runs the node image, reth-verifier and, with `PROVER=on`, the prover under Docker Compose. | Chain operator |
 | Exit portal | [`contracts/exit-portal`](../contracts/exit-portal) | `RomeExitPortal` records a native-asset withdrawal message and emits `ExitInitiated`. | Contract deployed on the rollup |
 | Exit prover | [`crates/rome-zk-exit-prover`](../crates/rome-zk-exit-prover) | Watches portal events, obtains and locally checks an Ethereum storage proof, and sends `ProveExit` against a final batch root. | Chain operator |
 | zk-inbox | [`programs/zk-inbox`](../programs/zk-inbox) | Stores transaction chunks and reduces each batch to a Merkle commitment. | Solana validators execute the deployed program |
@@ -124,9 +126,9 @@ guest input formats together. [`guest/rome-zk-bench-decode`](../guest/rome-zk-be
 guest, not the production guest.
 
 The system uses upstream releases of reth, ZisK and the Solana crates. Postgres stores the watcher's
-history and, when enabled, the prover's job history. The prover and input-generator crates have separate
-Cargo workspaces and lockfiles; they are excluded from the root workspace to preserve compatibility
-with the guest's dependency versions.
+history and, when enabled, the prover's job history. The prover, the input generator and the
+cross-repository wire test have separate Cargo workspaces and lockfiles; they are excluded from the root
+workspace to preserve compatibility with the guest's dependency versions.
 
 ## Deployment
 
@@ -144,10 +146,19 @@ registry-authority key separately, so a compromised prover can post proofs but c
 keys, fees or registry-controlled configuration.
 
 The portable [`deploy/rollup/`](../deploy/rollup/) directory is available, with setup and commands in its
-[operator runbook](../deploy/rollup/README.md). Public devnet programs, published images and the guest build
-for your chain id come later. The component READMEs document each service's configuration and commands. The
-public release is intended to provide software and instructions for running a chain; Rome's deployment
-and monitoring configuration stays private.
+[operator runbook](../deploy/rollup/README.md). The shared programs are live on Solana devnet, at the
+addresses in [`deploy/rollup/programs.devnet.json`](../deploy/rollup/programs.devnet.json), and the node
+image is published as `ghcr.io/rome-protocol/rome-zk-evm`. Building the guest for your chain is not
+automated yet, and no prover image is published. [Run on Solana devnet](RUN-ON-DEVNET.md) walks through
+starting a chain against those programs.
+
+The node image contains `rome-zk-sequencer`, `rome-zk-batcher` and `rome-zk-derive`, and, from the first
+tag after `v0.1.3`, `rome-zk-ops`. The prover, the exit prover and the settlement watcher are not in it.
+`deploy/rollup` builds the prover image from this repository the first time the prover starts.
+
+The component READMEs document each service's configuration and commands. The public release is
+intended to provide software and instructions for running a chain; Rome's deployment and monitoring
+configuration stays private.
 
 ## Data flow: one transaction, start to finish
 
@@ -181,19 +192,19 @@ and monitoring configuration stays private.
    never a block's own timestamp, so a chain running well below its block-count cap (or sitting idle
    between bursts) still posts on a bounded cadence instead of waiting forever for a group that may never
    fill; an empty group never closes this way. `--follow` checks this on every tick, whether a new block
-   just arrived or the log went quiet; `--once` reads the whole log and posts its own trailing partial
-   group once, at the end, exactly as it always has. Each batch is RLP-encoded and compressed as one stream, cut
+   just arrived or the log went quiet; `--once` reads the whole log and posts its trailing partial group
+   once, at the end. Each batch is RLP-encoded and compressed as one stream, cut
    into frames of at most 3,681 bytes each. Each frame becomes the body of one inbox chunk, posted as
-   exactly one Solana transaction (an `Open` + `Write` + `Seal` sequence) using the SIMD-0385 V1
+   exactly one Solana transaction (an `Open` + `Write` + `Seal` + `SealLeaf` sequence) using the SIMD-0385 V1
    transaction format and meeting the wire-format constraints every client
    transaction must satisfy. Up to `batches_in_flight` batches (default 2) post concurrently: the next
    batch's `OpenBatch` follows as soon as the current one confirms, chunk lanes overlap freely, and
    `FinalizeBatch` alone stays strictly ordered across batches — a bounded window that overlaps the
    cluster's own inclusion latency with the next batch's work instead of paying it serially. Cadence
    (per-batch open/finalize confirm time, window occupancy, and how far the log's tail runs ahead of the
-   last finalized block) is registered as Prometheus metrics (`Metrics::render`), served over the
-   batcher's own `/metrics` HTTP listener (the same reth-free responder the sequencer serves, pulled into
-   `rome-zk-metrics-http` so both can share it) and scraped by Prometheus as a distinct target.
+   last finalized block) is registered as Prometheus metrics and served from the batcher's own
+   `/metrics` HTTP listener, which Prometheus scrapes as a separate target. The listener is the same code
+   the sequencer uses, from `rome-zk-metrics-http`.
 6. **Accumulation.** Each sealed chunk contributes one leaf (`keccak(chunk index ‖ keccak(chunk body))`)
    to a per-batch Merkle accumulator, tracked in the inbox program's batch account. Seals are
    order-independent, so this step is fully parallel; once every expected chunk is sealed,
@@ -234,31 +245,31 @@ and monitoring configuration stays private.
 1. **`initiateExit`** on the L2 exit portal (`contracts/exit-portal`) records a message hash in
    `sentMessages` (storage slot 0) and emits it as an event; the native asset stays on L2 — there is no
    `withdraw`, only the twin asset a Solana vault later releases.
-1a. **The exit prover** (`crates/rome-zk-exit-prover`) is what actually turns that event into a
-    `ProveExit` call: it watches the portal for `ExitInitiated` (`eth_getLogs`), fetches an
-    `eth_getProof` of the message's inclusion against the newest Final batch's `state_root`, and verifies
-    that proof LOCALLY before ever sending — a doomed proof spends no fee. If the verifier node cannot
-    yet serve state at that batch's block (`--rpc.eth-proof-window`), it retries against a later Final
-    root once the chain head advances; a message it cannot yet prove simply waits for the next poll —
-    nothing about `sentMessages` expires. Configure reth's `--rpc.eth-proof-window` to cover the
-    final roots the exit prover needs; reth's default is 0 (the current tip only), so raise it and run
-    reth-verifier as an archive node. The setting limits how far back a proof request may reach;
-    it does not restore pruned state.
-2. **`ProveExit`** (28, `programs/zk-settlement`) proves that message's inclusion — an Ethereum
+2. **The exit prover** (`crates/rome-zk-exit-prover`) is what actually turns that event into a
+   `ProveExit` call: it watches the portal for `ExitInitiated` (`eth_getLogs`), fetches an
+   `eth_getProof` of the message's inclusion against the newest Final batch's `state_root`, and verifies
+   that proof LOCALLY before ever sending — a doomed proof spends no fee. If the verifier node cannot
+   yet serve state at that batch's block (`--rpc.eth-proof-window`), it retries against a later Final
+   root once the chain head advances; a message it cannot yet prove simply waits for the next poll —
+   nothing about `sentMessages` expires. Configure reth's `--rpc.eth-proof-window` to cover the
+   final roots the exit prover needs; reth's default is 0 (the current tip only), so raise it and run
+   reth-verifier as an archive node. The setting limits how far back a proof request may reach;
+   it does not restore pruned state.
+3. **`ProveExit`** (28, `programs/zk-settlement`) proves that message's inclusion — an Ethereum
    Merkle-Patricia account proof of the portal (its address bound from the chain's `exit_config`, never a
    caller-supplied argument) plus a storage proof of `sentMessages[message_hash]` — against a FINAL batch's
    `state_root` (the same finality predicate `RootView` uses). A successful call burns a persistent,
    per-nonce replay bit (`exit_nullifier`) and writes an `exit_record` (`STATUS_PROVED`), enforcing a
    per-challenge-window cap along the way — a call the exit prover's own send lands `ExitCapExceeded` on
    is re-queued to the next window rather than treated as a failure.
-3. **`ConsumeExit`** (29, `programs/zk-settlement`) is the release: the chain's registered bridge program
+4. **`ConsumeExit`** (29, `programs/zk-settlement`) is the release: the chain's registered bridge program
    (its identity read from `exit_config.bridge_program`) CPI-signs the `exit_consumer` PDA
    (`["exit_consumer", chain_id]`, derived under that program's own id) to authorise it — the only gate on
    who may call it, and one only that program's own runtime identity can ever satisfy (a PDA has no
    private key). It refunds the record's own `payer` (never a caller-supplied account) and recycles the
    record's rent by closing it. **The nullifier bit is never touched** — it is the permanent replay guard;
    the record is only ever the recyclable rent-paying wrapper around a single release.
-4. **The bridge's own vault release** (`zk-bridge`'s `ReleaseExit`) is the caller that actually
+5. **The bridge's own vault release** (`zk-bridge`'s `ReleaseExit`) is the caller that actually
    CPIs `ConsumeExit`, signed by its own `["exit_consumer", chain_id]` PDA: it reads the just-proved
    `exit_record` for the amount and recipient, CPIs `ConsumeExit` (the step above — closing the record and
    refunding its rent) FIRST, and only then transfers the decimal-scaled SPL amount from its vault to
@@ -268,7 +279,7 @@ and monitoring configuration stays private.
    later. Consuming before transferring, rather than the reverse, is what makes a second `ReleaseExit`
    against the same record unconstructable: by the time any second call could run, the record is already
    gone.
-5. **The settlement watcher** (`rome-zk-settlement-watcher`) observes both instructions under the same
+6. **The settlement watcher** (`rome-zk-settlement-watcher`) observes both instructions under the same
    ingest kind the rest of the settlement program's history already uses (`ProveExit`/`ConsumeExit` are
    instructions of that one program, not a separate ingest source) and derives one `exit` row per message
    hash: `ProveExit` inserts it `proved` (with that transaction's own signature); `ConsumeExit` moves it to
@@ -328,8 +339,10 @@ depends on the guest behind the active key and on the program and registry autho
 **What the proof binds.** The PLONK verifier (Veritas, `programs/veritas`) checks a proof against
 its public signal. Veritas itself does not bind the proof to a block, batch or chain. This code runs
 inside zk-settlement, so verification on the settlement path is governed by zk-settlement's upgrade
-authority. The separately deployed verifier program is not called on this path. The settlement program
-binds the signal to one of two layouts before accepting the post:
+authority. On Solana devnet, Rome holds the upgrade authority of all four programs as one
+single-signature key, not a multisig; [Trust model on Solana devnet](TRUST-MODEL.md) lists what that key
+and Rome's registry authority can change. The separately deployed verifier program is not called on this
+path. The settlement program binds the signal to one of two layouts before accepting the post:
 
 - **Layout 1, used by the batch guest,** commits 208 bytes: the chain id, first and last block numbers,
   batch opening time, timestamp drift bound, total gas used, parent hash, last block hash, state root,
@@ -370,7 +383,10 @@ every already-registered entry's bytes survive that growth untouched.
 is the tombstone, `SetRegistryEntry` refuses to write any OTHER activation slot against that same vkey
 (`EntryRetired`) — a retired key cannot be re-activated while its entry stands, and the operator's path
 back is rotating to a new ELF (a genuinely new vkey). Retiring an already-retired vkey again is unaffected
-by this and stays a no-op success. This is a bound, not an absolute: A retired vkey cannot be re-activated while its retired entry remains in the registry; once that slot has been reused for a new key the registry no longer remembers it, and naming that vkey again is an ordinary registration. The registry is four slots, not a memory — keep the list of retired ELFs and vkeys off-chain and never re-register one. This closes a gap the naive
+by this and stays a no-op success. This holds only while the retired entry is still in the registry:
+once its slot is reused for a new key, the registry no longer remembers it, and naming that vkey again is
+an ordinary registration. The registry has four slots, so keep the list of retired ELFs and vkeys
+off-chain and never re-register one. This closes a gap the naive
 version of the scheme would otherwise have: `InitChainV2` refuses to create a registry whose entries share
 a `(curve, scheme, vkey_hash)` — even under two different `layout_id` values, since one vkey is one ELF is
 one layout — before any account is written (`DuplicateRegistryEntry`), and `SetRegistryEntry` itself scans
@@ -406,13 +422,13 @@ Say which is which:
 | **A program other than the registered bridge releasing a proved exit.** `ConsumeExit`'s only accounts are `bridge_signer`/`exit_config`/`exit_record`/`payer_refund` — no chain-authority signer, no allowlist to bypass. | **Unconstructable.** | The check is `bridge_signer.key == exit_consumer_pda(chain_id, exit_config.bridge_program)` AND `bridge_signer.is_signer`. A PDA has no private key, so the ONLY way to produce a signed `bridge_signer` is an `invoke_signed` CPI from the exact program `exit_config.bridge_program` names — a different program's own `exit_consumer` PDA (derived under its own id) is a different address entirely, refused `NotBridgeProgram` (`consume_by_non_bridge_signer_is_refused`, `programs/zk-settlement/tests/exit_consume.rs`, a real-BPF CPI from a different program). |
 | **Redirecting a released exit's rent refund to an attacker-chosen account.** `ConsumeExit` takes a `payer_refund` account as part of its own instruction. | **Unconstructable.** | `payer_refund.key` must equal `exit_record.payer` — the account that actually paid `ProveExit`'s rent — checked before any lamports move; any other account is refused `InvalidArgument` with zero writes (`consume_refund_to_wrong_account_is_refused`). |
 | **Re-proving an exit after it has already been released**, e.g. by recreating the (now-closed) `exit_record` with attacker-chosen fields. | **Unconstructable.** | The replay guard is the persistent `exit_nullifier` bit, never the record — `ConsumeExit` closes the record but never clears the bit, so a later `ProveExit` of the same message hits `ExitAlreadyProved` at the SAME check that refuses any other replay, regardless of what account now sits at the record's former address (`prove_exit_after_release_is_refused`). |
-| **`zk-bridge`'s `ReleaseExit` sending a proved exit's funds anywhere other than `record.sol_recipient`.** The instruction takes a caller-supplied `recipient_ata` account; nothing forces a caller to name the right one. | **Unconstructable.** | `ReleaseExit` derives the expected ATA itself from `record.sol_recipient` (read off the just-checked exit record, never an instruction argument) and refuses `WrongRecipientAta` before any CPI or transfer if the supplied account differs — proved by `release_to_wrong_recipient_ata_is_refused` (an attacker's own valid ATA, real BPF) and by mutation (deriving the recipient from a caller-supplied account instead of the record turns `release_pays_only_record_recipient_and_closes_record` red). |
-| **`zk-bridge`'s `ReleaseExit` sending a proved exit's rent refund anywhere other than `record.payer`.** The instruction takes a caller-supplied `payer_refund` account. | **Unconstructable (defense in depth).** | `ReleaseExit` itself refuses `payer_refund.key != record.payer` (`WrongPayerRefund`) before the settlement CPI ever runs; `zk-settlement`'s own `ConsumeExit` enforces the identical property on the CPI it is about to receive (`InvalidArgument`), so funds are safe even if this program's own check were absent. Proved real-BPF (`release_to_wrong_payer_refund_is_refused`) and by mutation (dropping this program's own check still refuses the call, via the CPI's `InvalidArgument`, but changes the named error the caller sees from `WrongPayerRefund` to a generic `InvalidArgument` — proving the named guard is not decorative). |
-| **A proved exit released twice (double payout).** A naive implementation transferring before — or without — consuming the settlement record could let a second `ReleaseExit` repeat the transfer. | **Unconstructable.** | `ReleaseExit` CPIs `ConsumeExit` (which closes the exit record) BEFORE the SPL transfer, in the same atomic transaction; a second call finds the record already reassigned to the system program and fails the very first ownership check (`WrongSettlementOwner`). Proved by `release_twice_is_refused` (real BPF) and by mutation (skipping the CPI entirely reproduces an actual double payout — both transfers land, in the test's own logs — and turns that test red). |
-| **Decimal-scaling a wei amount into mint units in a way that manufactures value** (rounding up, or truncating in the wrong direction). | **Unconstructable.** | `mint_amount = amount / 10^(18 - mint_decimals)`, plain integer division — truncates by construction; there is no code path that adds back a remainder. Proved by `decimal_scaling_rounds_down_dust_stays_in_vault` (real BPF, an exact 500-wei remainder) and by mutation (`div_ceil` in place of integer division turns that test red — the recipient receives one mint unit too many). |
-| **Releasing a non-native asset, or against a forged/misdirected exit record, before this vault supports either.** | **Unconstructable (v1 scope), Unconstructable (forged record).** | `record.asset != [0; 20]` is refused (`UnsupportedAsset`) before any CPI or transfer; `exit_record`'s owner is checked against `vault_config.settlement_program` before its data is ever decoded (`WrongSettlementOwner`). Both proved real-BPF (`release_unsupported_asset_refused`, `release_with_wrong_settlement_owner_refused`) and by mutation (dropping either check turns its own test red). |
-| **An unauthorized party front-running `InitVault` for a chain/mint before the real chain authority does, naming a hostile `settlement_program`, and locking the real authority out of the chain's vault slot.** | **Unconstructable.** | Two layers. (1) *Provenance*: `InitVault` requires a `chain_authority` signer whose key equals the settlement `["root", chain_id]` PDA's own `authority` field — a config naming a given `settlement_program` can only ever be created by that settlement's own real `root.authority`. This alone does NOT stop an attacker from creating a config naming their OWN hostile `settlement_program` — they trivially control that program's root (the attacker leg of `attacker_first_does_not_lock_out_real_authority` succeeds). (2) *Keying* (the property that actually closes the front-run): the vault PDAs are keyed by `[settlement_program, chain_id]`, not `chain_id` alone, so the attacker's hostile config lands at `pda(hostile_settlement, chain_id)` — a DIFFERENT address than `pda(real_settlement, chain_id)`, which only the real chain authority can ever occupy. The real authority is never locked out, in either race ordering, because the two calls are never contending for the same address. Proved real-BPF: `attacker_first_does_not_lock_out_real_authority` (attacker InitVaults first at their own address, the real authority's InitVault still succeeds at a different address), `real_vault_address_is_derivable_from_the_real_settlement_only` (the real address stays unoccupied by an attacker who cannot sign as the real `root.authority`), plus the pre-existing `init_vault_by_non_chain_authority_is_refused`/`init_vault_root_not_owned_by_settlement_is_refused`/`init_vault_by_chain_authority_succeeds`. Mutation: reverting `vault_config_pda` to derive from `chain_id` alone (dropping `settlement_program` from the seed) turns `attacker_first_does_not_lock_out_real_authority` red — the two configs collide back into one slot and the lockout returns. The bridge client also checks `vault_config.settlement_program` before funding; the address separation is enforced by the program itself. |
-| **`InitVault` accepting an `args.mint_decimals` that does not match the mint's own real decimals**, mis-scaling every future `ReleaseExit` payout by a power of ten. | **Unconstructable.** | `InitVault` reads the mint account's own decimals byte (offset 44 of the standard 82-byte layout) and refuses a mismatch (`MintDecimalsMismatch`) before writing `vault_config`. Proved real-BPF (`init_vault_with_wrong_mint_decimals_is_refused`) and by mutation (dropping the check turns that test red). |
+| **`zk-bridge`'s `ReleaseExit` sending a proved exit's funds anywhere other than `record.sol_recipient`.** The instruction takes a caller-supplied `recipient_ata` account; nothing forces a caller to name the right one. | **Unconstructable.** | `ReleaseExit` derives the expected ATA itself from `record.sol_recipient` (read off the just-checked exit record, never an instruction argument) and refuses `WrongRecipientAta` before any CPI or transfer if the supplied account differs. Tests: `release_to_wrong_recipient_ata_is_refused` (an attacker's own valid ATA, real BPF) and `release_pays_only_record_recipient_and_closes_record`. |
+| **`zk-bridge`'s `ReleaseExit` sending a proved exit's rent refund anywhere other than `record.payer`.** The instruction takes a caller-supplied `payer_refund` account. | **Unconstructable (defense in depth).** | `ReleaseExit` itself refuses `payer_refund.key != record.payer` (`WrongPayerRefund`) before the settlement CPI ever runs; `zk-settlement`'s own `ConsumeExit` enforces the identical property on the CPI it is about to receive (`InvalidArgument`), so funds are safe even if this program's own check were absent; this program's check gives the caller the named error `WrongPayerRefund` instead of a generic `InvalidArgument`. Test: `release_to_wrong_payer_refund_is_refused` (real BPF). |
+| **A proved exit released twice (double payout).** A naive implementation transferring before — or without — consuming the settlement record could let a second `ReleaseExit` repeat the transfer. | **Unconstructable.** | `ReleaseExit` CPIs `ConsumeExit` (which closes the exit record) BEFORE the SPL transfer, in the same atomic transaction; a second call finds the record already reassigned to the system program and fails the very first ownership check (`WrongSettlementOwner`). Test: `release_twice_is_refused` (real BPF). |
+| **Decimal-scaling a wei amount into mint units in a way that manufactures value** (rounding up, or truncating in the wrong direction). | **Unconstructable.** | `mint_amount = amount / 10^(18 - mint_decimals)`, plain integer division — truncates by construction; there is no code path that adds back a remainder. Test: `decimal_scaling_rounds_down_dust_stays_in_vault` (real BPF, an exact 500-wei remainder). |
+| **Releasing a non-native asset, or against a forged/misdirected exit record, before this vault supports either.** | **Unconstructable (v1 scope), Unconstructable (forged record).** | `record.asset != [0; 20]` is refused (`UnsupportedAsset`) before any CPI or transfer; `exit_record`'s owner is checked against `vault_config.settlement_program` before its data is ever decoded (`WrongSettlementOwner`). Tests: `release_unsupported_asset_refused` and `release_with_wrong_settlement_owner_refused` (real BPF). |
+| **An unauthorized party front-running `InitVault` for a chain/mint before the real chain authority does, naming a hostile `settlement_program`, and locking the real authority out of the chain's vault slot.** | **Unconstructable.** | Two layers. (1) *Provenance*: `InitVault` requires a `chain_authority` signer whose key equals the settlement `["root", chain_id]` PDA's own `authority` field — a config naming a given `settlement_program` can only ever be created by that settlement's own real `root.authority`. This alone does NOT stop an attacker from creating a config naming their OWN hostile `settlement_program` — they trivially control that program's root (the attacker leg of `attacker_first_does_not_lock_out_real_authority` succeeds). (2) *Keying* (the property that actually closes the front-run): the vault PDAs are keyed by `[settlement_program, chain_id]`, not `chain_id` alone, so the attacker's hostile config lands at `pda(hostile_settlement, chain_id)` — a DIFFERENT address than `pda(real_settlement, chain_id)`, which only the real chain authority can ever occupy. The real authority is never locked out, in either race ordering, because the two calls are never contending for the same address. Tests (real BPF): `attacker_first_does_not_lock_out_real_authority` (attacker InitVaults first at their own address, the real authority's InitVault still succeeds at a different address), `real_vault_address_is_derivable_from_the_real_settlement_only` (the real address stays unoccupied by an attacker who cannot sign as the real `root.authority`), `init_vault_by_non_chain_authority_is_refused`, `init_vault_root_not_owned_by_settlement_is_refused` and `init_vault_by_chain_authority_succeeds`. The bridge client also checks `vault_config.settlement_program` before funding; the address separation is enforced by the program itself. |
+| **`InitVault` accepting an `args.mint_decimals` that does not match the mint's own real decimals**, mis-scaling every future `ReleaseExit` payout by a power of ten. | **Unconstructable.** | `InitVault` reads the mint account's own decimals byte (offset 44 of the standard 82-byte layout) and refuses a mismatch (`MintDecimalsMismatch`) before writing `vault_config`. Test: `init_vault_with_wrong_mint_decimals_is_refused` (real BPF). |
 
 **Batch numbering.** Batch ids are 1-based per chain; 0 is the sentinel everywhere else in this system —
 `head_pending_batch` and `head_final_batch` == 0 always mean "none" (`InitChain`'s own initial value),
@@ -438,7 +454,7 @@ sides of every format (on-chain program and off-chain client) can never quietly 
 
 | primitive | owner | consumed by |
 |---|---|---|
-| Account layouts (root, registry, pending, batch, chunk header, batch cursor, chain/global config, nonce, allow marker, exit accounts) | [`rome-zk-layouts`](../crates/rome-zk-layouts) | the inbox, settlement and bridge programs, their clients, the batcher, and every planned off-chain reader |
+| Account layouts (root, registry, pending, batch, chunk header, batch cursor, chain/global config, nonce, allow marker, exit accounts) | [`rome-zk-layouts`](../crates/rome-zk-layouts) | the inbox, settlement and bridge programs, their clients, the batcher, the derivation node, the prover and its input generator, the exit prover, the settlement watcher and `rome-zk-ops` |
 | PDA seeds and derivation | [`rome-zk-layouts`](../crates/rome-zk-layouts) | the inbox, settlement and bridge programs, their clients, tooling |
 | Ethereum Merkle-Patricia proof verification (bounded RLP, account/storage proofs, exit-proof wire shape) | [`rome-zk-mpt`](../crates/rome-zk-mpt) | `programs/zk-settlement`'s `ProveExit`, [`rome-zk-exit-prover`](../crates/rome-zk-exit-prover) |
 | `exit_consumer` PDA derivation (`["exit_consumer", chain_id]` under the caller-supplied bridge program — the one seed both `ConsumeExit` and `zk-bridge`'s own `ReleaseExit` CPI agree on) | [`rome-zk-layouts`](../crates/rome-zk-layouts) (`exit` module) | `programs/zk-settlement`'s `ConsumeExit`, `zk-settlement-client`, `programs/zk-bridge`'s `ReleaseExit` |

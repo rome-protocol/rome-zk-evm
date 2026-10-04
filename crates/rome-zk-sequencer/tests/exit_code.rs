@@ -8,18 +8,14 @@ use alloy::signers::local::PrivateKeySigner;
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::http_client::HttpClientBuilder;
 use rome_zk_sequencer::testutil::signed_raw_tx;
-use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
-const CHAIN_ID: u64 = 424_243;
+mod common;
 
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
-}
+const CHAIN_ID: u64 = 424_243;
 
 async fn wait_for_port(port: u16, timeout: Duration) {
     let deadline = Instant::now() + timeout;
@@ -57,16 +53,14 @@ async fn a_live_segment_roll_failure_exits_the_process_non_zero() {
     )
     .unwrap();
 
-    let rpc_port = free_port();
-    let metrics_port = free_port();
     let config_path = dir.path().join("config.toml");
     std::fs::write(
         &config_path,
         format!(
             r#"
             chain_id = {CHAIN_ID}
-            rpc_addr = "127.0.0.1:{rpc_port}"
-            metrics_addr = "127.0.0.1:{metrics_port}"
+            rpc_addr = "127.0.0.1:0"
+            metrics_addr = "127.0.0.1:0"
             log_dir = "{}"
             sequencer_key_path = "{}"
             blocks_per_segment = 1
@@ -85,14 +79,10 @@ async fn a_live_segment_roll_failure_exits_the_process_non_zero() {
     )
     .unwrap();
 
-    let bin = env!("CARGO_BIN_EXE_rome-zk-sequencer");
-    let mut child: Child = Command::new(bin)
-        .arg("--config")
-        .arg(&config_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn rome-zk-sequencer binary");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rome-zk-sequencer"));
+    cmd.arg("--config").arg(&config_path);
+    let (mut child, ports) = common::spawn_reporting_ports(&mut cmd);
+    let rpc_port = ports.rpc;
 
     wait_for_port(rpc_port, Duration::from_secs(10)).await;
 

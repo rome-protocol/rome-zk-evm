@@ -31,7 +31,8 @@ caller's point of view this is not a new public surface — it is the same seam,
   root of a block's withdrawals list, and `canonical_header_rule_with_withdrawals` is the header rule for a
   block that carries them. The sequencer, derive and the stateless validator all call these, so they cannot
   disagree on a block's `withdrawalsRoot`. With an empty list the root is `EMPTY_WITHDRAWALS` and the rule is
-  exactly `canonical_header_rule`, so a block without deposits is unchanged.
+  exactly `canonical_header_rule`, so a block without deposits is unchanged. `BlockEnv.withdrawals` carries a
+  block's list (empty for a block with no deposits), so `BlockEnv` is `Clone` but no longer `Copy`.
 - **A per-sub-block execution budget is enforced by the caller, not assumed by the executor.**
   `execute_sub_block` takes a gas limit and a wall-clock deadline; an executor must stop reaching new
   transactions once either binds, and must return everything it did not reach, in order, as

@@ -223,6 +223,29 @@ pub async fn serve_metrics(addr: SocketAddr, metrics: Arc<Metrics>) -> std::io::
     rome_zk_metrics_http::serve(addr, move || metrics.render()).await
 }
 
+/// Binds the metrics listener on `addr` and serves `GET /metrics` on it from a spawned task; returns
+/// the address actually bound. The bind happens before this returns, so a configured port 0 (the OS
+/// picks) is reported back as the real port, and the startup log line can say where the endpoint is.
+/// A bind failure is logged and the sequencer carries on without a metrics endpoint (`addr` is
+/// returned unchanged), exactly as when the spawned `serve_metrics` task used to end in an error
+/// nobody read.
+pub async fn spawn_metrics(addr: SocketAddr, metrics: Arc<Metrics>) -> SocketAddr {
+    let listener = match rome_zk_metrics_http::bind(addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            tracing::error!("metrics server on {addr} failed to bind: {e}");
+            return addr;
+        }
+    };
+    let bound = listener.local_addr().unwrap_or(addr);
+    tokio::spawn(async move {
+        if let Err(e) = rome_zk_metrics_http::serve_on(listener, move || metrics.render()).await {
+            tracing::error!("metrics server stopped: {e}");
+        }
+    });
+    bound
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

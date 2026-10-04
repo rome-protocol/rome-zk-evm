@@ -99,7 +99,10 @@ async fn abandon_batch_cu_on_a_900_leaf_account_fits_the_chunk_compute_unit_limi
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(account.data.len(), rome_zk_layouts::batch::account_len(900));
+    assert_eq!(
+        account.data.len(),
+        rome_zk_layouts::batch::account_len_for(rome_zk_layouts::batch::VERSION, 900).unwrap()
+    );
 
     let abandon_ix = zk_inbox_client::abandon_batch_ix(
         &program_id,

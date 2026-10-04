@@ -3,6 +3,10 @@
 //! `ZiskStdin::write_slice`-framed, written to a file; and the expected public values, printed as hex so
 //! a ziskemu run's committed output can be compared field by field.
 //!
+//! **Wire v3 deposit fields, empty for now:** `build_batch_input` writes the deposit-free range (the
+//! batch's settlement program, `deposit_from` 0, `deposit_hash_from` = `h_0` of that program and chain,
+//! no deposits). Real ranges come with the batch header v3 in the deposit build.
+//!
 //! **No `chain_config` here any more (wire v2):** the chain's rules are baked
 //! into the guest ELF at compile time, not supplied by the host — `--genesis` (the CLI's own arg) is
 //! still read (`crate::genesis::load_chain_config`) to learn `chain_id` for deriving PDAs, but its
@@ -12,6 +16,14 @@ use std::path::Path;
 
 use crate::inbox::BatchAccount;
 use crate::wire::{write_slice_frame, RomePublicInput, RomeWitnessInput};
+
+/// `h_0` for `(settlement_program, chain_id)`: the deposit queue's hash chain before any deposit, and
+/// the value a batch with an empty deposit range carries as `deposit_hash_from` (an empty range uses
+/// the cursor's current value, which is `h_0` on a chain that never took a deposit).
+fn empty_range_hash(settlement_program: &[u8; 32], chain_id: u64) -> [u8; 32] {
+    let keccak = rome_zk_merkle::keccak256 as fn(&[&[u8]]) -> [u8; 32];
+    rome_zk_layouts::deposit::queue_seed_hash(&keccak, settlement_program, chain_id)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum BuildError {
@@ -124,6 +136,7 @@ pub fn build_batch_input(
 
     let parent_hash = crate::header_hash(&parent_header);
 
+    let settlement_program = batch_account.settlement_program.to_bytes();
     let public = RomePublicInput {
         chain_id: batch_account.chain_id,
         batch: batch_account.batch,
@@ -134,6 +147,10 @@ pub fn build_batch_input(
         chunk_bodies,
         parent_header,
         blocks,
+        settlement_program,
+        deposit_from: 0,
+        deposit_hash_from: empty_range_hash(&settlement_program, batch_account.chain_id),
+        deposits: vec![],
     };
     let witness = RomeWitnessInput { witnesses };
 
@@ -276,6 +293,10 @@ mod tests {
             chunk_bodies: vec![vec![9, 9, 9]],
             parent_header: alloy_consensus::Header::default(),
             blocks: vec![],
+            settlement_program: [0x33; 32],
+            deposit_from: 0,
+            deposit_hash_from: [0; 32],
+            deposits: vec![],
         };
         let witness = RomeWitnessInput { witnesses: vec![] };
         // Unique per process/run, not a fixed shared name — see genesis.rs's own test for why (a stale
@@ -300,5 +321,121 @@ mod tests {
         assert_eq!(decoded.chain_id, public.chain_id);
         assert_eq!(decoded.chunk_bodies, public.chunk_bodies);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Serves the committed batch-3930 fixture's own header, blocks and witnesses, so
+    /// `build_batch_input` runs end to end with no network.
+    struct FixtureVerifier {
+        public: RomePublicInput,
+        witness: RomeWitnessInput,
+    }
+
+    impl crate::verifier::VerifierFetch for FixtureVerifier {
+        fn head(&mut self) -> Result<u64, crate::verifier::VerifierError> {
+            Ok(self.public.blocks.last().unwrap().header.number)
+        }
+        fn header(
+            &mut self,
+            number: u64,
+        ) -> Result<alloy_consensus::Header, crate::verifier::VerifierError> {
+            assert_eq!(number + 1, self.public.blocks[0].header.number);
+            Ok(self.public.parent_header.clone())
+        }
+        fn block(
+            &mut self,
+            number: u64,
+        ) -> Result<reth_ethereum_primitives::Block, crate::verifier::VerifierError> {
+            Ok(self
+                .public
+                .blocks
+                .iter()
+                .find(|b| b.header.number == number)
+                .unwrap()
+                .clone())
+        }
+        fn witness(
+            &mut self,
+            number: u64,
+        ) -> Result<alloy_rpc_types_debug::ExecutionWitness, crate::verifier::VerifierError>
+        {
+            let idx = self
+                .public
+                .blocks
+                .iter()
+                .position(|b| b.header.number == number)
+                .unwrap();
+            Ok(self.witness.witnesses[idx].clone())
+        }
+    }
+
+    /// `build_batch_input` writes the empty deposit range: the batch account's settlement program,
+    /// `deposit_from` 0, `h_0` of (that program, the chain id), no deposits, and every other field as
+    /// before. Run against the committed batch-3930 fixture, it reproduces that file's public and witness
+    /// frames byte for byte, which also ties the fixture's migrated tail to what the builder writes.
+    #[test]
+    fn build_batch_input_writes_the_empty_deposit_range_and_reproduces_the_fixture() {
+        use std::str::FromStr;
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/prover-input/txv1-dev-batch-3930.bin"
+        );
+        let raw = std::fs::read(path).unwrap();
+        let public_len = u64::from_le_bytes(raw[0..8].try_into().unwrap()) as usize;
+        let public_bytes = &raw[8..8 + public_len];
+        let witness_frame = &raw[8 + public_len + ((8 - public_len % 8) % 8)..];
+        let (fixture_public, _): (RomePublicInput, usize) =
+            bincode::serde::decode_from_slice(public_bytes, bincode::config::standard()).unwrap();
+        let witness_len = u64::from_le_bytes(witness_frame[0..8].try_into().unwrap()) as usize;
+        let (fixture_witness, _): (RomeWitnessInput, usize) = bincode::serde::decode_from_slice(
+            &witness_frame[8..8 + witness_len],
+            bincode::config::standard(),
+        )
+        .unwrap();
+
+        let settlement_program = solana_program::pubkey::Pubkey::from_str(
+            "6yWj1Az1JmHBmt1654bFx2UdPMWd6Aak2QqBDPQxpj56",
+        )
+        .unwrap();
+        let batch_account = BatchAccount {
+            chain_id: fixture_public.chain_id,
+            batch: fixture_public.batch,
+            open_slot: fixture_public.open_slot,
+            expected_count: fixture_public.expected_count,
+            leaves_present: fixture_public.expected_count,
+            finalized: true,
+            settlement_program,
+            authority: solana_program::pubkey::Pubkey::new_unique(),
+            root: [0; 32],
+            forced_root: [0; 32],
+            acc: [0; 32],
+            finalize_cursor: 0,
+            open_unix_ts: fixture_public.open_unix_ts,
+            deposit: None,
+        };
+        let mut verifier = FixtureVerifier {
+            public: fixture_public.clone(),
+            witness: fixture_witness,
+        };
+        let (public, witness, _expected) = build_batch_input(
+            batch_account,
+            fixture_public.chunk_bodies.clone(),
+            fixture_public.max_drift_secs,
+            &mut verifier,
+        )
+        .unwrap();
+
+        assert_eq!(public.settlement_program, settlement_program.to_bytes());
+        assert_eq!(public.deposit_from, 0);
+        assert_eq!(
+            public.deposit_hash_from,
+            empty_range_hash(&settlement_program.to_bytes(), 200101)
+        );
+        assert!(public.deposits.is_empty());
+
+        assert_eq!(public.serialize(), public_bytes);
+        let mut witness_out = Vec::new();
+        write_slice_frame(&mut witness_out, &witness.serialize());
+        assert_eq!(witness_out, witness_frame);
     }
 }

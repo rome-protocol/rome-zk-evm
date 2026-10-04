@@ -44,7 +44,14 @@ fn batch_account_bytes(
     expected_count: u32,
     chunk_bodies: &[&[u8]],
 ) -> Vec<u8> {
-    let mut d = vec![0u8; rome_zk_layouts::batch::account_len(expected_count)];
+    let mut d = vec![
+        0u8;
+        rome_zk_layouts::batch::account_len_for(
+            rome_zk_layouts::batch::VERSION,
+            expected_count
+        )
+        .unwrap()
+    ];
     d[rome_zk_layouts::batch::OFF_MAGIC..rome_zk_layouts::batch::OFF_MAGIC + 4]
         .copy_from_slice(&rome_zk_layouts::batch::MAGIC.to_le_bytes());
     d[rome_zk_layouts::batch::OFF_VERSION] = rome_zk_layouts::batch::VERSION;

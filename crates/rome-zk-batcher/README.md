@@ -38,6 +38,17 @@ program.
   `rome-zk-derive`'s `batch_queue::decode_batch` checks on the read side; a dev-dependency test
   (`tests/derive_decode_batch_compat.rs`) proves the real function accepts every shape this crate's own
   grouping produces, size-closed groups included.
+- **The deposit cursor rides in the stream as the optional fifth block field.** `BlockSource` reads each block's
+  withdrawal indices off the ordered log (it never counts them): a block's `deposits_end` is its last
+  withdrawal's index plus one, and a block without withdrawals keeps the previous value. Indices must run on
+  without a gap or a repeat, and the first index after the resume point must equal the deposit cursor's
+  `deposit_next` (set with `BlockSource::with_deposit_start`, default 0) or the previous batch's end; anything
+  else stops the batcher with `FirstDepositIndexMismatch` or `DepositIndexGap`. `SizeCappedGrouper` keeps the
+  running value (`with_deposits(from, cap)`) and writes the field through the channel's `set_deposits_end`, so it
+  appears exactly where the value changes. When a `DepositCap` is set it closes a group before a block that
+  would take it over the queue's `max_per_batch`, using the stricter of the active and pending values, and the
+  next group starts where that one ended (`CloseReason::Deposits`). A log without deposits gives the same
+  stream and frame bytes as before (`tests/deposits_stream.rs`).
 - **`BlockSource` refuses rather than truncate.** If the log genuinely holds more sub-blocks for a block
   than this process is configured for, `BlockSource` peeks one record ahead before ever handing back a
   "complete" block and refuses (`SourceError::ProfileMismatch`) — a misconfigured `sub_blocks_per_block`
@@ -153,7 +164,7 @@ visible in the ordered log minus the last finalized batch's own last block), and
 `_cu_samples_triggered_total` (counter: finalized batches whose turn it was to CU-sample under
 `cu_sample_every`, bumped whether or not an RPC client is configured — see below).
 
-Age-close observability: `_groups_closed_total{reason=cap|size|age}` (counter — a quiet chain that never
+Age-close observability: `_groups_closed_total{reason=cap|size|deposits|age}` (counter — a quiet chain that never
 produces anything shows no increments here at all), `_oldest_unposted_block_age_seconds` (gauge: how long
 the group in progress has held its first block on this process's own receipt clock, 0 whenever nothing is
 unposted), `_block_age_on_arrival_seconds` (histogram: this process's wall clock minus a block's own

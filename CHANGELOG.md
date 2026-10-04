@@ -4,6 +4,49 @@ This changelog describes the system as built on `main`, grouped by component. It
 release-tag cadence yet — see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for what each component does
 and how they fit together.
 
+## Synthetic deposit batches
+
+- `synth-deposit-batch` (in `rome-zk-prover-input`) builds a wire v3 guest input that carries deposits, plus a JSON
+  sidecar with the expected 208-byte public values and the intermediate values (the hash chain ends, `forced_root`,
+  `acc`, each block's withdrawals root). The blocks come from a local reth node (peer discovery off, no peers) driven
+  through `testing_buildBlockV1` with each block's deposit withdrawals; the records, hash chain and `forced_root` come
+  from the deposit functions in `rome-zk-layouts`, the stream from `set_deposits_end` and `cut_frames`. Keys and
+  addresses derive from fixed seeds; nothing is secret or funded. The settlement program is
+  `rome_zk_testkit::fixed_settlement_program_id()` and each sender is the pubkey of a fixed-seed keypair
+  (`rome_zk_testkit::synthetic_depositor_keypair`), so program tests can sign `Deposit` and reproduce the batch's hash
+  chain, `forced_root` and `acc`.
+- Two committed batches, `fixtures/prover-input/synthetic-deposits-{small,full}.{bin,json}`: `small` is 3 deposits
+  over 2 blocks with an empty block between them, `full` is 4 deposits in each of 60 blocks (240). A unit test
+  re-derives every hash value in each sidecar from its `.bin`.
+- `scripts/synth-deposit-batch.sh` runs the node and the generator; `scripts/tests/synth_deposit_batch_flags.sh`
+  checks that the node starts with discovery off and no peers.
+
+## Prover input: wire v3
+
+- The guest input (`RomePublicInput` in `rome-zk-prover-input`) gains four fields after `blocks`: the settlement
+  program, the first deposit index of the batch, the deposit hash chain value at that index, and the batch's deposits
+  (sender, recipient and amount in gwei; each index is the first index plus its position). The layout matches the
+  guest that takes deposits, and a cross-repository test round-trips it both ways.
+- `build_batch_input` writes an empty deposit range for now: the settlement program from its config, first index 0,
+  and the queue's starting hash for that settlement program and chain id. Real ranges come with the deposit build.
+- The two recorded inputs (`txv1-dev-batch-3930.bin`, `txv1-dev-reset6-batch-1.bin`) are migrated to the new layout
+  by a test that shows every earlier field is unchanged.
+- The prover can only feed a guest built for this input. A chain proving with an older guest keeps the image it runs.
+
+Node images are published as `ghcr.io/rome-protocol/rome-zk-evm`. `v0.1.2` carries everything up to
+"Inbox accounts keyed by the settlement program". `v0.1.3` adds the batcher compute-unit limits, batcher
+restart recovery, the withdrawals rule, the deposit hash functions and the channel's `deposits_end` field.
+The operator CLI and the rest of "Deposit groundwork" are on `main` and not yet in a published image.
+
+## Bridge program set once
+
+- `ProposeExitConfig` refuses a proposal that names a bridge program once the chain's exit config holds
+  one (`BridgeProgramSetOnce`, 86), the same bridge included. Portal, cap and bond proposals are unaffected.
+- `ActivateExitConfig` drops the bridge part of an older pending proposal when a bridge is already set, applies
+  its portal, cap and bond parts, clears the pending slot and logs the dropped bridge. It never refuses over it,
+  since a pending proposal cannot be cancelled. The exit-config layout, every account list and
+  `PostRootProved`'s size are unchanged.
+
 ## Operator CLI
 
 - New crate `rome-zk-ops` with the binary `rome-zk-ops`: `chain-id`, `register`, `refund-deposit`,
@@ -25,7 +68,7 @@ and how they fit together.
 - A shell test, `scripts/tests/no_legacy_tx.sh` (run by the shell-tests job), refuses a legacy transaction or
   message constructor in client code under `crates/` and `programs/`, and proves it fails on a planted line.
 - The root `Dockerfile` ships `rome-zk-ops` beside the sequencer, batcher and derive binaries, and pins the
-  runtime user to uid and gid 999.
+  runtime user to uid and gid 999. Published node images up to `v0.1.3` do not include it; the next tag will.
 - `rome-zk-solana-sender` can sign with co-signers beside the fee payer, for a transaction with a second
   required signer.
 - `zk-settlement-client` gains `ops_plan`: the registration nonce lookup, the recorded nonce and chain id pair,
@@ -35,13 +78,52 @@ and how they fit together.
   is given. The other `governance` subcommands send through the V1 sender instead of building a legacy
   transaction. The `devnet-driver` feature no longer pulls in `reqwest`, `serde_json`, `base64` or `bincode`.
 
+## Deposit groundwork
+
+Deposits are not live yet: no program takes a deposit and the sequencer credits none. These changes add
+the formats a deposit will use. A chain with no deposits builds, logs, encodes and commits exactly the
+bytes it did before, and the tests pin that against the old encodings.
+
+- `rome-zk-layouts::deposit` holds the deposit queue's hash formulas: the starting value `h_0`, a deposit's
+  leaf, the hash chain, a batch's `deposits_commitment` and the two-lane `forced_root`. They are pure
+  functions, so the programs, the services and the guest compute the same bytes. `forced_root` over an
+  empty range is the existing empty constant.
+- `rome-zk-channel`: a block gains an optional fifth field, `deposits_end`, the deposit queue's index after
+  the block. A block without it encodes as the same four-item list as before, and decoding accepts four or
+  five items. A fifth field that does not move past the previous block's value is refused.
+- `rome-zk-layouts::deposit_queue` holds the bridge's deposit accounts: the one-time bridge config, a chain's
+  deposit queue and a single deposit record, plus `amount_gwei`, which converts a token amount to gwei and
+  refuses a mint with more than 9 decimals.
+- `rome-zk-layouts` and `zk-inbox-client` read a version 2 batch cursor, which adds the deposit queue's
+  cursor (21 to 69 bytes), and a version 3 batch account header, which adds the batch's deposit range (210 to
+  290 bytes). Every earlier offset stays where it is. The inbox program still writes cursor version 1 and
+  header version 2. `zk-inbox-client::reference_commitment_with_deposits` computes a batch's commitment
+  with a deposit range; with an empty range it equals `reference_commitment`.
+- Blocks that carry withdrawals: `BlockEnv` gains `withdrawals: Vec<Withdrawal>`, empty for a block with no
+  deposits, and is no longer `Copy`. The executor builds a block with its withdrawals credited after its
+  transactions. In `rome-zk-log` the sub-block header takes an optional ninth item, `deposits_end`, on the
+  first sub-block of a block that credits deposits, and that record carries the block's withdrawals after
+  its transactions. The header hash and the sequencer's signature cover `deposits_end`. Sequencer restart
+  recovery replays a logged block with its withdrawals.
+
 ## Withdrawals rule
 
 - `rome-zk-executor-api` gains `deposit_withdrawal(index, recipient, amount_gwei)`, `withdrawals_root(&[Withdrawal])`
   and `canonical_header_rule_with_withdrawals(chain_id, number, fee_recipient, &[Withdrawal])`. They give the
   sequencer, derive and the stateless validator one definition of a block's withdrawals and their root. The crate
-  now depends on `alloy-eips` and `alloy-trie` with default features off. `canonical_header_rule`,
-  `EMPTY_WITHDRAWALS` and `BlockEnv` are unchanged, and with an empty list the new rule is exactly the old one.
+  now depends on `alloy-eips` and `alloy-trie` with default features off. `canonical_header_rule` and
+  `EMPTY_WITHDRAWALS` are unchanged, and with an empty list the new rule is exactly the old one. `BlockEnv`
+  gained a `withdrawals` field later; see "Deposit groundwork".
+
+## Batcher: deposits in the stream
+
+- `BlockSource` reads each block's withdrawal indices off the ordered log and sets the block's `deposits_end`
+  (last index plus one; none for a block without withdrawals). Indices must run on without a gap, and the first
+  index after the resume point must equal the cursor's `deposit_next` or the previous batch's end, or the batcher
+  stops with a named error. `SizeCappedGrouper` keeps the running value, encodes it with `set_deposits_end`, and
+  closes a group before a block that would take it over `max_per_batch` (the stricter of the active and pending
+  values; new close reason `deposits`). A log without deposits produces byte-identical frames. The header
+  readers and the send path are unchanged.
 
 ## Batcher restart recovery
 
@@ -178,8 +260,8 @@ and how they fit together.
   range is refused with `BackedBalanceInvalid`, and one key without the other with `BackedAddressMissing` or
   `BackedBalanceMissing`. Any other key under `[genesis]` is refused with `GenesisKeyUnknown`.
 - With a backed balance, `init` prints the exact lamport amount to lock in the chain's vault with `Fund`
-  before asking Rome to register the key, and says the bridge program is not deployed on devnet yet. Rome checks the
-  lock before it registers the key.
+  before asking Rome to register the key. Rome checks the lock before it registers the key. The vault lives on
+  the shared devnet zk-bridge listed in `deploy/rollup/programs.devnet.json`, and `init` says so.
 - The README, `chain.toml.example` and the devnet guide now describe zero balances and the optional backed balance.
 - A chain initialised with `funded_address` keeps that genesis and can never take deposits. To use this version, start a
   new chain: move `rendered/` aside, remove `funded_address` from `chain.toml`, and run `init` with a new payer key.
@@ -252,8 +334,9 @@ and how they fit together.
   `PostRootProved` that reaches the pairing about 557k to 562k, now about 453k to 459k. The settlement
   tests keep their bounds (a rejection stays under 60k, reaching the pairing stays over 400k) and the verify
   pin is now below 460k.
-- Tiber's deploy script now deploys `veritas` instead of the old verifier. Its program id will be assigned
-  at Tiber's next chain reset. The deploy config's program list no longer includes the retired verifier.
+- On the shared Solana devnet, `veritas` is deployed at `2cLGd9FKC7TiZrEHCvpw291AwXNcGgP9nDT4W3PHLe5k`,
+  listed in `deploy/rollup/programs.devnet.json`. Tiber's deploy script now deploys `veritas` instead of the
+  old verifier; Tiber gets its program id at its next chain reset.
 
 ## Solana crate line bumped to Agave 4.3.0 + SBPF v3 everywhere (2026-10-01)
 
@@ -1445,7 +1528,9 @@ image and a real `docker compose up` on a build machine.
 
 ### Chain registration writes the layout-1 verifier entry; Tiber's batch cadence widens to 60 blocks
 
-- **`register_chain` now writes three genesis registry entries, not two.** The layout-1 primary — the
+- **`register_chain` now writes three genesis registry entries, not two.** (This now applies to reserved
+  chains only. A permissionless chain registers with an empty registry and refuses the verifier-key flags;
+  see "Permissionless chain registration and proved finality".) The layout-1 primary — the
   chain's own ZisK stateless-validator guest vkey, read from a `--layout1-vkey-json` file — comes first,
   ahead of the existing layout-2 header-RLP fallback and the zeroed Groth16 placeholder slot. The example
   refuses to run without `--layout1-vkey-json`, by name: a chain registered without a layout-1 entry can
@@ -1477,8 +1562,7 @@ image and a real `docker compose up` on a build machine.
   the profile shipped with this repo.
 - This reset needs new program ids: `register_chain` refuses a chain whose root account already exists,
   and every prior Tiber reset hit that the same way — a Tiber reset has always rotated ids for this
-  reason. See the Tiber deploy README's full-reset section for the chain-id-cannot-move argument (the guest ELF
-  now embeds the chain's own genesis at build time).
+  reason. The chain id cannot move either: the guest ELF embeds the chain's own genesis at build time.
 
 ### Batch guest + prover input (`crates/rome-zk-prover-input`; guest in rome-zk-guest)
 
@@ -1608,7 +1692,7 @@ image and a real `docker compose up` on a build machine.
   the real header number directly, no `-1` conversion) and `rome-zk-derive`'s engine equality check and
   settlement-root resume anchor (see the Derivation node entries below) changed in lockstep.
   **Devnet-only consequence:** this changes every already-committed block's real height and
-  `prev_randao` — a running devnet must be reset (see the Tiber deploy README), never migrated in place;
+  `prev_randao` — a running devnet must be reset, never migrated in place;
   this is never acceptable on a live chain.
 - Single-node sequencer: bounded admission queue (arrival order is sealing order — no fee-ordered
   mempool), per-sender nonce cache with nonce-gap parking, 50 ms signed sub-blocks and 1 s blocks.
@@ -1880,8 +1964,7 @@ image and a real `docker compose up` on a build machine.
   any write, so this reading can never be anything other than a real committed clock value. No migration:
   a v1 account is refused (`BadVersion`, or the equivalent named error at each reader's own boundary) by
   the program itself, `zk-inbox-client`, the derivation node, the batcher's resume-anchor walk, and the
-  settlement program's `PostRoot`; a devnet carrying v1 batches is reset, never upgraded in place
-  (see the Tiber deploy README).
+  settlement program's `PostRoot`; a devnet carrying v1 batches is reset, never upgraded in place.
 
 ### Settlement program (`programs/zk-settlement`)
 
@@ -1899,7 +1982,8 @@ image and a real `docker compose up` on a build machine.
   (cross-program-invocable; returns only final roots).
 - Registration and revenue: `InitGlobalConfig` (authenticated against the program's own upgrade authority
   — no bootstrap key needed), `AllowReservedId` / `RevokeReservedId`, `SetFee`, `SetTreasury`,
-  `MigrateChain` (brings a chain that predates this scheme forward into it), `RefundDeposit`,
+  `MigrateChain` (brings a chain that predates this scheme forward into it; now retired and replaced by
+  `MigrateChainV2`, below), `RefundDeposit`,
   `ReclaimChain` (reclaims an id that was never posted to, once its window has elapsed and, for a
   reserved id, once its allow marker is revoked), `SetGlobalConfig`, and a two-step
   `ProposeRegistryAuthority` / `AcceptRegistryAuthority` rotation.
@@ -1912,8 +1996,8 @@ image and a real `docker compose up` on a build machine.
   from ZisK's 64-word `u32` output ABI. `PostRootProved` now has two live layouts, selected by the
   registry entry's `layout_id`: layout 2 (unchanged, single block, header-bound) and layout 1 (new — a
   whole batch range, bound directly to the poster's claimed args, the inbox batch account's own committed
-  clock reading, and the chain's drift bound), before the pairing runs in either case. No guest commits
-  layout 1 yet — this lands the on-chain binding and byte format ahead of the guest work.
+  clock reading, and the chain's drift bound), before the pairing runs in either case. The batch guest
+  (`guest-rome`, in the separate guest repository) commits layout 1; see "Batch guest + prover input".
 - **`chain_config` v2: `max_drift_secs`.** A new `InitChainV2` (discriminant 24) takes an explicit
   `max_drift_secs` argument (`0` refused) and creates `chain_config` at v2 directly; the original `InitChain`
   (3) keeps the byte shape recorded on the shared standalone node (slot 2554, committed as a fixture and
@@ -2117,7 +2201,7 @@ image and a real `docker compose up` on a build machine.
   `Pubkey` type `pda` returns; every other function stays free of it.
 - **`rome-zk-layouts` pins the five PDAs already deployed on Tiber** (`tests/pda_pins.rs`: root, batch
   cursor, global config, reserved-allow marker and chain config, all for chain id 200101) as string
-  literals against the live addresses recorded in the Tiber deploy README. With every account's PDA
+  literals against the live addresses on that chain. With every account's PDA
   derivation now living in this one crate, the programs' and clients' own delegation tests compare their
   derivation against this crate's — which agrees with a wrong seed exactly as readily as a right one.
   These five tests are the check that catches a seed change that would strand an already-deployed
@@ -2217,15 +2301,14 @@ image and a real `docker compose up` on a build machine.
 
 ### Not yet built
 
-The following crates exist as scaffolding only — a short module doc naming the design section they will
-implement, and no behavior: `rome-zk-challenger` (the challenge-flow client), `rome-zk-indexer`, and
-`rome-zk-explorer-api` (the explorer's read API). `rome-zk-prover` has its first behavior (see
-"rome-zk-prover" below) but still has no follower loop, no poster, and no chain write.
+The following crates exist as scaffolding only — a short module doc saying what they will do, and no
+behavior: `rome-zk-challenger` (the challenge-flow client), `rome-zk-indexer`, and
+`rome-zk-explorer-api` (the explorer's read API).
 
 ### Operations
 
-- A persistent Solana-devnet-settled chain (Tiber, chain id 200101) that every merged change deploys to — see the
-  Tiber deploy README. The render-config Make target (a script in the Tiber deploy directory) renders the
+- A persistent Solana-devnet-settled chain (Tiber, chain id 200101) that every merged change deploys to. The
+  render-config Make target (a script in the Tiber deploy directory) renders the
   sequencer's `sequencer-config.toml` (gitignored, no secret) from `crates/rome-zk-sequencer/config.example.toml` —
   the sequencer start target runs it automatically before scp'ing; the signing key stays provisioned separately in
   the secret store.
@@ -2260,8 +2343,7 @@ implement, and no behavior: `rome-zk-challenger` (the challenge-flow client), `r
   health check gained two checks: batches advancing
   (`batch_cursor.next_batch` increasing across two 60 s-apart samples) and verifier head == sequencer head
   (`reth-verifier`'s `eth_blockNumber`, reached over a tunnelled ssh connection since its RPC is loopback-only,
-  within one `blocks_per_batch` of the sequencer's own). See the Tiber deploy README's "Settlement services" and
-  full-reset sections.
+  within one `blocks_per_batch` of the sequencer's own).
 
 ### Executor
 
@@ -2449,16 +2531,14 @@ implement, and no behavior: `rome-zk-challenger` (the challenge-flow client), `r
   `rome-zk-profile` test proves the exact sequencer `config.example.toml` `[profile]` table validates through
   `Profile::validate` after the config render script's own substitution.
 - **No live Tiber resource changes with this release** — recreating the sequencer/batcher/derive
-  containers on an image built from it is the operator's own step (the Tiber deploy README's "Recreate
-  on the idle-knob images" section).
+  containers on an image built from it is the operator's own step.
 
 ### Tiber ops — the recreate steps and the check script are true against the live chain
 
 The previous release's recreate steps, walked against the real `make -n` recipes and the
 live chain's own accounts read-only, had every check and every step below either red on
 arrival or describing a step that does not run as written. This release closes that gap; **no live
-Tiber resource changes with this release** — the recreate itself stays the operator's own step,
-documented in the Tiber deploy README's "Recreate on the idle-knob images" section.
+Tiber resource changes with this release** — the recreate itself stays the operator's own step.
 
 - **Tiber health check's check 2 no longer requires
   `eth_blockNumber` to advance.** An idle chain
@@ -2809,22 +2889,22 @@ inbox programs. None of them require exposing a private key beyond what a normal
 already needs; every key referenced below is read from wherever the deployment's key management already
 keeps it, never printed or logged.
 
-### Upgrading the Tiber programs
+### Upgrading the programs
 
-The three on-chain programs are deployed under upgradeable program keys. To ship a new build:
+The four on-chain programs (zk-inbox, zk-settlement, veritas and zk-bridge) are deployed under upgradeable
+program keys. To ship a new build:
 
-1. Build the programs (`cargo build-sbf` for each of `programs/*/`, per the top-level
+1. Build the programs (`cargo build-sbf --arch v3` for each of `programs/*/`, per the top-level
    [`README.md`](README.md)) and confirm the workspace test suite is green against the new build.
 2. Deploy the upgrade using the standard Solana upgrade path (`solana program deploy` against the
    existing program id, signed by the program's current upgrade authority).
-3. Re-run the Tiber check target to confirm the chain, the updated program, and every dependent service are
-   still healthy.
+3. Check that every chain on those programs still posts and that its services are healthy
+   (`./rollup check` for a chain run from `deploy/rollup`).
 
 A change to an account layout, a PDA seed, or the accumulator's commitment formula is **not** a plain upgrade
 — those are baked into every existing account, and changing them means every existing account of that shape is
-now misread by the new program. Such a change needs a fresh chain (a Tiber reset, which redeploys under new
-program keypairs and a clean chain state) rather than an in-place upgrade, until a migration path for that
-specific layout exists.
+now misread by the new program. Such a change needs a fresh chain (new program ids and a clean chain state)
+rather than an in-place upgrade, until a migration path for that specific layout exists.
 
 ### Bootstrapping a new chain's batch cursor (`InitBatchCursor`)
 
@@ -2840,15 +2920,19 @@ accepts next) — initializing it too low would let a future `OpenBatch` reuse a
 may already have been reclaimed, and initializing it above that id halts the chain. A second
 `InitBatchCursor` call for the same chain is rejected; there is no re-run path.
 
-### Bringing a pre-existing chain into the registration-and-revenue scheme (`MigrateChain`)
+### Bringing a pre-existing chain forward (`MigrateChainV2`)
 
 A chain whose root and registry accounts were created before the settlement program's registration and
-fee bookkeeping existed (Tiber's own chain, for example) has no `chain_config` account yet, and every
-`PostRoot` / `PostRootProved` call for it requires one. `MigrateChain`, signed by the registry authority,
-creates that chain's `chain_config` account with the current global defaults (fee schedule, deposit
-bookkeeping) and marks it as never having had a deposit locked — a migrated chain's deposit is treated as
-already refunded, since none was ever collected for it. This is a one-time, per-chain step: a second call
-for the same chain is rejected once its `chain_config` account already exists. Run `InitGlobalConfig` once
-per deployment before running `MigrateChain` for any chain — the global configuration account
-(`treasury`, `registry_authority`, default fee schedule) must already exist for `MigrateChain` to read its
-defaults from.
+fee bookkeeping existed (Tiber's own chain, for example) has no `chain_config` account, and every
+`PostRoot` / `PostRootProved` call for it requires one. A chain migrated before `chain_config` version 2
+existed has a version 1 account with no drift bound, and layout 1 cannot post for it. `MigrateChainV2`
+(discriminant 23), signed by the registry authority, handles both: it creates a missing `chain_config` at
+version 2 with the current global defaults (fee schedule, deposit bookkeeping), or grows a version 1
+account to version 2 in place and keeps every existing field. A chain already on version 2 is refused
+(`ChainAlreadyMigrated`). The drift bound is an explicit argument with no default, and `0` is refused. A
+`chain_config` it creates records that no deposit was ever locked, so the deposit counts as already
+refunded. The original `MigrateChain` (15) is retired and refused by name (`RetiredInstruction`).
+
+Run it with `rome-zk-ops migrate ... --max-drift-secs N` (a dry run unless `--confirm`). Run
+`InitGlobalConfig` once per deployment first: the global configuration account (`treasury`,
+`registry_authority`, default fee schedule) must exist for the migration to read its defaults from.

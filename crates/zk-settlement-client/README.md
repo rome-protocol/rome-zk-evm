@@ -26,12 +26,18 @@ feature itself.
   (`examples/devnet_driver.rs`, `examples/governance.rs`) and by the thin example wrappers over
   [`rome-zk-ops`](../rome-zk-ops) (`examples/register_chain.rs`, `examples/migrate_chain.rs`, and
   `governance`'s exit-config subcommands). The operator commands themselves live in `rome-zk-ops`.
-- **`register_chain --permissionless` registers a chain with an empty registry.** The program refuses a
-  permissionless chain that brings its own verifier keys, so `rome-zk-ops register` refuses `--layout1-vkey-json` and
-  `--zisk-vkey-json` on that path (error `VkeysNotAllowedOnPermissionless`)
-  before it reads a key or calls an RPC, and prints that the chain cannot finalize a proved root until Rome
-  registers its layout-1 verifier key. The flow is: run `register_chain`, ask Rome to register the key, and
-  Rome adds it with `governance set-registry-entry`. `--reserved` still takes both vkey files.
+- **`rome-zk-ops register` registers a permissionless chain with an empty registry.** Permissionless is
+  the default path. The program refuses a permissionless chain that brings its own verifier keys, so
+  `rome-zk-ops register` refuses `--layout1-vkey-json` and `--zisk-vkey-json` on that path (error
+  `VkeysNotAllowedOnPermissionless`) before it reads a key or calls an RPC, and prints that the chain cannot
+  finalize a proved root until Rome registers its layout-1 verifier key. The flow is: run
+  `rome-zk-ops register`, ask Rome to register the key, and Rome adds it with `governance set-registry-entry`.
+  `--reserved` still takes both vkey files. The `register_chain` example is a thin wrapper over the same
+  command.
+- **`ops_plan` holds the decisions the operator commands share**: the registration nonce lookup (a failed
+  read is `NonceLookupFailed`, never nonce 0), the recorded nonce and chain id pair a registration sends, and
+  the `pending_mask` of an exit-config proposal. `rome-zk-ops` and the tests use this one copy; it reads no
+  key and calls no RPC.
 - **`decode_registry_account` reports every entry's activation slot and retired status, not just the
   header.** Each `RegistryEntryView` carries `activation_slot` — `0` on a v1-length account (active since
   genesis, what `InitChainV2` still writes), the real value once `set_registry_entry_ix` has grown the

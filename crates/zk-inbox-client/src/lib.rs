@@ -213,7 +213,7 @@ pub fn close_chunk_ix(
 
 /// Requires `payer` to be the chain's `authority`, read from the settlement root PDA, and `batch` to equal the
 /// chain's `batch_cursor.next_batch` — which this instruction then increments. Creates the batch account at
-/// `min(account_len(expected_count), MAX_PERMITTED_DATA_INCREASE)` bytes; above that ceiling, follow with
+/// `min(account_len_for(version, expected_count), MAX_PERMITTED_DATA_INCREASE)` bytes; above that ceiling, follow with
 /// [`grow_batch_ix`] (or use [`open_and_grow_batch_ixs`] to build the whole plan at once).
 pub fn open_batch_ix(
     program_id: &Pubkey,
@@ -279,7 +279,9 @@ pub fn open_and_grow_batch_ixs(
     expected_count: u32,
     settlement_program: &Pubkey,
 ) -> Vec<solana_program::instruction::Instruction> {
-    let target = batch::account_len(expected_count);
+    // `OpenBatch` writes header v2 (`batch::VERSION`), so the plan is for a v2 account.
+    let target = batch::account_len_for(batch::VERSION, expected_count)
+        .expect("the version OpenBatch writes has a known length");
     let mut current = target.min(MAX_PERMITTED_DATA_INCREASE);
     let mut ixs = vec![open_batch_ix(
         program_id,
@@ -604,7 +606,7 @@ pub mod cursor_proposal {
 
         fn batch_account(chain_id: u64, batch: u64, settlement: &Pubkey) -> Vec<u8> {
             use rome_zk_layouts::batch as b;
-            let mut d = vec![0u8; b::account_len(0)];
+            let mut d = vec![0u8; b::account_len_for(b::VERSION, 0).unwrap()];
             d[b::OFF_MAGIC..b::OFF_MAGIC + 4].copy_from_slice(&b::MAGIC.to_le_bytes());
             d[b::OFF_VERSION] = b::VERSION;
             d[b::OFF_CHAIN_ID..b::OFF_CHAIN_ID + 8].copy_from_slice(&chain_id.to_le_bytes());
@@ -738,7 +740,12 @@ pub mod scan {
         }
 
         fn batch_bytes(chain_id: u64, batch: u64) -> Vec<u8> {
-            let mut d = vec![0u8; rome_zk_layouts::batch::account_len(0)];
+            let mut d =
+                vec![
+                    0u8;
+                    rome_zk_layouts::batch::account_len_for(rome_zk_layouts::batch::VERSION, 0)
+                        .unwrap()
+                ];
             d[rome_zk_layouts::batch::OFF_MAGIC..rome_zk_layouts::batch::OFF_MAGIC + 4]
                 .copy_from_slice(&rome_zk_layouts::batch::MAGIC.to_le_bytes());
             d[rome_zk_layouts::batch::OFF_CHAIN_ID..rome_zk_layouts::batch::OFF_CHAIN_ID + 8]
@@ -1015,7 +1022,7 @@ mod tests {
 
     #[test]
     fn decode_round_trips_a_hand_built_account() {
-        let mut d = vec![0u8; batch::account_len(1)];
+        let mut d = vec![0u8; batch::account_len_for(batch::VERSION, 1).unwrap()];
         d[0..4].copy_from_slice(&batch::MAGIC.to_le_bytes());
         d[4] = batch::VERSION;
         d[5..13].copy_from_slice(&7u64.to_le_bytes());
@@ -1161,8 +1168,8 @@ mod tests {
         assert_eq!(a.open_unix_ts, 11);
         assert_eq!(a.expected_count, 9);
 
-        let mut d2 = vec![0u8; rome_zk_layouts::batch::account_len(9)];
-        d2[..rome_zk_layouts::batch::HEADER_LEN].copy_from_slice(
+        let mut d2 = vec![0u8; rome_zk_layouts::batch::account_len_for(2, 9).unwrap()];
+        d2[..rome_zk_layouts::batch::HEADER_LEN_V2].copy_from_slice(
             &rome_zk_layouts::batch::write_header(&rome_zk_layouts::batch::BatchFields {
                 deposit: None,
                 ..v3

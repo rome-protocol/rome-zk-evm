@@ -1,0 +1,66 @@
+{
+  "chain_id": 200101,
+  "first_number": 1,
+  "last_number": 3,
+  "open_unix_ts": 1790000008,
+  "max_drift_secs": 60,
+  "gas_used": 0,
+  "parent_hash": "4339ddd0ff6114c1197970f43e3e7351a8fef82ac16179b2d0d95964b9a72e95",
+  "inbox_commitment": "e92a3f30c5aa39e79c7b849892f81036a0e15090e81dcd2cab4357dd89843843",
+  "forced_outcome_commitment": "8bb7e79bf9767f0cc2772f2e2ee2c8d389cbdf8e87138488c738c50aeff3be04",
+  "last_block_hash": "ca31644570ebf113579a1368a66baf171058777f996e90bddca6b9183fc7538c",
+  "state_root": "2bc9c38ff293458e7895e62419071b4fedfb8307e5832bc35bd54abbc14c93f4",
+  "provenance": {
+    "solana_rpc": "none (a synthetic batch: no Solana read)",
+    "verifier_rpc": "a local reth node: peer discovery off, no peers",
+    "fetched_at": 1790000600,
+    "verifier_version": "reth/v2.5.2-5a6940e/x86_64-unknown-linux-gnu",
+    "input_bytes": 5408,
+    "elf_sha256": null,
+    "genesis_sha256": "15367d781b458217af60de3ec87e2358ecfc219494ecf46090811612693f856f",
+    "attempt": 0
+  },
+  "public_values_hex": "a50d03000000000001000000000000000300000000000000883bb16a000000003c0000000000000000000000000000004339ddd0ff6114c1197970f43e3e7351a8fef82ac16179b2d0d95964b9a72e95ca31644570ebf113579a1368a66baf171058777f996e90bddca6b9183fc7538c2bc9c38ff293458e7895e62419071b4fedfb8307e5832bc35bd54abbc14c93f4e92a3f30c5aa39e79c7b849892f81036a0e15090e81dcd2cab4357dd898438438bb7e79bf9767f0cc2772f2e2ee2c8d389cbdf8e87138488c738c50aeff3be04",
+  "deposits": {
+    "settlement_program": "5151515151515151515151515151515151515151515151515151515151515151",
+    "batch": 1,
+    "open_slot": 1000,
+    "expected_count": 1,
+    "deposit_from": 0,
+    "deposit_to": 3,
+    "h_0": "035872f612eaf18c5769c8475143f8233f22d71e45b39a4e925cdf34896fa980",
+    "h_from": "035872f612eaf18c5769c8475143f8233f22d71e45b39a4e925cdf34896fa980",
+    "h_to": "de2ada9842a4ee1472aaff3f3e50339efaf3c2d922a3aae2d84b4df87eb25fd9",
+    "deposits_commitment": "34ff9878bcb6dd57fcc73fbd6f0d99d7e8e3eba37efd5772f9df1bc4bd9711ad",
+    "forced_tx_commitment": "a05d5437702ee6b45d9b6626ccc0c3bba77a7e0b192956a50031e2c84e1d1e9d",
+    "forced_root": "8bb7e79bf9767f0cc2772f2e2ee2c8d389cbdf8e87138488c738c50aeff3be04",
+    "inbox_root": "984c6880919725e19f23c9b427ca9c21535331b141fe4751e339a4b70d8c7d25",
+    "acc": "e92a3f30c5aa39e79c7b849892f81036a0e15090e81dcd2cab4357dd89843843",
+    "blocks": [
+      {
+        "number": 1,
+        "timestamp": 1790000001,
+        "deposits": 2,
+        "deposits_end": 2,
+        "withdrawals_root": "1118dd519845bb6e6a15b8c6b00d3d30a55d6b794edb8b66c29f683683ae9ce6",
+        "block_hash": "a3580919595c9f1293e709d4d532217e4e368fd5e7ec9d3a4980c8686245d947"
+      },
+      {
+        "number": 2,
+        "timestamp": 1790000002,
+        "deposits": 0,
+        "deposits_end": 2,
+        "withdrawals_root": "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+        "block_hash": "8e13738be7d256845772c25609c7c69d9d1bc49ef49d4ee584b59e799cd44916"
+      },
+      {
+        "number": 3,
+        "timestamp": 1790000003,
+        "deposits": 1,
+        "deposits_end": 3,
+        "withdrawals_root": "e21ca819b8040733186e158aadc5ffb0079fcedcb53f36b847780d10c112c5bc",
+        "block_hash": "ca31644570ebf113579a1368a66baf171058777f996e90bddca6b9183fc7538c"
+      }
+    ]
+  }
+}
