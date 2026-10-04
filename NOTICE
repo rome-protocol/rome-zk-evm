@@ -1,10 +1,17 @@
 Rome ZK EVM
-Copyright 2026 Rome Protocol
+Copyright © 2024-2026 Coin Vesting Inc. d/b/a Rome Protocol. All rights reserved.
 
-This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+This software is licensed under Rome Protocol's licence (see LICENSE): personal, non-commercial use only; commercial
+use needs Rome Protocol's written permission. Releases up to and including v0.2.1 were published under the Apache
+License, Version 2.0, and those releases keep that licence.
 
-It depends on open-source libraries under their own licences. Most are Apache-2.0 or MIT. Two are under the
-Mozilla Public License 2.0 (MPL-2.0), a file-level licence: the source files of these libraries stay under
+Parts under other licences:
+
+  contracts/exit-portal   MIT, as stated at the top of each file. The exit portal is already in every chain's
+                          genesis under that licence, so it stays MIT.
+
+This software depends on open-source libraries under their own licences. Most are Apache-2.0 or MIT. Two are under
+the Mozilla Public License 2.0 (MPL-2.0), a file-level licence: the source files of these libraries stay under
 MPL-2.0 and are used here unmodified, as ordinary dependencies.
 
   fastrlp   MPL-2.0

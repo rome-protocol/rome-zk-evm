@@ -2,7 +2,7 @@
 # toolchain. ./rollup guest-build builds and runs it for you; to do it by hand, from this directory:
 #
 #   docker build --platform linux/amd64 -t rome-zk-guest-build:local \
-#     --build-arg ROME_ZK_EVM_TAG=v0.2.1 --build-arg ROME_ZK_GUEST_TAG=v0.2.0 .
+#     --build-arg ROME_ZK_EVM_TAG=v0.2.2 --build-arg ROME_ZK_GUEST_TAG=v0.2.0 .
 #
 # The image holds the toolchain and both source trees, and none of the ZisK proving keys. The two source tags are build
 # arguments: the node's tag (ROME_ZK_EVM_TAG, the same tag your node image runs) and the guest's (ROME_ZK_GUEST_TAG).
@@ -23,7 +23,7 @@ ARG ZISK_TOOLCHAIN_TAG=zisk-3.0.0
 ARG ZISK_TOOLCHAIN_SHA256=74190d265b2d8f10424cdf666b71a5b5670c3a685785cd668ee5f49318fa149e
 # sha256 of the cargo_zisk_linux_amd64.tar.gz release tarball that ziskup downloads
 ARG CARGO_ZISK_SHA256=e3605dafb5fcdb2fa8271ea945334694f42704737f31ef0bdf93d663f2b14866
-ARG ROME_ZK_EVM_TAG=v0.2.1
+ARG ROME_ZK_EVM_TAG=v0.2.2
 ARG ROME_ZK_GUEST_TAG=v0.2.0
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -72,7 +72,7 @@ RUN set -eu; \
 
 # The two public source trees. Submodules come with the guest.
 WORKDIR /work
-RUN git clone -q --branch "${ROME_ZK_EVM_TAG}" --depth 1 https://github.com/rome-protocol/rome-zk-evm.git rome-zk-evm \
+RUN git clone -q --branch "${ROME_ZK_EVM_TAG}" --depth 1 https://github.com/rome-protocol/solana-zk-evm.git rome-zk-evm \
     && git clone -q --branch "${ROME_ZK_GUEST_TAG}" --depth 1 https://github.com/rome-protocol/rome-zk-guest.git rome-zk-evm/.fork \
     && git -C rome-zk-evm/.fork submodule update --init --recursive -q \
     && git -C rome-zk-evm rev-parse HEAD > /work/rome-zk-evm.rev \

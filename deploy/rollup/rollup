@@ -125,7 +125,7 @@ node_image() { # [cfg] -> the image reference, or non-zero when none is set
   else return 1; fi
 }
 need_image() { # sets OPS_IMAGE or refuses by name
-  OPS_IMAGE="$(node_image "${1:-}")" || die ImageTagNotSet "set ROME_ZK_TAG in $ENV_FILE to the tag of the source you checked out (published tags: https://github.com/rome-protocol/rome-zk-evm/tags), or ROME_ZK_IMAGE to an image you built; the operator commands run from that image"
+  OPS_IMAGE="$(node_image "${1:-}")" || die ImageTagNotSet "set ROME_ZK_TAG in $ENV_FILE to the tag of the source you checked out (published tags: https://github.com/rome-protocol/solana-zk-evm/tags), or ROME_ZK_IMAGE to an image you built; the operator commands run from that image"
 }
 ops() { # ops ARGS... -> runs rome-zk-ops from the node image against SOLANA_RPC_URL; the mounts are OPS_MOUNTS
   docker run --rm --network host ${OPS_MOUNTS[@]+"${OPS_MOUNTS[@]}"} --entrypoint rome-zk-ops "$OPS_IMAGE" --rpc-url "$SOLANA_RPC_URL" "$@"
@@ -496,7 +496,7 @@ cmd_up() {
   seq_key="$(rz_env_get "$OUT/compose.env" SEQUENCER_KEY_PATH)"
   payer_key="$(rz_env_get "$OUT/compose.env" PAYER_KEYPAIR_PATH)"
   if [[ -z "$(rz_env_get "$OUT/compose.env" ROME_ZK_IMAGE)" && -z "$(rz_env_get "$OUT/compose.env" ROME_ZK_TAG)" ]]; then
-    die ImageTagNotSet "set ROME_ZK_TAG in $ENV_FILE to the tag of the source you checked out (published tags: https://github.com/rome-protocol/rome-zk-evm/tags), or ROME_ZK_IMAGE to an image you built, then run ./rollup init again"
+    die ImageTagNotSet "set ROME_ZK_TAG in $ENV_FILE to the tag of the source you checked out (published tags: https://github.com/rome-protocol/solana-zk-evm/tags), or ROME_ZK_IMAGE to an image you built, then run ./rollup init again"
   fi
   [[ -f "$seq_key" ]] || die SequencerKeyMissing "$seq_key does not exist (64 hex characters, readable by uid 999)"
   if [[ $# -eq 0 ]] || printf '%s\n' "$@" | grep -qxE 'batcher|prover'; then
@@ -511,7 +511,7 @@ cmd_up() {
 # tag; the image is built here the first time. The output is rendered/guest/<elf sha256>.elf and rendered/guest/vkey.json:
 # point ELF_DIR at the directory and VKEY_JSON at the file. The programVK needs the ZisK proving keys (ZISK_HOME) and about
 # 36 GB of memory; without them vkey.json is written without it and the command says so.
-GUEST_BUILD_EVM_TAG_DEFAULT=v0.2.1
+GUEST_BUILD_EVM_TAG_DEFAULT=v0.2.2
 GUEST_BUILD_GUEST_TAG_DEFAULT=v0.2.0
 cmd_guest_build() {
   local skip_vk=0 a

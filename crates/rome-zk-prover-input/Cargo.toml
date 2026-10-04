@@ -2,8 +2,8 @@
 name = "rome-zk-prover-input"
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0"
-repository = "https://github.com/rome-protocol/rome-zk-evm"
+license = "LicenseRef-Rome-Protocol"
+repository = "https://github.com/rome-protocol/solana-zk-evm"
 publish = false
 description = "Host-only input generator for the batch guest: reads a finalized batch's inbox chunk bodies + batch account (zk-inbox-client, FINALIZED), fetches each block + its execution witness from a reth verifier, and writes the guest's two bincode inputs."
 

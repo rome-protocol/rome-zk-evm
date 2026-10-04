@@ -29,8 +29,8 @@ stops. The deposit is refundable to the chain authority after one final root or 
 Set `SOLANA_RPC_URL` in `.env` to any Solana devnet RPC endpoint you use. A provider endpoint is more reliable
 than the public endpoint under load.
 
-This folder contains the node and prover configuration and the `rollup` commands; it does not yet include the
-command to build your chain's guest. The tests here run without the Solana programs.
+This folder contains the node and prover configuration and the `rollup` commands. The tests here run without
+the Solana programs.
 
 ## The commands
 
@@ -122,9 +122,12 @@ second time, and finishes the cursor and `rendered/pdas.env`. If it cannot read 
 `RootLookupFailed` and sends nothing.
 
 `register` sends no verification key: the program refuses one on a permissionless chain. Once you have a guest
-built for your chain's genesis, [open an issue on rome-protocol/rome-zk-evm](https://github.com/rome-protocol/rome-zk-evm/issues) with the chain id from
-`rendered/chain-id.env` and the guest ELF's sha256. Rome registers the matching verification key through the
-registry authority. Until then, your chain has no verification key on Solana.
+built for your chain's genesis, [open an issue on this repository](https://github.com/rome-protocol/solana-zk-evm/issues).
+Attach `rendered/genesis.json` and `rendered/guest/vkey.json`, and include your chain id from
+`rendered/chain-id.env` and the guest tag. `vkey.json` holds the ELF's sha256 (`elf_sha256`), the genesis
+file's sha256 (`genesis_sha256`) and the `programVK`. If your genesis declares a balance, include the vault
+that backs it. Rome answers on the issue. Until your key is registered, your chain has no verification key on
+Solana.
 
 `up` starts the services. `./rollup up sequencer` starts just that one. `check` tells you, by name, which service is
 missing or unhealthy, then compares the chain id, the heads, the batcher's progress, the inbox and the roots. Its items
@@ -249,14 +252,12 @@ the genesis root written at registration. Withdrawals need a final root, so no w
 Proofs are checked against your chain's verification key. Ask Rome to register it after registering your chain,
 as described above. `VKEY_JSON` must describe that registered key, and `ELF_DIR` must contain the matching guest
 program built for your chain's genesis. The batch guest source is published at
-[`rome-protocol/rome-zk-guest`](https://github.com/rome-protocol/rome-zk-guest), tag `v0.2.0`. From the root of
-this repository, run `git clone --branch v0.2.0 https://github.com/rome-protocol/rome-zk-guest.git .fork`,
-then `cd .fork && git submodule update --init --recursive`. The guest uses crates from this repository.
-Build it with `./rollup guest-build`. The command builds the guest-build image (the ZisK 1.2.0-alpha toolchain
-and the two public sources, `rome-zk-evm` at `ROME_ZK_TAG` and `rome-zk-guest` at `ROME_ZK_GUEST_TAG`, from
-`.env`; the defaults are the tags this guide names), builds the guest for `rendered/genesis.json` inside it and
-writes `rendered/guest/<sha256>.elf` and `rendered/guest/vkey.json`. Two machines get the same sha256 for the same
-genesis. It takes about 8 minutes the first time and about 6 minutes once the image exists. It refuses by name
+[`rome-protocol/rome-zk-guest`](https://github.com/rome-protocol/rome-zk-guest), tag `v0.2.0`, and uses crates
+from this repository. Build it with `./rollup guest-build`. The command builds an image with the ZisK
+1.2.0-alpha toolchain that clones `rome-zk-evm` at `ROME_ZK_TAG` and `rome-zk-guest` at `ROME_ZK_GUEST_TAG`
+from `.env`. Set `ROME_ZK_TAG=v0.2.2` as shown below; the guest tag defaults to `v0.2.0`. It builds the guest
+for `rendered/genesis.json` and writes `rendered/guest/<sha256>.elf` and `rendered/guest/vkey.json`. Two
+machines get the same sha256 for the same genesis. It takes about 8 minutes the first time and about 6 minutes once the image exists. It refuses by name
 a genesis whose chain id differs from `rendered/chain-id.env` (`ChainIdMismatch`) and a genesis with more than
 one funded account (`GenesisFundedAccountLimit`). The programVK in `vkey.json` is computed with the ZisK proving
 keys, which the command mounts read-only from `ZISK_HOME` (about 36 GB of memory, about 40 seconds); without
@@ -295,9 +296,10 @@ To keep the manifest somewhere else, set `PROVER_KEYS_MANIFEST` in `.env` to its
 
 ## The node image
 
-The compose file runs the published node image `ghcr.io/rome-protocol/rome-zk-evm:v0.2.1`. Public tags are
+Set `ROME_ZK_TAG=v0.2.2` in `.env` to run the published node image
+`ghcr.io/rome-protocol/rome-zk-evm:v0.2.2`. Public tags are
 pinned to the commit of the source export they were built from, so a tag names exactly one tree and never
-moves. Set `ROME_ZK_TAG=v0.2.1` in `.env`. `./rollup up` stops with `ImageTagNotSet` until you do. To run an
+moves. `./rollup up` stops with `ImageTagNotSet` until you set the tag. To run an
 image you built from this tree yourself, set `ROME_ZK_IMAGE` to its full reference instead.
 
 ## Exits

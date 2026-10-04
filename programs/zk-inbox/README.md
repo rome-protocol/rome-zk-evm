@@ -126,7 +126,7 @@ both halves on real BPF. Without this, an authority could re-`Seal` a shorter `l
 already committed a leaf hash over the longer body — Solana DA would then no longer reproduce that leaf,
 undetectable at the settlement program's `PostRoot`. This program's own error namespace (`ChunkError`,
 `Custom(100)`/`Custom(101)`) is numbered apart from the batch accumulator's (`BatchError`, `Custom(1)`
-through `Custom(13)`) so the two never alias each other in an error code a caller inspects. See
+through `Custom(14)`) so the two never alias each other in an error code a caller inspects. See
 [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md#threat-model) for this alongside the other attack
 classes this system closes or bounds.
 

@@ -1,8 +1,12 @@
 # Changelog
 
-This changelog describes the system as built on `main`, grouped by component. It does not follow a
-release-tag cadence yet — see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for what each component does
-and how they fit together.
+## v0.2.2
+
+- The licence is now Rome Protocol's licence. Releases up to v0.2.1 keep Apache-2.0.
+- `SECURITY.md` explains how to report a security problem.
+- The guides now name v0.2.2, the first release with `./rollup guest-build`.
+
+The sections below describe the code in this release. Deposits are built but not deployed on devnet yet.
 
 ## Bridge deposits
 

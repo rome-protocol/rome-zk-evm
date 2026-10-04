@@ -71,7 +71,7 @@ authorise a release for that chain — see `rome_zk_layouts::exit::exit_consumer
 - **`Deposit { chain_id, amount, l2_recipient }`** (tag 3) — a user locks `amount` base units of the vault's mint
   in the vault and queues a credit of the same value, in gwei, to a 20-byte address on the chain. The depositor
   signs and pays the record's rent and the queue's fee (to the fee recipient in the queue's active parameters);
-  the record's sender is the depositor's wallet. The record is written at `["deposit_record", settlement_program,
+  the record's sender is the depositor's wallet. The record is written at `["deposit", settlement_program,
   chain_id, index]` for the queue's current `count`, the queue's `count` and hash chain advance, and a record
   address that was pre-funded is adopted. Every account is bound by address: the vault config and the queue sit at
   their PDAs under the vault config's settlement program, and the chain's root, registry and exit config are that
@@ -80,11 +80,14 @@ authorise a release for that chain — see `rome_zk_layouts::exit::exit_consumer
   a deposit there could never be credited or refunded); an exit config naming another bridge; a zero recipient or
   the exit portal; a fee recipient other than the parameter; an amount below the minimum; a mint whose amount does
   not fit in gwei; a record address that already holds a record.
+  Accounts, in order: `depositor`, `depositor_token`, `vault_config`, `vault_token`, `deposit_queue`,
+  `deposit_record`, `exit_config`, `fee_recipient`, `token_program`, `system_program`, `root`, `registry`.
 - **`CloseDeposit { chain_id, index }`** (tag 8) — permissionless; refunds a record's rent to its sender once a
   finalized batch has credited the deposit and that batch is final. The cursor must be the chain's, at the inbox's
   address, owned by the inbox and at version 2: `deposit_next > index` means a batch has credited it, `index <
   deposit_final` means that batch is final. The rent always goes to the record's sender. The vault and the fee
   recipient are not touched.
+  Accounts, in order: `bridge_config`, `registry`, `cursor`, `deposit_record`, `rent_recipient`.
 
 **Parameter bounds, fixed in the program (an upgrade changes them):** an inclusion deadline of 1 to 24 hours;
 `1 <= max_per_block <= max_per_batch <= 256`; `min_amount >= 1` base unit; a fee of at most 0.01 SOL; and a fee
@@ -246,16 +249,16 @@ bit-exact across repeated runs on the same binary.)
 | Vault authority | `["vault_authority", settlement_program, chain_id]` | none (never holds data; a pure signer identity) |
 | Bridge config | `["bridge_config"]` | this program |
 | Deposit queue | `["deposit_queue", settlement_program, chain_id]` | this program |
+| Deposit record | `["deposit", settlement_program, chain_id, index]` | this program |
 | Exit consumer | `["exit_consumer", chain_id]` | none (the identity this program CPI-signs `ConsumeExit` as) |
 
 Keying the first three by `settlement_program` is what makes the real chain authority's vault address
 un-frontrunnable — see `InitVault`'s own bullet above. `exit_consumer` is unaffected: it identifies THIS
 program to `zk-settlement`, not a settlement program to this one.
 
-## What this program does not do
+## Devnet status and limits
 
-No deposit path yet (the queue and its parameters exist, the deposit instruction does not) — `InitVault`/`Fund` stand in for a real bridge-in until a later step (the first live
-release is from an operator-funded devnet SPL vault; deposits come later). No multi-asset vault (one
+Deposits are built (`Deposit` and `CloseDeposit`) but not deployed on devnet yet. No multi-asset vault (one
 mint per `(settlement_program, chain_id)` in v1; the `["vault", settlement_program, chain_id, mint]`
 seed already leaves room for more). No recipient-ATA auto-creation — `ReleaseExit` requires the
 recipient's ATA to already exist; creating it on the fly would need a CPI into the

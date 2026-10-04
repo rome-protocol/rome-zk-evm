@@ -30,8 +30,8 @@ exclude = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0"
-repository = "https://github.com/rome-protocol/rome-zk-evm"
+license = "LicenseRef-Rome-Protocol"
+repository = "https://github.com/rome-protocol/solana-zk-evm"
 
 # ---- the ONE Agave crate set ----------------------------------------------------------------------------
 # Public devnet (and the dev chain once redeployed) runs Agave 4.3.0; `solana-program-test`/`solana-client` no

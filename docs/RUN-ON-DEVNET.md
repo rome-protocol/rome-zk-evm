@@ -6,6 +6,8 @@ Registration is permissionless. Finalizing roots needs a prover and a verificati
 
 ## What is live on devnet
 
+Build from the release tag named in this guide. `main` can be ahead of the programs deployed on devnet.
+
 Read the [devnet trust model](TRUST-MODEL.md) for the powers and limits of Rome's keys and your chain authority.
 
 Rome verified the program addresses and settlement settings on chain. The program addresses are also in
@@ -26,7 +28,7 @@ Rome verified the program addresses and settlement settings on chain. The progra
 | Registry authority | `7CsvZgCML2C7i4f1Qd6Au3cxonB4c8uAWn3NmMmU9MDk` — Rome's key that registers verification keys |
 | Treasury | `2H8bMM3AUTU6RZap3zyFU5coNUazo6z5Xg7ighfCTJ3q` |
 | Program upgrade authority | `2H8bMM3AUTU6RZap3zyFU5coNUazo6z5Xg7ighfCTJ3q` — held by Rome |
-| Node image | `ghcr.io/rome-protocol/rome-zk-evm:v0.2.1` |
+| Node image | `ghcr.io/rome-protocol/rome-zk-evm:v0.2.2` |
 
 ## What you need
 
@@ -49,7 +51,7 @@ about 30 GB of GPU memory; a 24 GB card is not enough. You also need a guest bui
 ### 1. Clone and prepare the settings
 
 ```sh
-git clone --branch v0.2.1 https://github.com/rome-protocol/rome-zk-evm.git
+git clone --branch v0.2.2 https://github.com/rome-protocol/solana-zk-evm.git
 cd rome-zk-evm/deploy/rollup
 cp .env.example .env
 cp chain.toml.example chain.toml
@@ -79,7 +81,7 @@ Edit `.env`:
 - Set `SOLANA_RPC_URL` to your Solana devnet RPC endpoint.
 - Keep `PROGRAMS_JSON=programs.devnet.json`.
 - Set `PAYER_KEYPAIR_PATH` and `SEQUENCER_KEY_PATH` to your key files. These are paths, not key values.
-- Set `ROME_ZK_TAG=v0.2.1` to use the node image above.
+- Set `ROME_ZK_TAG=v0.2.2` to use the node image above.
 - Keep `RPC_BIND=127.0.0.1` for local access and leave `PROVER` unset for this first run.
 
 A new chain's genesis has no balances, and you do not need to set anything for that. A genesis that mints coins could
@@ -199,21 +201,14 @@ it does not mean the chain has finalized a root.
 
 ## Getting your verification key registered
 
-When you have a guest built for your chain's genesis, [open an issue on rome-protocol/rome-zk-evm](https://github.com/rome-protocol/rome-zk-evm/issues).
-Include your chain id from `rendered/chain-id.env` and the guest ELF's sha256. Rome registers the
-matching verification key through the registry authority listed above.
+After building the guest for your chain's genesis, [open an issue on this repository](https://github.com/rome-protocol/solana-zk-evm/issues).
+Attach `rendered/genesis.json` and `rendered/guest/vkey.json`, and include your chain id from
+`rendered/chain-id.env` and the guest tag. `vkey.json` holds the ELF's sha256 (`elf_sha256`), the genesis
+file's sha256 (`genesis_sha256`) and the `programVK`. If your genesis declares a balance, include the vault
+that backs it. Rome answers on the issue.
 
 The batch guest source is [rome-protocol/rome-zk-guest](https://github.com/rome-protocol/rome-zk-guest),
-tag `v0.2.0`. From the root of your `rome-zk-evm` checkout, clone it into `.fork/` and initialize
-its submodules:
-
-```sh
-git clone --branch v0.2.0 https://github.com/rome-protocol/rome-zk-guest.git .fork
-cd .fork && git submodule update --init --recursive
-```
-
-Git prints submodule checkout progress as needed. You do not need that checkout to build the guest: the
-next command does it for you.
+tag `v0.2.0`. `./rollup guest-build` clones the guest sources itself.
 
 Build the guest for your chain with one command:
 
@@ -269,9 +264,14 @@ Your node, RPC service and prover have their own running costs.
   proving keys (about 26 GB downloaded; measured on a CPU host).
   The final proof step needs about 30 GB of GPU memory; a 24 GB card is not enough.
 - Exits are off on a new chain: it has no exit portal configured and its exit cap is zero. The chain
-  authority can use the settlement client's `governance` example to send `propose-exit-config`.
-  After at least one 172,800-slot challenge window, anyone can send `activate-exit-config`. Exits are
-  paid from the shared zk-bridge program listed above. Its vault for your chain is keyed by the settlement
-  program and your chain id; the chain authority creates it with the bridge client's `vault` example
-  (`init-vault`) and funds it with `fund`.
+  authority can run `./rollup exit-config propose --exit-portal 0x4200000000000000000000000000000000000016
+  --bridge-program 27TbMDUyVynpFpqeKygpUMcDzWKHfW4k9aRN5yCysLEQ --exit-cap N
+  --activation-delay-slots 175000 --confirm`, where `N` is the most that may exit in one challenge window, in gwei
+  (1 gwei is 1 lamport of wrapped SOL). The program refuses an activation slot less than one 172,800-slot
+  challenge window away (`ActivationTooSoon`), and the delay counts from the slot the command reads before it
+  sends, so give a little more than the window. Once that slot has passed, run `./rollup exit-config activate
+  --confirm`, then `./rollup exit-config show`. The chain authority creates its vault with `./rollup vault init
+  --confirm`, wraps the SOL to lock with `spl-token wrap`, funds the vault with `./rollup vault fund --amount N
+  --confirm` (in lamports for wrapped SOL), and reads it with `./rollup vault show`. The vault is keyed by the
+  settlement program and your chain id.
 - The devnet programs are upgradeable. Rome holds their upgrade authority.

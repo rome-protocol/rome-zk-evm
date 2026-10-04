@@ -2,8 +2,8 @@
 name = "rome-zk-prover"
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0"
-repository = "https://github.com/rome-protocol/rome-zk-evm"
+license = "LicenseRef-Rome-Protocol"
+repository = "https://github.com/rome-protocol/solana-zk-evm"
 publish = false
 description = "prover orchestrator: config + vkey of record, the cargo-zisk subprocess Prover, and the ZisK calldata decoder"
 

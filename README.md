@@ -80,4 +80,9 @@ For the available services and their configuration, start with
 
 ## License
 
-Apache-2.0. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
+Copyright © 2024-2026 Coin Vesting Inc. d/b/a Rome Protocol. All rights reserved. You may use this software for
+personal, non-commercial purposes; commercial use needs Rome Protocol's written permission. See [`LICENSE`](LICENSE),
+and [`NOTICE`](NOTICE) for the parts under other licences. Releases up to v0.2.1 were published under Apache-2.0 and
+keep that licence.
+
+To report a security problem, see [`SECURITY.md`](SECURITY.md).

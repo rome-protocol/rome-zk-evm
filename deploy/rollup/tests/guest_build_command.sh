@@ -101,10 +101,10 @@ grep -q -- '--platform linux/amd64' "$WORK/run_calls" && grep -q -- '--platform 
 grep -q -- '--rm' "$WORK/run_calls" && pass "the container is removed after the run" || fail "--rm" "$(cat "$WORK/run_calls")"
 
 # ---- the image: tags and pins --------------------------------------------------------------------------------------------
-grep -q -- '-t rome-zk-guest-build:v0.2.1-v0.2.0 ' "$WORK/build_calls" && grep -q 'ROME_ZK_EVM_TAG=v0.2.1' "$WORK/build_calls" && grep -q 'ROME_ZK_GUEST_TAG=v0.2.0' "$WORK/build_calls" && pass "default tags: node v0.2.1, guest v0.2.0" || fail "default tags" "$(cat "$WORK/build_calls")"
+grep -q -- '-t rome-zk-guest-build:v0.2.2-v0.2.0 ' "$WORK/build_calls" && grep -q 'ROME_ZK_EVM_TAG=v0.2.2' "$WORK/build_calls" && grep -q 'ROME_ZK_GUEST_TAG=v0.2.0' "$WORK/build_calls" && pass "default tags: node v0.2.2, guest v0.2.0" || fail "default tags" "$(cat "$WORK/build_calls")"
 grep -q 'guest-build$' "$WORK/build_calls" && pass "the build context is deploy/rollup/guest-build" || fail "build context" "$(cat "$WORK/build_calls")"
 # The Dockerfile's own defaults are the same tags, so a by-hand build gives the same image.
-grep -q '^ARG ROME_ZK_EVM_TAG=v0.2.1$' "$GB_DIR/Dockerfile" && grep -q '^ARG ROME_ZK_GUEST_TAG=v0.2.0$' "$GB_DIR/Dockerfile" && pass "the Dockerfile defaults are the same tags" || fail "Dockerfile defaults" "$(grep '^ARG' "$GB_DIR/Dockerfile")"
+grep -q '^ARG ROME_ZK_EVM_TAG=v0.2.2$' "$GB_DIR/Dockerfile" && grep -q '^ARG ROME_ZK_GUEST_TAG=v0.2.0$' "$GB_DIR/Dockerfile" && pass "the Dockerfile defaults are the same tags" || fail "Dockerfile defaults" "$(grep '^ARG' "$GB_DIR/Dockerfile")"
 grep -q '^FROM ubuntu@sha256:[0-9a-f]\{64\}$' "$GB_DIR/Dockerfile" && pass "the base image is pinned by digest" || fail "base image pinned by digest" "$(grep '^FROM' "$GB_DIR/Dockerfile")"
 grep -q 'ZISK_VERSION=1.2.0-alpha' "$GB_DIR/Dockerfile" && grep -q 'sha256sum -c' "$GB_DIR/Dockerfile" && pass "ZisK 1.2.0-alpha, with its installer checked against a sha256" || fail "ZisK pin" "$(grep -n ZISK "$GB_DIR/Dockerfile")"
 DF="$GB_DIR/Dockerfile"
