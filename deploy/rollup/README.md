@@ -360,7 +360,7 @@ sudo chgrp 999 keys/payer.json keys/sequencer.key && chmod 640 keys/payer.json k
 then prints the new public key and a recovery phrase. Keep the phrase private. It also refuses to overwrite an existing
 file.
 
-Fund the payer with about 6 devnet SOL, for example from [Solana's faucet](https://faucet.solana.com).
+Fund the payer with about 7 devnet SOL, for example from [Solana's faucet](https://faucet.solana.com).
 The host also reads the payer key during `init` and `register`. `.gitignore` in this directory excludes `keys/`.
 
 - `SEQUENCER_KEY_PATH`: the sequencer's signing key, 64 hex characters in a file.

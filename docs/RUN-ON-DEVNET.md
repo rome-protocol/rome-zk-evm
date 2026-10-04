@@ -36,7 +36,7 @@ Rome verified the program addresses and settlement settings on chain. The progra
   curl, jq, openssl, the Solana CLI and Python 3.11 or newer. You do not need Rust or a compiler: every command that
   talks to Solana runs inside the node image.
 - A Solana devnet RPC endpoint. A provider endpoint is more reliable under load.
-- A Solana payer keypair in a JSON file, funded with about 6 SOL on devnet. It is also your chain authority.
+- A Solana payer keypair in a JSON file, funded with about 7 SOL on devnet. It is also your chain authority.
 - A sequencer signing key: 64 hex characters in a file. Both key files must be readable by container user 999.
 - An EVM address you control for the fee recipient (and, if you declare one, the backed balance).
 
@@ -52,7 +52,7 @@ about 30 GB of GPU memory; a 24 GB card is not enough. You also need a guest bui
 
 ```sh
 git clone --branch v0.2.2 https://github.com/rome-protocol/solana-zk-evm.git
-cd rome-zk-evm/deploy/rollup
+cd solana-zk-evm/deploy/rollup
 cp .env.example .env
 cp chain.toml.example chain.toml
 ```
@@ -72,7 +72,7 @@ sudo chgrp 999 keys/payer.json keys/sequencer.key && chmod 640 keys/payer.json k
 `solana-keygen` asks for an optional passphrase (press Enter for none) and prints the new public key and a recovery
 phrase. Keep the phrase private.
 
-Fund `keys/payer.json` with about 6 devnet SOL. You can use a devnet faucet such as
+Fund `keys/payer.json` with about 7 devnet SOL. You can use a devnet faucet such as
 [Solana's faucet](https://faucet.solana.com). The containers run as uid 999, and `init` and `register`
 also read the payer key on the host. `deploy/rollup/.gitignore` excludes `keys/` from Git.
 
@@ -241,7 +241,8 @@ It covers `PROVER=on`, `VKEY_JSON`, `ELF_DIR`, `ZISK_HOME` and the proving-key h
 
 ## Costs
 
-Budget about 6 SOL on the payer to start. The 5 SOL deposit is locked at registration. It is refundable
+Budget about 7 SOL on the payer to start. The 5 SOL deposit is locked at registration, and `./rollup check`
+wants at least 1 SOL left on the payer for the batcher's transactions and rent (`PAYER_FLOOR_LAMPORTS`). It is refundable
 to the chain authority once the chain has a final root or has posted ten roots. If the chain is reclaimed
 first, the deposit goes to the treasury. For your chain, the 0.001 SOL settlement fee is charged only
 when a proved root is posted, with 0 bps added. The payer also covers Solana transaction fees and
