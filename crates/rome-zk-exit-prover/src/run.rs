@@ -37,6 +37,29 @@ pub enum ExitGate {
     Idle(&'static str),
 }
 
+/// Remembers the last reason the prover logged for waiting, so the line is written when the reason
+/// changes (and once at start) rather than on every poll.
+#[derive(Debug, Default)]
+pub struct WaitingLog {
+    last: Option<String>,
+}
+
+impl WaitingLog {
+    /// True when this reason differs from the one last logged.
+    pub fn should_log(&mut self, reason: &str) -> bool {
+        if self.last.as_deref() == Some(reason) {
+            return false;
+        }
+        self.last = Some(reason.to_owned());
+        true
+    }
+
+    /// Exits are active again: the next wait is news and gets logged.
+    pub fn active(&mut self) {
+        self.last = None;
+    }
+}
+
 /// Reads the exit config and the exit cap and says whether the prover has anything to watch. A chain
 /// that has not switched exits on has no exit config account, a config without a portal, or a cap of
 /// zero; all three are the ordinary state before activation, not errors. A read that fails for any other

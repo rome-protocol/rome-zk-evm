@@ -16,6 +16,22 @@ A chain that has posted no root can be reclaimed 6,480,000 slots after registrat
 authority and registers verification keys. The node image is `ghcr.io/rome-protocol/rome-zk-evm:v0.3.0`.
 Read the [devnet trust model](TRUST-MODEL.md) for the powers and limits of Rome's keys and your chain authority.
 
+Rome ran this whole guide on devnet with a chain of its own, chain id `3313188585893834`, on one 96 GB RTX PRO
+6000 GPU. Each link opens the transaction in the Solana explorer, on devnet:
+
+| Step | Transaction |
+| --- | --- |
+| A proved root posted and final at once | [`64uUhxFu…MpDGFr`](https://explorer.solana.com/tx/64uUhxFu9C48mqYd9rZTcfbEwvTB7C4PmSFWkY6feB8qsqJZNMh3gM8ZKM6woSsyjRgntqujSsHuCB2TGYMpDGFr?cluster=devnet) |
+| Exit configuration activated (portal, bridge, cap) | [`2yyQrpv9…h1aSds`](https://explorer.solana.com/tx/2yyQrpv9CHQg7n5exxwERNYMEPDcm9gaPZje4jAv2Y2HHQ9DsPjbCDRbeLWoCZMwVv5UA6rohtJeQ1KZXRh1aSds?cluster=devnet) |
+| Deposit queue opened | [`4tpfJKTV…XJbb9F`](https://explorer.solana.com/tx/4tpfJKTVmhvUnhH822JficbJrDJZHknBJ9rwmux5R17HLj6WGniuRCXd9wQ8jSzjVa9uTDm4g3f369QQnkXJbb9F?cluster=devnet) |
+| 0.1 SOL deposited, credited on the chain in block 191 | [`5jKNqid8…VjYy67`](https://explorer.solana.com/tx/5jKNqid8XsqMedKBgm6dM5cSnszA7yFxa9xgm4MyGE45RcxthTkEZ9k1yGpzaPzqKGhN7CDz7iLAMMNFrfVjYy67?cluster=devnet) |
+| A 0.03 withdrawal proved on Solana (`ProveExit`) | [`3p8RhJJU…3rNDNz`](https://explorer.solana.com/tx/3p8RhJJUrvTxKrmtCJM1uZe2K6oLMw7cASoNQTm4RrMw6s1SrFeXWvws1D74UhnnRVPoevfhHmyNvkPGca3rNDNz?cluster=devnet) |
+| The same withdrawal paid out to its recipient | [`3dMpiQRX…nSVAz9`](https://explorer.solana.com/tx/3dMpiQRXgLBoNbBmKmz6qBVXfdX7EC9YwajQ35uGg1fzSb9HryH3awqrqx1fAEpsGfQPEDQrwUepgGtEkrnSVAz9?cluster=devnet) |
+| The 5 SOL registration deposit refunded | [`3YgyfLL2…zQk7wp`](https://explorer.solana.com/tx/3YgyfLL2bze6uefnUx3x76etTAu9WxQ3L2S8oNkKdSc3bBY7aHfWTZtrs1qDKxiJTMwA6i3LxRYTBC9n3RzQk7wp?cluster=devnet) |
+
+The withdrawal was started on the chain in block 192 and paid out on Solana about four minutes later, most of
+that the time for its batch to close and be proved. The proof used 39,592 compute units and the payout 56,764.
+
 ## What you need
 
 - An x86-64 Linux machine with bash 4 or newer, Git, Docker Engine 28 or newer with the Compose plugin,
@@ -249,7 +265,19 @@ It covers `PROVER=on`, `VKEY_JSON`, `ELF_DIR`, `ZISK_HOME` and the proving-key h
 
 ## Open deposits on your chain
 
-First post and prove a root with the registered ZisK 1.3.1-alpha key. A chain with no balances sends no transactions, and while `empty_block_interval_secs` under `[profile]` in `chain.toml` is 0, the default, its sequencer seals no blocks, so there is nothing to prove. Set it to a number of seconds such as `60`, then run `./rollup init` and `./rollup up`, or declare a backed balance at genesis. Once the first root is proved you can set it back to 0 if you like, running `./rollup init` and `./rollup up` again. Then create a wrapped SOL vault with
+First post and prove a root with the registered ZisK 1.3.1-alpha key. A chain with no balances
+sends no transactions. While `empty_block_interval_secs` under `[profile]` in `chain.toml` is 0,
+its default, the sequencer seals no blocks, so there is nothing to prove. Wait until the chain's
+verification key is registered and the prover is running: set `PROVER=on`, run `./rollup up` and confirm that the `service prover` and `verification key` items in `./rollup check` pass. Then set `empty_block_interval_secs` to a
+number of seconds such as `60` and run `./rollup init` and `./rollup up`. If you declared a backed
+balance at genesis, you can send a transaction to make the first block instead.
+
+Every sealed block goes into a batch, and the prover proves batches one at a time in order. By
+default a batch closes 60 seconds after it opens. At a 60-second empty-block interval, that makes
+about one batch a minute, or about 1,440 a day. If you turn empty blocks on while the key request is still waiting, those batches pile up: the prover has to prove each of them, in order, before it reaches the chain's newest blocks, and each proved root costs the payer about 0.003 SOL (see [Costs](#costs)). On devnet, one 96 GB RTX PRO 6000 GPU took
+about 35 minutes to clear 116 nearly empty batches, about 17 seconds per batch. After the first
+proved root, set the interval back to 0 unless you want empty blocks, then run `./rollup init` and
+`./rollup up` again. Then create a wrapped SOL vault with
 `./rollup vault init --confirm`. Your chain's exit configuration must name the bridge program in
 `programs.devnet.json`. Use `./rollup exit-config propose --bridge-program <address>
 --activation-delay-slots N --confirm`, with `N` a little more than one challenge window, then
@@ -321,8 +349,13 @@ when a proved root is posted, with 0 bps added. The payer also covers Solana tra
 rent on inbox batch and chunk accounts. With a prover, it pays rent for each posted root's pending
 account too. For a posted batch, inbox rent can be reclaimed only after a root covering it is final.
 Nothing in `deploy/rollup` closes posted inbox accounts. The prover closes pending accounts only when
-`close_pending_after_batches` is set. Plan for rent to keep accumulating, with or without a prover.
-Watch the payer balance on a busy chain.
+`close_pending_after_batches` is set; it is unset by default so that exits can still be proved against older final batches, which reads their pending accounts.
+Plan for rent to keep accumulating, with or without a prover. Rome has not yet decided how long old batch data must stay on Solana.
+On devnet, each proved root cost the payer about 0.003 SOL: about 0.002 SOL in pending-account rent,
+0.001 SOL in the settlement fee, and the transaction fee on top. The pending-account rent stays locked
+with the default settings. At one batch a minute, this is about 4.4 SOL a day, nearly 3 SOL of it locked as rent. Posting the batches to the inbox costs separately. With empty blocks off, a quiet chain seals no
+batches and pays no batch-posting or root-posting costs. Watch the payer balance on a busy chain.
+The exit prover uses its own payer; `./rollup check` requires at least 0.1 SOL on it by default.
 Your node, RPC service and prover have their own running costs.
 
 ## Known limits
@@ -332,11 +365,14 @@ Your node, RPC service and prover have their own running costs.
   nor skipped. If the batcher stops mid-batch, just start it again: it finishes the open batch under the same
   id. If it stops with `ResumeImpossible`, rerun it with the build and config that opened the batch.
 - The guest build needs Docker and, for the programVK, the ZisK proving keys and about 36 GB of memory on the machine that runs `./rollup guest-build`.
-- A new chain has no gas until it receives a deposit or starts with a backed balance. Opening deposits needs a proved root, a vault, a bridge exit configuration and a deposit queue. A chain with no balances seals no blocks while `empty_block_interval_secs` is 0, so set it above 0 to get blocks for that first proved root.
+- A new chain has no gas until it receives a deposit or starts with a backed balance. Opening deposits needs a proved root, a vault, a bridge exit configuration and a deposit queue. A chain with no balances seals no blocks while `empty_block_interval_secs` is 0. Set it above 0 for the first proved root only after the verification key is registered and the prover is running (`PROVER=on`; in `./rollup check`, the `service prover` and `verification key` items pass). Set it back to 0 after that root unless you want empty blocks.
 - The prover needs one NVIDIA GPU with more than 30 GB of memory. The final proof step needs about 30 GB
   of GPU memory; a 24 GB card is not enough. See [prover host setup](PROVER-HOST.md) for disk needs.
-- Withdrawals need a final root and a proved exit. The exit prover is a separate service and is not in the
-  node image or this deployment folder.
+- Withdrawals need a final root, an active exit configuration and a funded vault. The exit prover ships in
+  the node image. With `EXITS=on` in `.env`, `./rollup init` renders its config and `./rollup up` starts it.
+  It proves each withdrawal against a final root and releases the payout from the chain's vault. A payout
+  below the token-account minimum waits for `./rollup release-exit` if the recipient has no wrapped SOL
+  token account. See [Withdrawals](WITHDRAWALS.md) for the full flow.
 - Nothing in this release sends the inbox's `CloseBatch`, and `./rollup` has no `close-batch` command. The batch authority, which is your payer key, must build and sign it itself after the batch's root is final; the inbox client library's `close_batch_ix` builds the instruction. Until a close service ships, batch, chunk and deposit-record rent stays locked: `close-deposit` refuses a record (`DepositNotFinal`) until the crediting batch has been closed with `CloseBatch` by its batch authority.
 - Exits are off on a new chain: it has no exit portal configured and its exit cap is zero. The chain
   authority can run `./rollup exit-config propose --exit-portal 0x4200000000000000000000000000000000000016

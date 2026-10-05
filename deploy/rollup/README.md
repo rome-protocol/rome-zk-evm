@@ -380,7 +380,18 @@ balance, `--amount` is the lamport amount `init` printed. Anyone can fund a vaul
 ## Deposits
 
 Wait for the chain's first proved root and an active verification key built from the deposit-capable guest.
-A chain with no balances seals no blocks while `empty_block_interval_secs` (under `[profile]` in `chain.toml`) is 0, its default, so there is nothing to prove. Set it above 0, for example 60, until the first proved root, then set it back to 0 if you want, running `./rollup init` and `./rollup up` each time. Or declare a backed balance at genesis.
+A chain with no balances seals no blocks while `empty_block_interval_secs` (under `[profile]` in
+`chain.toml`) is 0, its default, so there is nothing to prove. Wait until the chain's verification
+key is registered and the prover is running (`PROVER=on`; in `./rollup check`, the `service prover` and `verification key` items pass). Then set the interval above 0, for example 60, and run `./rollup init`
+and `./rollup up`. If you declared a backed balance at genesis, you can send a transaction to
+make the first block instead.
+
+Every sealed block enters a batch, and the prover proves batches one at a time in order. With `batch_close_after_secs = 60`, as in `chain.toml.example`, a batch closes 60 seconds after its first block. A 60-second interval makes about one batch a
+minute, or about 1,440 a day. If you start empty blocks while the key request waits, every batch made in the meantime still has to be proved, in order, before the prover reaches the chain's newest blocks, and each one costs a root fee and pending-account rent. On devnet, 116 nearly empty batches took
+about 35 minutes to prove on one 96 GB RTX PRO 6000 GPU, about 17 seconds each. After the first
+proved root, set the interval back to 0 and run `./rollup init` and `./rollup up` again, unless
+you want empty blocks.
+
 Create the wrapped SOL vault with `./rollup vault init --confirm`. The exit configuration must name the bridge
 program from `programs.devnet.json`; [Exits](#exits) shows how to propose and activate that setting.
 The bridge refuses to create a queue before the chain has posted a root or before its vault exists.

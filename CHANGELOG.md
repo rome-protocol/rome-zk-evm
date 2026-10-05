@@ -1,7 +1,12 @@
 # Changelog
 
-## Unreleased
+## v0.3.0
 
+Chains on devnet now take deposits and pay out withdrawals, end to end. Proofs use ZisK 1.3.1-alpha, and the settlement program pins one recursion root per ZisK release. The exit prover ships in the node image with its own payer and pays withdrawals out on its own. The prover host setup was walked on a real GPU host. Node image `ghcr.io/rome-protocol/rome-zk-evm:v0.3.0`, batch guest `rome-zk-guest` `v0.3.0`.
+
+
+- `./rollup check` reports "exits active" as a warning, not a failure, when a proposal that sets a portal and a cap is already pending: `ExitsPendingActivation` names the activation slot and the current slot and points at `./rollup exit-config activate --confirm`. `ExitsNotActive` with the propose advice stays for a chain with nothing pending.
+- While exits are not active the exit prover writes its "waiting" line when the reason changes, and once at start, not on every poll (about 43,000 lines a day at the default 2 second interval).
 - `./rollup init` with `EXITS=on` stops when it cannot read the exit payer's public key, instead of going on without checking that it differs from the batcher's payer. `./rollup check`'s exit log scan also counts failed `eth_blockNumber` reads, which stop a scan before any `eth_getLogs`.
 - Withdrawals are packaged: the node image carries `rome-zk-exit-prover`, `EXITS=on` in `.env` makes `./rollup init` render its config and `./rollup up` start it, and `./rollup check` reports the exit prover, whether exits are active and any stuck withdrawal (`ExitProverUnreachable`, `ExitsNotActive`, `ExitsStuck`). The exit prover now waits without failing until the chain's exit configuration is active. A new guide, `docs/WITHDRAWALS.md`, covers what a user sends, what the operator runs, how long it takes and every refusal. A test starts the real exit prover binary against fake servers.
 - The exit prover has a payer key of its own. Anyone can start a withdrawal, even for one wei, and each proof costs its payer a fee and about 0.002 SOL of rent, so sharing the batcher's key would let users drain it. `EXIT_PAYER_KEYPAIR_PATH` in `.env` names the key; with `EXITS=on`, `./rollup init` refuses a missing one (`ExitPayerMissing`) or the batcher's own (`ExitPayerIsBatcherPayer`), and the compose file mounts only that key into the exit prover. `./rollup check` also reports the exit payer's balance (`ExitPayerBelowFloor`, floor `EXIT_PAYER_FLOOR_LAMPORTS`), failed log reads by the exit prover that keep growing (`ExitLogScanFailing`), and an exit prover that cannot read the chain's exit configuration from Solana (`ExitConfigUnreadableByExitProver`).
@@ -23,23 +28,14 @@
 - The exit prover pays proved withdrawals out itself: after its own `ProveExit` lands, and for any proved record it finds still open, it sends `ReleaseExit` with the accounts `release-exit` uses. `auto_release` (default `true`) turns it off. A payout below `release_create_account_min_lamports` (default 10,000,000) to a recipient with no wrapped SOL token account is not released automatically, so an attacker cannot make the exit payer buy token accounts for dust; it is counted in `rome_zk_exit_release_waiting`, its message hash is logged, and `release-exit` still pays it. New metrics: `rome_zk_exits_released_total` and `rome_zk_exit_release_waiting`. `docs/WITHDRAWALS.md` is updated to match.
 - An exit that waits for a manual release (a small payout to a recipient without a token account) is checked on a growing delay, from 30 seconds up to 30 minutes, with its accounts read together in one request, instead of four reads on every poll. `rome_zk_exit_gate_read_ok` is also 0 while the program accounts cannot be read.
 
-## v0.2.2
-
-- The licence is now Rome Protocol's licence. Releases up to v0.2.1 keep Apache-2.0.
-- `SECURITY.md` explains how to report a security problem.
-- The guides now name v0.2.2, the first release with `./rollup guest-build`.
-
-v0.2.2 was cut from an earlier commit than this one. The sections below describe `main`, which runs ahead of the
-programs deployed on devnet: deposits are built but not deployed there yet.
-
-## Prover host setup: key archives kept outside ZISK_HOME
+### Prover host setup: key archives kept outside ZISK_HOME
 
 - `setup-prover-host.sh` downloads the key archives to a directory beside `ZISK_HOME` by default. ziskup clears
   `ZISK_HOME` when it installs, so the old default (inside it) lost the checked archives before they were unpacked, and
   every real install stopped with `ZiskupFailed`. A `DOWNLOAD_DIR` inside `ZISK_HOME` is now refused by name
   (`DownloadDirInsideZiskHome`).
 
-## The prover host on ZisK 1.3.1
+### The prover host on ZisK 1.3.1
 
 - `deploy/rollup/prover/setup-prover-host.sh` sets up a GPU host for ZisK 1.3.1-alpha, now the default release. It
   downloads both key archives itself and unpacks the files it has checked. `ziskup` runs with `--nokey`, so it installs
@@ -57,7 +53,7 @@ programs deployed on devnet: deposits are built but not deployed there yet.
 - `setup-prover-host.sh` has the modes `--check-ziskup`, `--check-archives` and `--check-binaries`, which check one
   download against its pin and change nothing.
 
-## The operator tool and ZisK releases
+### The operator tool and ZisK releases
 
 - `vkey register` takes `--zisk <release>`, which is required. A release that is not open is refused before any file is
   read or the guest is rebuilt (`ZiskVersionNotOpen`, or `ZiskVersionUnknown` for a name the registry does not have). The
@@ -81,7 +77,7 @@ programs deployed on devnet: deposits are built but not deployed there yet.
 - `rome-zk-ops` now depends on the `veritas` crate for the release table, so `Cargo.lock` gained one line; it was
   regenerated on the build box.
 
-## Deposit commands and checks
+### Deposit commands and checks
 
 - `./rollup check` judges the vault against the genesis balance until the chain has a final batch (an exit needs one),
   so a short vault fails once a deposit queue exists; and "inbox batches" fails by name on an unreadable
@@ -100,7 +96,7 @@ programs deployed on devnet: deposits are built but not deployed there yet.
   vault, the exit configuration's bridge, the `[deposits]` section, the batch cursor's format, the oldest waiting
   deposit against the deadline and the queue backlog.
 
-## guest-build: a pin file per ZisK release
+### guest-build: a pin file per ZisK release
 
 - The guest-build image takes the ZisK release as a build argument (`ZISK_RELEASE`, 1.2.0-alpha until a build names
   another). Everything that belongs to a release moves out of the Dockerfile and `guest-build.sh` into one file,
@@ -117,7 +113,7 @@ programs deployed on devnet: deposits are built but not deployed there yet.
   directory of another release is refused with `ProvingKeyMismatch`, naming the release the keys are of; an image whose
   release has no pin file is refused with `ZiskReleaseUnknown`.
 
-## Veritas: one key and one pinned recursion root per ZisK release
+### Veritas: one key and one pinned recursion root per ZisK release
 
 - Veritas holds a release table (`veritas::versions`, `veritas::zisk_version(scheme)`): one row per ZisK release,
   numbered as the registry's `scheme` byte, with its wrapper key and the `rootCVadcopFinal` its proofs carry.
@@ -134,7 +130,7 @@ programs deployed on devnet: deposits are built but not deployed there yet.
   `Cargo.lock` gains one line: Veritas lists itself as a dev-dependency, to turn the 1.2.0 test key on in its own
   tests.
 
-## Settlement: `PostRootProved` picks the key from the entry's ZisK release
+### Settlement: `PostRootProved` picks the key from the entry's ZisK release
 
 - `PostRootProved` finds the entry with `registry::find_zisk` and takes the release from its `scheme`. An entry
   under a withdrawn release (scheme 1, every entry written before the release table) is refused as
@@ -175,7 +171,7 @@ programs deployed on devnet: deposits are built but not deployed there yet.
   the proof, so it has no single value. The test asserts it stays under the prover's 700,000 limit and compares
   the proof's public values with the independent record of the batch.
 
-## Registry: ZisK release numbers
+### Registry: ZisK release numbers
 
 - The registry entry's `scheme` byte now names a ZisK release: `1` is ZisK 1.2.0-alpha (every entry written so far)
   and `2` is ZisK 1.3.1-alpha. `rome-zk-layouts` exports `SCHEME_ZISK_1_2_0`, `SCHEME_ZISK_1_3_1` and the release list
@@ -185,7 +181,7 @@ programs deployed on devnet: deposits are built but not deployed there yet.
   refuses two active matches by name (`FindZiskError::TwoActiveMatches`). `PostRootProved` and the prover's
   anchor both use it.
 
-## Bridge deposits: a posted chain, replaceable proposals, vault settlement checks
+### Bridge deposits: a posted chain, replaceable proposals, vault settlement checks
 
 - `InitDepositQueue` and `Deposit` refuse a chain whose root has never taken a posted batch
   (`ChainNeverPosted`, new error 48). Reclaiming a chain needs that counter at 0 and it only grows, so a chain
@@ -201,7 +197,7 @@ programs deployed on devnet: deposits are built but not deployed there yet.
 - `init_vault_ix`, `release_exit_ix` and `deposit_ix` in `zk-bridge-client` add the bridge config account, so
   `rome-zk-ops` sends it without a change of its own.
 
-## Verification-key registration
+### Verification-key registration
 
 - `rome-zk-ops` gains `vkey register`, Rome's checked registration of a chain's verification key. It refuses by name
   unless the chain id (`ChainIdMismatch`), the genesis (`GenesisMismatch`), the rebuilt guest's sha256
@@ -233,7 +229,7 @@ programs deployed on devnet: deposits are built but not deployed there yet.
   prints the same summary lines from the same function, so `./rollup check`'s verification-key item and `vkey show`
   cannot disagree.
 
-## Inbox: FinalizeBatchV2 and header v3
+### Inbox: FinalizeBatchV2 and header v3
 
 - `InboxIx::FinalizeBatchV2 { step, deposit_to }` (discriminant 11) replaces `FinalizeBatch` (6), which is now
   refused by name. `zk-inbox-client` gains `finalize_batch_v2_ix`, which names the exit config, the cursor, the
@@ -257,7 +253,7 @@ programs deployed on devnet: deposits are built but not deployed there yet.
   is final or gone, and the order rule holds by induction. `abandon_batch_ix` names the account itself; its
   arguments are unchanged.
 
-## Inbox: deposit deadline measured at open time
+### Inbox: deposit deadline measured at open time
 
 - `FinalizeBatchV2` measures a deposit's age at the batch's committed open time (`open_unix_ts` in its header)
   instead of at the time of the finalizing call. Whether a batch can finalize is now settled when it opens, so a
@@ -276,6 +272,15 @@ programs deployed on devnet: deposits are built but not deployed there yet.
   check, and it uses the shorter of the active and a pending inclusion deadline. Its
   loaded-accounts requirement for a finalize now counts the bridge accounts a finalize with deposits loads: the
   cursor's version-2 layout, the exit config, the queue and two deposit records.
+
+## v0.2.2
+
+- The licence is now Rome Protocol's licence. Releases up to v0.2.1 keep Apache-2.0.
+- `SECURITY.md` explains how to report a security problem.
+- The guides now name v0.2.2, the first release with `./rollup guest-build`.
+
+v0.2.2 was cut from an earlier commit than this one. The sections below describe `main`, which runs ahead of the
+programs deployed on devnet: deposits are built but not deployed there yet.
 
 ## Bridge deposits
 

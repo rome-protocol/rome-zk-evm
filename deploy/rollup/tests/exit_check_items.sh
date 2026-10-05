@@ -69,6 +69,20 @@ expect "$out" '^FAIL: exit prover — ExitProverUnreachable: no answer from http
 printf 'rome_zk_exit_active 0\n' > "$S/exit_metrics"; out="$(run)"
 expect "$out" '^FAIL: exits active — ExitsNotActive: the chain.s exit config names no portal or its exit cap is 0, so the exit prover waits \(./rollup exit-config propose, then activate\)' "an inactive exit config fails by name, with the fix"
 
+# A proposal that sets a portal and a cap is waiting for its slot: a warning with the slot, not the propose advice.
+printf '  pending_mask                5 (portal, cap)\n  pending_exit_portal         0x4200000000000000000000000000000000000016\n  pending_exit_cap            500\n  activation_slot             5000 - not yet (current slot 1000, 4000 slots to go)\n' > "$S/exit_config"
+out="$(run)"
+expect "$out" '^WARN: exits active — ExitsPendingActivation: the pending exit config activates at slot 5000 \(the current slot is 1000\); run ./rollup exit-config activate --confirm once it has passed' "a pending portal and cap is a warning with the activation slot"
+grep -qE '^FAIL: exits active' <<<"$out" && fail "a pending activation is not a failure" "$out" || pass "a pending activation is not a failure"
+printf '  pending_mask                5 (portal, cap)\n  activation_slot             5000 - reached (current slot 5200); activatable now\n' > "$S/exit_config"
+out="$(run)"
+expect "$out" '^WARN: exits active — ExitsPendingActivation: the pending exit config activates at slot 5000 \(the current slot is 5200\); run ./rollup exit-config activate --confirm once it has passed' "a reached slot still points at activate"
+# A pending change that sets only the bond leaves exits off, so the propose advice stays.
+printf '  pending_mask                8 (bond)\n  activation_slot             5000 - not yet (current slot 1000, 4000 slots to go)\n' > "$S/exit_config"
+out="$(run)"
+expect "$out" '^FAIL: exits active — ExitsNotActive: .*\(./rollup exit-config propose, then activate\)' "a pending change that sets no portal and cap keeps the propose advice"
+rm -f "$S/exit_config"
+
 printf 'rome_zk_exit_active 1\nrome_zk_exit_stuck{reason="proof_too_large"} 1\nrome_zk_exit_stuck{reason="max_send_attempts"} 2\nrome_zk_exit_stuck{reason="exceeds_window_cap"} 0\n' > "$S/exit_metrics"
 out="$(run)"; code=$?
 expect "$out" '^FAIL: stuck exits — ExitsStuck: 3 exits are parked as stuck \(max_send_attempts=2 proof_too_large=1\); see ./rollup logs exit-prover' "stuck exits fail by name with the counts per reason"

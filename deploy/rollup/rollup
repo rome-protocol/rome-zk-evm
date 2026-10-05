@@ -1174,7 +1174,19 @@ cmd_check() {
       else
         if [[ "$eg" == 0 ]]; then fail "exits active" "ExitConfigUnreadableByExitProver: the exit prover could not read the chain's exit config or root from Solana, so it cannot tell whether exits are active; check that SOLANA_RPC_URL in $ENV_FILE answers from this host (curl it), then ./rollup logs exit-prover"
         elif [[ "$ea" == 1 ]]; then pass "exits active" "the chain's exit config names a portal and a cap, the exit prover is scanning"
-        else fail "exits active" "ExitsNotActive: the chain's exit config names no portal or its exit cap is 0, so the exit prover waits (./rollup exit-config propose, then activate)"; fi
+        else
+          # Not active yet: a proposal that is already pending, with a portal and a cap, only waits for its slot.
+          local pec="" pslot="" pnow=""
+          if OPS_IMAGE="$(node_image)"; then
+            ops_reset
+            pec="$(ops exit-config show --settlement "$SETTLEMENT_ID" --chain-id "$chain_id" 2>/dev/null)" || pec=""
+          fi
+          pslot="$(sed -n 's/^ *activation_slot  *\([0-9][0-9]*\) - .*/\1/p' <<<"$pec" | head -1)"
+          pnow="$(sed -n 's/.*current slot \([0-9][0-9]*\).*/\1/p' <<<"$pec" | head -1)"
+          if [[ -n "$pslot" && -n "$pnow" ]] && grep -qE '^ *pending_mask +[0-9]+ \(.*portal.*cap' <<<"$pec"; then
+            warn "exits active" "ExitsPendingActivation: the pending exit config activates at slot $pslot (the current slot is $pnow); run ./rollup exit-config activate --confirm once it has passed"
+          else fail "exits active" "ExitsNotActive: the chain's exit config names no portal or its exit cap is 0, so the exit prover waits (./rollup exit-config propose, then activate)"; fi
+        fi
         if [[ -z "$es" ]]; then pass "stuck exits" "none"
         else
           local n=0 kv; for kv in $es; do n=$(( n + ${kv#*=} )); done

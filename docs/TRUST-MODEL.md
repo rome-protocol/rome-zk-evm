@@ -150,6 +150,22 @@ recorded depositor. It does not return the tokens locked in the vault.
 Withdrawals need a final root and an activated exit configuration with a portal, a nonzero cap and
 a bridge program. Anyone can prove an exit from a final root. Only the bridge program named in the
 chain's exit configuration can consume its exit record for release.
+The settlement program's `ProveExit` check binds the withdrawal to the configured portal and a
+final root. It checks the storage proof, prevents the same withdrawal from being proved twice and
+enforces the chain's exit cap in each challenge window. An exit that does not fit in the current
+window must wait for another window; one larger than the whole cap needs the chain authority to
+raise it. The chain authority can change the portal, bridge and cap after the configuration delay,
+so users should check the active configuration before withdrawing.
+A proof against an older final batch reads that batch's pending account, so that account must still exist; the newest final root is read from the chain's root account. The prover leaves pending accounts open by default so withdrawals can still be proved against older final roots.
+
+With `EXITS=on`, `./rollup init` renders the exit prover's config and `./rollup up` starts it from
+the node image. It proves withdrawals against final roots and then sends their release. It signs
+with `EXIT_PAYER_KEYPAIR_PATH` (`./keys/exit-payer.json` by default), never the batcher's payer.
+Anyone can start a withdrawal, and each proof costs this payer a fee and record rent. `init`
+refuses a missing exit key (`ExitPayerMissing`) or the batcher's key (`ExitPayerIsBatcherPayer`).
+The operator can delay withdrawals by not posting and proving roots, not funding the vault or exit
+payer, or stopping the exit prover. Anyone can submit a valid exit proof and send a release, so the
+exit prover is not the only way to complete a withdrawal.
 
 Rome's shared zk-bridge program is deployed on devnet at
 `27TbMDUyVynpFpqeKygpUMcDzWKHfW4k9aRN5yCysLEQ`. Each chain has its own vault, keyed by its
@@ -158,7 +174,11 @@ or call ReleaseExit for a valid exit. A release checks the proved exit record fr
 settlement program and the configured bridge. It checks the refund address and the recipient's
 associated token account.
 It consumes the record and transfers the tokens in one transaction, so the same exit cannot pay twice.
-The recipient's token account must exist; the bridge does not create it.
+The recipient is read from the proved record, and the bridge checks the associated token account
+derived from that recipient. Under Rome's shared zk-bridge, the exit prover, operator and person
+sending the release cannot redirect the payout. The recipient's token account must exist when the bridge
+runs; the release transaction can create it first. The exit prover leaves a payout below its
+token-account minimum waiting when the recipient has no wrapped SOL token account. Anyone can send the release for it; the operator can use `./rollup release-exit`. See [Withdrawals](WITHDRAWALS.md) for the full flow.
 Without a program upgrade, Rome's keys cannot create a vault for a chain whose authority they do not
 hold, change its mint, choose where its payouts go or withdraw from it without a proved exit.
 

@@ -87,7 +87,7 @@ to leave every payout to this command. Both settings are in `exit-prover.toml`, 
 | --- | --- | --- |
 | service exit-prover | the container is running | `ServiceMissing` |
 | exit prover | its metrics answer | `ExitProverUnreachable` |
-| exits active | the chain's exit configuration names a portal and a cap, and the exit prover could read it and the root from Solana | `ExitsNotActive`, `ExitConfigUnreadableByExitProver` |
+| exits active | the chain's exit configuration names a portal and a cap, and the exit prover could read it and the root from Solana; a change that is proposed but not yet active is a warning that names its activation slot | `ExitsNotActive`, `ExitConfigUnreadableByExitProver`, `ExitsPendingActivation` (warning) |
 | stuck exits | no withdrawal is parked as stuck | `ExitsStuck` |
 | exit payer balance | the exit prover's own payer holds at least `EXIT_PAYER_FLOOR_LAMPORTS` (0.1 SOL by default) | `ExitPayerBelowFloor`, `ExitPayerBalanceUnreadable` |
 | exit log scan | the exit prover's failed reads of the verifier node (`eth_blockNumber`, `eth_getLogs`) did not grow since the previous check | `ExitLogScanFailing` |

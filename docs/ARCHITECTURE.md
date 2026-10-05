@@ -108,9 +108,9 @@ Each linked directory has a README with the component's configuration and tests.
 | Batch guest | `rome-protocol/rome-zk-guest`, `crates/clients/rome/guest` (`guest-rome`) | Checks that blocks match inbox data and execute correctly, then commits the batch's public values. The chain's genesis and fee recipient are compiled into the guest. | Executed by ZisK during proving |
 | Settlement watcher | [`crates/rome-zk-settlement-watcher`](../crates/rome-zk-settlement-watcher) | Reads inbox and settlement transaction history into Postgres and derives batch and exit status. Never writes to Solana. | Chain operator or an independent observer |
 | Operator CLI | [`crates/rome-zk-ops`](../crates/rome-zk-ops) | One binary for operator actions on a chain's Solana accounts: chain id, chain status (`chain-status`), the account addresses (`pdas`), registration, deposit refund, exit configuration, the one-time migration, creating the batch cursor (`init-cursor`), the bridge vault (`vault init`, `vault fund`, `vault show`), the deposit queue (`deposit-queue init`, `propose`, `activate`, `show`), `deposit`, `close-deposit`, the bridge config (`bridge-config init`, `show`) and `release-exit`. A dry run unless `--confirm`; every transaction goes out as a V1 transaction through `rome-zk-solana-sender`. The registry-authority commands (global configuration, verifier registry) are not in this binary; they stay in the `governance` example of `zk-settlement-client`. The root `Dockerfile` builds it into the node image; published images include it from `v0.2.1`. | Chain operator |
-| Rollup runner | [`deploy/rollup`](../deploy/rollup) | `./rollup init`, `register`, `up` and `check`: renders a chain's configuration and genesis, registers the chain, and runs the node image, reth-verifier and, with `PROVER=on`, the prover under Docker Compose. | Chain operator |
+| Rollup runner | [`deploy/rollup`](../deploy/rollup) | `./rollup init`, `register`, `up` and `check`: renders a chain's configuration and genesis, registers the chain, and runs the node image, reth-verifier and, with `PROVER=on`, the prover under Docker Compose. With `EXITS=on`, it renders the exit prover's config and starts that service from the node image. | Chain operator |
 | Exit portal | [`contracts/exit-portal`](../contracts/exit-portal) | `RomeExitPortal` records a native-asset withdrawal message and emits `ExitInitiated`. | Contract deployed on the rollup |
-| Exit prover | [`crates/rome-zk-exit-prover`](../crates/rome-zk-exit-prover) | Watches portal events, obtains and locally checks an Ethereum storage proof, and sends `ProveExit` against a final batch root. | Chain operator |
+| Exit prover | [`crates/rome-zk-exit-prover`](../crates/rome-zk-exit-prover) | Watches portal events, obtains and locally checks an Ethereum storage proof, sends `ProveExit` against a final batch root, then releases the payout from the chain's vault. | Chain operator |
 | zk-inbox | [`programs/zk-inbox`](../programs/zk-inbox) | Stores transaction chunks and reduces each batch and its ordered deposit range to a Merkle commitment. | Solana validators execute the deployed program |
 | zk-settlement | [`programs/zk-settlement`](../programs/zk-settlement) | Registers chains, accepts roots, tracks finality, serves `RootView`, verifies exit inclusion and manages fees and governance. | Solana validators execute the deployed program |
 | Proof verifier (Veritas) | [`programs/veritas`](../programs/veritas) | The PLONK verifier checks ZisK proofs over BN254 with a release-specific verifying key and pinned recursion root. zk-settlement links this code and runs it inside `PostRootProved`; the prover runs the same check off-chain before it posts. | Solana validators inside zk-settlement, using `alt_bn128` syscalls; the prover off-chain |
@@ -153,12 +153,14 @@ keys, fees or registry-controlled configuration.
 The portable [`deploy/rollup/`](../deploy/rollup/) directory is available, with setup and commands in its
 [operator runbook](../deploy/rollup/README.md). The shared programs are live on Solana devnet, at the
 addresses in [`deploy/rollup/programs.devnet.json`](../deploy/rollup/programs.devnet.json), and the node
-image is published as `ghcr.io/rome-protocol/rome-zk-evm`. `./rollup guest-build` builds the guest for your chain, and no prover image is published. [Run on Solana devnet](RUN-ON-DEVNET.md) walks through
+image is published as `ghcr.io/rome-protocol/rome-zk-evm:v0.3.0`. `./rollup guest-build` builds the `rome-zk-guest` `v0.3.0` guest for your chain with ZisK 1.3.1-alpha, and no prover image is published. [Run on Solana devnet](RUN-ON-DEVNET.md) walks through
 starting a chain against those programs.
 
-The node image contains `rome-zk-sequencer`, `rome-zk-batcher` and `rome-zk-derive`, and, from `v0.2.1`,
-`rome-zk-ops`. The prover, the exit prover and the settlement watcher are not in it.
+The node image contains `rome-zk-sequencer`, `rome-zk-batcher`, `rome-zk-derive`, `rome-zk-ops`
+and `rome-zk-exit-prover`. The prover and the settlement watcher are not in it.
 `deploy/rollup` builds the prover image from this repository the first time the prover starts.
+With `EXITS=on`, `./rollup init` renders the exit prover's config and `./rollup up` starts it with
+its own payer key. [Withdrawals](WITHDRAWALS.md) covers the user and operator flow.
 
 The component READMEs document each service's configuration and commands. The public release is
 intended to provide software and instructions for running a chain; Rome's deployment and monitoring
@@ -183,6 +185,11 @@ configuration stays private.
    most every N seconds instead. Once a block has actually opened, every later sub-block in it seals
    regardless of content — the idle gate only ever decides whether a NEW block opens, never whether an
    already-open one finishes.
+   For a new chain with no backed balance, turn on empty blocks only after its verification key is
+   registered and the prover is running. Every sealed block enters a batch, and the prover proves
+   batches one at a time in order. A 60-second empty-block interval and the default 60-second batch
+   close produce about 1,440 batches a day. Turn the interval back to 0 after the first proved root
+   unless you want the chain to keep sealing empty blocks.
 4. **Block sealing (every 1 s, every 20th sub-block).** The execution engine computes the block's state
    root once, over the accumulated sub-blocks, under a block environment (timestamp, gas limit,
    `prevRandao`, coinbase, base fee) that was committed *before* the first sub-block of the block executed
@@ -319,6 +326,9 @@ The deposited tokens stay in the vault as the backing for the L2 credit.
    re-deriving one. The window index a `ProveExit` call computed on-chain (`Clock::slot`-derived, not an
    instruction argument) is not reconstructed here — the watcher reads only transaction history, never
    Solana account state, the same documented bound the inbox accumulator's own `root`/`acc` columns state.
+
+With `EXITS=on`, the exit prover sends the release itself after proving a withdrawal, and it also releases any proved withdrawal it finds still open (`auto_release`, on by default). If the recipient has no wrapped SOL token account and the payout is below the exit prover's token-account minimum, the payout waits until someone sends the release, for example with `./rollup release-exit`, or until the recipient has a token account. The release
+reads the recipient from the proved record, so whoever sends it cannot redirect the payout.
 
 ## Persistence and restart recovery
 

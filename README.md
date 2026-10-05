@@ -8,6 +8,12 @@ the PLONK verifier, and the bridge vault), plus off-chain sequencer, batcher, de
 and settlement services. Most Rust crates share one Cargo workspace; the prover, its input tools and
 the measurement guest have separate workspaces.
 
+On Solana devnet, anyone can register a chain and request its verification key through the
+[issue form](https://github.com/rome-protocol/solana-zk-evm/issues/new?template=vkey-request.yml).
+Once Rome registers the key, the operator can run the prover and post proved roots, which are final on Solana. Deposits and withdrawals work end to end on devnet too: SOL deposited on Solana is credited on the chain, and a withdrawal started on the chain is proved and paid out on Solana by the exit prover, without anyone stepping in. The node image is
+`ghcr.io/rome-protocol/rome-zk-evm:v0.3.0`; the guest is `rome-zk-guest` `v0.3.0`, using ZisK
+`1.3.1-alpha`. The prover leaves old pending accounts open by default, and nothing in this release closes inbox batches, and Rome has not yet decided how long old batch data must stay on Solana. The devnet programs can be upgraded without notice.
+
 - **Architecture:** [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — components, the transaction data flow, the
   trust model, and the threat model. Start with its
   [Components at a glance](docs/ARCHITECTURE.md#components-at-a-glance): a data-flow diagram and a compact
@@ -75,6 +81,7 @@ The portable [`deploy/rollup/`](deploy/rollup/) directory is available, with set
 [Devnet trust model](docs/TRUST-MODEL.md) explains who controls the shared programs and what they enforce.
 [Monitoring one rollup](docs/MONITORING.md) covers health checks and example alerts for that chain.
 [Prover host](docs/PROVER-HOST.md) sets up the GPU machine that proves your chain's batches.
+[Withdrawals](docs/WITHDRAWALS.md) explains how the exit prover pays users from the chain's vault.
 For the available services and their configuration, start with
 [Deployment](docs/ARCHITECTURE.md#deployment) and the [component READMEs](docs/ARCHITECTURE.md#components).
 

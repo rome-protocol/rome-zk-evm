@@ -38,7 +38,7 @@ use rome_zk_exit_prover::metrics::Metrics;
 use rome_zk_exit_prover::release::{ReleaseContext, Releaser};
 use rome_zk_exit_prover::rpc::HttpVerifierRpc;
 use rome_zk_exit_prover::run::{
-    exit_gate_with_tuning, poll_once, resolve_tuning, ExitGate, TuningError,
+    exit_gate_with_tuning, poll_once, resolve_tuning, ExitGate, TuningError, WaitingLog,
 };
 use rome_zk_exit_prover::settlement::RpcSettlementReader;
 
@@ -103,6 +103,7 @@ fn main() -> anyhow::Result<()> {
     let mut releaser = Releaser::new(cfg.auto_release);
 
     let mut logged_limit = None;
+    let mut waiting_log = WaitingLog::default();
     loop {
         // What a ProveExit loads depends on the live program size, so the loaded-accounts limit is worked out
         // here on every poll. A configured value that is too small stops the process; accounts that cannot be
@@ -130,13 +131,18 @@ fn main() -> anyhow::Result<()> {
             exit_gate_with_tuning(&settlement, tuning.as_ref(), &metrics),
             tuning,
         ) {
-            (ExitGate::Active { portal_hex }, Some(tuning)) => (portal_hex, tuning),
+            (ExitGate::Active { portal_hex }, Some(tuning)) => {
+                waiting_log.active();
+                (portal_hex, tuning)
+            }
             (gate, _) => {
                 let reason = match gate {
                     ExitGate::Idle(reason) => reason,
                     ExitGate::Active { .. } => "the send settings could not be worked out",
                 };
-                tracing::info!(reason, "exits are not active, waiting");
+                if waiting_log.should_log(reason) {
+                    tracing::info!(reason, "exits are not active, waiting");
+                }
                 metrics.record_follower(&follower);
                 if args.once {
                     break;

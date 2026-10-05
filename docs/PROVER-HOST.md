@@ -14,16 +14,15 @@ You do not need a prover host to run the node itself, only to settle roots. See
 | Need | Value |
 | --- | --- |
 | Operating system | Ubuntu 22.04 or later, x86_64 |
-| GPU | One NVIDIA GPU with about 32.2 GB of memory or more. This is the script's default check. The final proof step asks for about 30 GB, so a 24 GB card is not enough. |
+| GPU | The setup script accepts one NVIDIA GPU with about 32.2 GB of memory or more. The final proof step asks for about 30 GB, so a 24 GB card is not enough. While the prover proved a nearly empty batch on a 96 GB card, about 95 GB of the card's memory showed as in use. That is how much the prover held, not the least a batch needs. Smaller cards have not been tested with this release. |
 | NVIDIA driver | 525.60.13 or later, which is ZisK's own minimum. The prover image is built on CUDA 12.9, so a recent driver is the safer choice. |
 | Disk | By default, about 27 GB is downloaded below the install directory (proving key 5.1 GB, PLONK key 21.9 GB). The archives are deleted after unpacking. After the setup's `check-setup` step, the proving key directory measured 21 GiB and the PLONK key directory 26 GiB (`du -sh`), 47 GiB (about 50 GB) together. The first proof adds its cache on top; a CPU host measured 102.1 GB in total after one. Plan for 125 GB free at the install directory. |
-| Memory | The proving library reports 24.7 GB for its main working buffer and 5.6 GB for the recursion steps, for a batch of about 3.0 million steps. The peak memory of the whole process was not recorded on ZisK 1.3.1-alpha. On ZisK 1.2.0-alpha the peaks were 37.5 GB for the STARK step and 88.4 GB for the PLONK step, for a batch of 10 empty blocks. Use a host with at least 128 GB of RAM until a GPU host has been measured. |
+| Memory | The proving library reports 24.7 GB for its main working buffer and 5.6 GB for the recursion steps, for a batch of about 3.0 million steps. The peak memory of the whole process was not recorded on ZisK 1.3.1-alpha. On ZisK 1.2.0-alpha the peaks were 37.5 GB for the STARK step and 88.4 GB for the PLONK step, for a batch of 10 empty blocks. The GPU host that proved the devnet batches had 176 GB of RAM; its peak use was not recorded. Plan for at least 128 GB. |
 
 ## What was measured
 
-Every figure below was measured on a CPU-only host with 32 vCPUs (Intel Xeon, 2.8 GHz) and 135 GB of RAM. None of it
-comes from a GPU host. A GPU host generates some files of its own, and its disk use and proof times are not measured
-yet.
+Every figure in the table below was measured on a CPU-only host with 32 vCPUs (Intel Xeon, 2.8 GHz) and 135 GB of RAM.
+A GPU host also writes files of its own when it first proves; how much disk they take has not been measured.
 
 | What | ZisK 1.3.1-alpha, CPU host |
 | --- | --- |
@@ -37,9 +36,13 @@ yet.
 
 The two `check-setup` rows were measured with an earlier command, not the one the setup runs now. With the setup's command, a host measured 21 GiB for the proving key directory and 26 GiB for the PLONK key directory (`du -sh`) after the step; the time it takes has not been measured.
 
+On a host with one 96 GB RTX PRO 6000 (Blackwell) GPU, 48 CPU cores and 176 GB of RAM, a proof of a nearly empty
+batch took about 17 seconds, including the PLONK wrap. About 95 GB of the card's memory showed as in use while the prover ran.
+Larger batches have not been timed on a GPU.
+
 The first CPU proof included about 2.5 minutes generating more constant trees and about 45 seconds loading the
-recursive setup. A later proof on the same host skips that one-time generation. A GPU proof of the same batch has
-not been timed here. `cargo-zisk prove --plonk -y` checks the wrapped proof with `snarkjs` after the wrap and
+recursive setup. A later proof on the same host skips that one-time generation. The same CPU batch was not timed on
+the GPU host. `cargo-zisk prove --plonk -y` checks the wrapped proof with `snarkjs` after the wrap and
 fails without it ("Failed to execute snarkjs"); the prover image carries it.
 
 ## Run the script
