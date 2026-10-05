@@ -11398,13 +11398,16 @@ dependencies = [
 name = "rome-zk-ops"
 version = "0.1.0"
 dependencies = [
+ "alloy-genesis",
  "base64 0.22.1",
  "clap",
  "hex",
  "reqwest 0.12.28",
+ "reth-chainspec",
  "rome-zk-layouts",
  "rome-zk-solana-sender",
  "serde_json",
+ "sha2 0.10.9",
  "solana-client",
  "solana-commitment-config",
  "solana-hash",
@@ -11413,6 +11416,7 @@ dependencies = [
  "solana-signer",
  "thiserror 2.0.21",
  "tokio",
+ "veritas",
  "wincode",
  "zk-bridge",
  "zk-bridge-client",
@@ -17180,6 +17184,7 @@ dependencies = [
  "solana-program-test",
  "solana-sdk",
  "tokio",
+ "veritas",
 ]
 
 [[package]]

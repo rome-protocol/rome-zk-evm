@@ -134,10 +134,10 @@ pub fn required_loaded_accounts_data_size(
     let loaded_account_base_bytes = rome_zk_solana_sender::LOADED_ACCOUNT_BASE_BYTES as usize;
     let placeholder = Pubkey::new_from_array([1u8; 32]);
 
-    // Sized for the version `OpenBatch` writes (v2); the account is never larger than this until the
+    // Sized for the version `OpenBatch` writes (v3); the account is never larger than this until the
     // inbox writes the next header version.
     let batch_len = rome_zk_layouts::batch::account_len_for(
-        rome_zk_layouts::batch::VERSION,
+        rome_zk_layouts::batch::VERSION_V3,
         max_frames_per_batch,
     )
     .expect("the version OpenBatch writes is a known batch version");
@@ -176,21 +176,39 @@ pub fn required_loaded_accounts_data_size(
     let open_grow_requirement =
         loaded_account_base_bytes * unique_loaded_accounts(&open_grow_ixs, &placeholder) + base;
 
-    let finalize_ixs = [zk_inbox_client::finalize_batch_ix(
+    // The widest finalize: a chain with a deposit queue, taking one deposit, so the instruction names the exit
+    // config, the queue and two deposit records, and the program loads the cursor in its 69-byte layout. The
+    // bridge program only decides which addresses the queue and records have; it is not itself loaded.
+    let bridge_placeholder = Pubkey::new_from_array([2u8; 32]);
+    let finalize_ixs = [zk_inbox_client::finalize_batch_v2_ix(
         inbox_program_id,
         &placeholder,
         &placeholder,
         200_101,
+        1,
         0,
-        0,
+        1,
+        Some(&bridge_placeholder),
     )];
     // `FinalizeBatch` now names its own authority signer — here the same `placeholder` this
     // function already uses as the real transaction's fee payer, so it contributes no new unique account
     // beyond what `unique_loaded_accounts`'s own fee-payer insertion below already counts (that is still the
     // reason the fee payer must be force-included in the first place: `FinalizeBatch`'s account list alone,
     // before it named an authority signer, named nothing that resolved to it).
-    let finalize_requirement =
-        loaded_account_base_bytes * unique_loaded_accounts(&finalize_ixs, &placeholder) + base;
+    // A completing finalize also reads the previous batch, which can still be there at full size, so it counts
+    // a second batch account: the finalize above is built for batch 1, whose previous batch is a real account
+    // of its own, and `batch_len` is that account's worst-case data.
+    // On top of the two batch accounts, the data the bridge side adds: the cursor (version 2), the exit config, the
+    // queue and the two records.
+    let deposit_accounts_len = rome_zk_layouts::cursor::LEN_V2
+        + rome_zk_layouts::exit::exit_config::LEN
+        + rome_zk_layouts::deposit_queue::deposit_queue::LEN
+        + 2 * rome_zk_layouts::deposit_queue::deposit_record::LEN;
+    let finalize_requirement = loaded_account_base_bytes
+        * unique_loaded_accounts(&finalize_ixs, &placeholder)
+        + base
+        + batch_len
+        + deposit_accounts_len;
 
     chunk_requirement
         .max(open_grow_requirement)
@@ -438,8 +456,11 @@ mod tests {
     /// makes this test fail. It pins the 290-frame requirement to its exact real value (computed from the real
     /// `plan_chunk`/`open_and_grow_batch_ixs`/`finalize_batch_ix` instruction lists, Tiber's own measured
     /// program/ProgramData sizes) and checks it against the live-verified minimum from the devnet probe (142,966 B).
-    /// The batch account header grew 202 -> 210 B (`open_unix_ts`), so this pin moved +8 B in lockstep — deliberately
-    /// recomputed, not silently left stale.
+    /// The finalize shape is the largest one now: besides its own batch account it counts the previous batch the completing
+    /// call reads (one more account at 64 B plus the batch's full 9,607 B at 290 frames, 8 accounts in all), so the pin
+    /// moved from 146,868 to 152,839. A finalize on a chain with a deposit queue loads two more accounts and some
+    /// bridge data, which moves it to 153,569 — deliberately recomputed by hand: 36 + 133,077 + 9,607 (base) +
+    /// 9,607 (previous batch) + 602 (cursor 69, exit config 142, queue 165, two records 2 * 113) + 10 * 64.
     #[test]
     fn requirement_pins_the_290_frame_batch_against_its_live_minimum() {
         let program_id = Pubkey::new_unique();
@@ -451,7 +472,7 @@ mod tests {
             crate::channel::DEFAULT_MAX_FRAME_BODY_LEN,
         );
         assert_eq!(
-            required, 146_788,
+            required, 153_569,
             "290-frame requirement drifted from its pinned value — recompute by hand before changing this"
         );
         assert!(
@@ -461,7 +482,9 @@ mod tests {
         );
     }
 
-    /// The 900-frame counterpart of the pin above — live-verified minimum 162,562 B.
+    /// The 900-frame counterpart of the pin above — live-verified minimum 162,562 B. By hand: 36 + 133,077 + 29,203
+    /// (base) + 29,203 (previous batch) + 602 (cursor 69, exit config 142, queue 165, two records 2 * 113) +
+    /// 10 * 64 = 192,761.
     #[test]
     fn requirement_pins_the_900_frame_batch_against_its_live_minimum() {
         let program_id = Pubkey::new_unique();
@@ -473,7 +496,7 @@ mod tests {
             crate::channel::DEFAULT_MAX_FRAME_BODY_LEN,
         );
         assert_eq!(
-            required, 166_384,
+            required, 192_761,
             "900-frame requirement drifted from its pinned value — recompute by hand before changing this"
         );
         assert!(
@@ -481,6 +504,29 @@ mod tests {
             "must never fall below the devnet-probe-verified live minimum for a 900-frame batch, got \
              {required}"
         );
+    }
+
+    /// A limit that only fits a finalize without deposits is refused: the requirement counts the cursor, the exit
+    /// config, the queue and the two records a finalize with deposits loads, so a limit tuned to the old figure
+    /// would pass the check and then fail every finalize that carries deposits.
+    #[test]
+    fn a_limit_tuned_to_a_finalize_without_deposits_is_refused() {
+        let inbox_program_id = Pubkey::new_unique();
+        let programdata = bpf_loader_upgradeable::get_program_data_address(&inbox_program_id);
+        let mut lens = std::collections::HashMap::new();
+        lens.insert(inbox_program_id, 36usize);
+        lens.insert(programdata, 133_077usize);
+        let reader = FakeReader(lens);
+        let body = crate::channel::DEFAULT_MAX_FRAME_BODY_LEN;
+        assert!(matches!(
+            check(&reader, &inbox_program_id, 192_031, 900, body),
+            Err(LoadedAccountsError::ConfiguredLimitTooLow {
+                required: 192_761,
+                ..
+            })
+        ));
+        check(&reader, &inbox_program_id, 192_761, 900, body)
+            .expect("the exact requirement is enough");
     }
 
     /// A loader-v3 (upgradeable) inbox program always has a

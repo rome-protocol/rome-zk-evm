@@ -29,6 +29,17 @@ has sequencer-config.toml '^sub_block_ms = 40$' "sub_block_ms comes from chain.t
 has sequencer-config.toml '^empty_block_interval_secs = 5$' "empty_block_interval_secs comes from chain.toml"
 has sequencer-config.toml '^sequencer_key_path = "/data/sequencer.key"$' "container key path"
 has sequencer-config.toml '^log_dir = "/data/reth/log"$' "container log dir (the batcher reads it)"
+has sequencer-config.toml '^\[deposits\]$' "the [deposits] section is rendered, so a deposit queue made later is read without another init"
+has sequencer-config.toml '^solana_rpc_url = "https://rpc.example.invalid"$' "[deposits] reads Solana through the RPC from .env, the one the batcher uses"
+has sequencer-config.toml '^settlement_program = "FixtureBprogram11111111111111111111111111112"$' "[deposits] names the settlement program from the programs file"
+has sequencer-config.toml '^poll_interval_ms = 1000$' "[deposits] poll interval"
+python3 - "$OUT/sequencer-config.toml" <<'PY' && pass "sequencer-config.toml parses as TOML with the [deposits] keys the sequencer reads, and nothing else in it" || fail "sequencer-config.toml [deposits] parses" "see above"
+import sys, tomllib
+c = tomllib.load(open(sys.argv[1], "rb"))
+d = c["deposits"]
+assert set(d) == {"solana_rpc_url", "settlement_program", "poll_interval_ms"}, d
+assert c["chain_id"] == 4295391538 and c["profile"]["blocks_per_batch"] == 30
+PY
 
 python3 - "$OUT/genesis.json" "$REPO_ROOT/contracts/exit-portal/RomeExitPortal.runtime.hex" <<'PY' && pass "genesis.json: chainId is the derived id, gas limit and coinbase come from chain.toml; no balances; the exit portal is the one predeploy" || fail "genesis.json: chainId is the derived id, gas limit and coinbase come from chain.toml; no balances; the exit portal is the one predeploy" "see above"
 import json, sys

@@ -143,6 +143,17 @@ root) and in each layout's own module pin concrete hex values computed independe
 code, specifically so a change that happens to keep every existing test passing by accident (a
 compensating pair of offset changes, for instance) still fails the fixed-value check.
 
+- **A registry entry names its ZisK release in its `scheme` byte.** `0` is Groth16; `1` is ZisK 1.2.0-alpha
+  (`SCHEME_ZISK_1_2_0`, the value every entry written so far carries); `2` is ZisK 1.3.1-alpha
+  (`SCHEME_ZISK_1_3_1`). `registry::ZISK_RELEASES` lists the releases, a number is never reused, and a later
+  release takes the next unused number; a test holds the published rows fixed. No byte of the entry moves.
+  The `scheme` byte is the ZisK release number; code that reads or writes an entry names the release it means.
+  `registry::find_zisk(d, vkey_hash, at_slot)` finds the one active BN254 entry under any ZisK scheme for a
+  verification-key hash (skipping retired and not-yet-active entries) and refuses two active matches
+  (`FindZiskError::TwoActiveMatches`), so a hash can never choose between two releases. Settlement's
+  `PostRootProved` and the prover's anchor both look keys up with it. The release list here and the one in Veritas
+  are two tables; a test in `programs/zk-settlement` fails if their scheme numbers or names differ.
+
 ## Scope
 
 This crate covers the inbox batch account (its sizing and growth), the settlement root, pending and registry

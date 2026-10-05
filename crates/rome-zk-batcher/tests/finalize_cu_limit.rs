@@ -27,7 +27,7 @@
 //! signature/error at the one point they cross that boundary — same "one conversion" rule as
 //! `sender::compat`, just local to this test file since program-test never needs the reverse direction.
 
-use rome_zk_batcher::channel::Frame;
+use rome_zk_batcher::channel::{cut_frames, encode_stream, Block, Frame};
 use rome_zk_batcher::metrics::Metrics;
 use rome_zk_batcher::pipeline::{self, BatchTarget, FinalizePoll};
 use rome_zk_batcher::sender::{SendTuning, Sender, SenderError};
@@ -55,8 +55,8 @@ use std::time::Duration;
 /// `solana_sdk::transaction::TransactionError` (what `BanksClientError::TransactionError` carries)
 /// -> `solana_transaction_error::TransactionError` (what `Sender`/`SenderError::StepFailed` use).
 /// Deliberately narrow: this test file only ever produces (and only ever needs to assert on)
-/// `InstructionError(index, ComputationalBudgetExceeded)` — the exact shape a real CU-exceeded
-/// `FinalizeBatch` returns — so every other variant panics loudly rather than silently misrepresenting an
+/// `InstructionError(index, ComputationalBudgetExceeded | ProgramFailedToComplete)` — the two shapes a real
+/// CU-exceeded finalize returns — so every other variant panics loudly rather than silently misrepresenting an
 /// error this file was never written to expect. A general-purpose `TransactionError` converter
 /// is out of scope for a test-only bridge; see `sender::compat`'s own module doc for the production
 /// conversion boundary this crate actually ships.
@@ -69,9 +69,13 @@ fn to_v1_tx_error(
                 solana_sdk::instruction::InstructionError::ComputationalBudgetExceeded => {
                     solana_instruction_error::InstructionError::ComputationalBudgetExceeded
                 }
+                // Running out of compute units inside the program's own instructions reports this.
+                solana_sdk::instruction::InstructionError::ProgramFailedToComplete => {
+                    solana_instruction_error::InstructionError::ProgramFailedToComplete
+                }
                 other => panic!(
                     "to_v1_tx_error: unhandled InstructionError variant {other:?} — this test-only \
-                     bridge only converts ComputationalBudgetExceeded"
+                     bridge only converts the two compute-budget errors"
                 ),
             };
             solana_transaction_error::TransactionError::InstructionError(idx, v1_inner)
@@ -148,6 +152,17 @@ impl LowLevelRpcSender for BanksAccountRpc {
         request: RpcRequest,
         params: serde_json::Value,
     ) -> ClientResult<serde_json::Value> {
+        if request == RpcRequest::GetMinimumBalanceForRentExemption {
+            // The batcher asks for the rent minimum of the 69-byte cursor before its first V2.
+            let len = params[0].as_u64().expect("data length param") as usize;
+            let rent = self
+                .banks_client
+                .clone()
+                .get_rent()
+                .await
+                .expect("BanksClient::get_rent");
+            return Ok(serde_json::json!(rent.minimum_balance(len)));
+        }
         assert_eq!(
             request,
             RpcRequest::GetAccountInfo,
@@ -204,18 +219,34 @@ fn tuning(compute_unit_limit: u32) -> SendTuning {
     }
 }
 
-/// 900 tiny frames (frame_no 0..900) — enough to reproduce the measured ~373k CU `FinalizeBatch` cost;
-/// content is irrelevant (never re-derived against any source blocks here), only that each frame's own
-/// `to_bytes()` hashes to what gets seeded as that leaf's on-chain (pre-finalize) hash.
-fn synthetic_frames(n: u32) -> Vec<Frame> {
-    (0..n)
-        .map(|i| Frame {
-            channel_id: [0u8; 16],
-            frame_no: i as u16,
-            is_last: i + 1 == n,
-            body: i.to_le_bytes().to_vec(),
-        })
-        .collect()
+/// `n` frames (frame_no 0..n) of 4 bytes each, cut from one real channel stream: a block whose one
+/// transaction is incompressible filler sized so the compressed stream is exactly `4 * n` bytes or a little
+/// under (the last frame is then short). Enough to reproduce the measured ~373k CU `FinalizeBatchV2` cost; the
+/// content only has to decode, since `finalize_and_verify` decodes the posted stream before it sends.
+fn synthetic_frames(chain_id: u64, batch: u64, n: u32) -> Vec<Frame> {
+    let want = n as usize;
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut filler = Vec::with_capacity(want * 4 + 64);
+    for _ in 0..(want * 4 + 64) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        filler.push((state >> 24) as u8);
+    }
+    for len in (want * 4 - 200)..(want * 4 + 64) {
+        let blocks = [Block {
+            number: 1,
+            timestamp: 1,
+            gas_limit: 30_000_000,
+            txs: vec![alloy_primitives::Bytes::copy_from_slice(&filler[..len])],
+            deposits_end: None,
+        }];
+        let frames = cut_frames(chain_id, batch, &encode_stream(&blocks), 4);
+        if frames.len() == want {
+            return frames;
+        }
+    }
+    panic!("no filler length gave exactly {want} frames");
 }
 
 /// Opens+grows a real `n`-leaf batch (via `pipeline::open_and_grow_batch`, driven by `BanksSender` — a
@@ -247,16 +278,16 @@ async fn open_grown_and_presealed_batch(
         .unwrap()
         .expect("batch account must exist after OpenBatch(+Grow)");
     let target_len = rome_zk_layouts::batch::account_len_for(
-        rome_zk_layouts::batch::VERSION,
+        rome_zk_layouts::batch::VERSION_V3,
         frames.len() as u32,
     )
     .unwrap();
     assert_eq!(account.data.len(), target_len);
 
     let mut data = account.data.clone();
-    let bitmap_off = rome_zk_layouts::batch::HEADER_LEN_V2;
+    let bitmap_off = rome_zk_layouts::batch::HEADER_LEN_V3;
     let leaves_off = rome_zk_layouts::batch::leaves_offset_for(
-        rome_zk_layouts::batch::VERSION,
+        rome_zk_layouts::batch::VERSION_V3,
         frames.len() as u32,
     )
     .unwrap();
@@ -320,7 +351,7 @@ async fn finalize_and_verify_fails_a_900_leaf_batch_at_the_general_200k_cu_limit
         chain_id,
         batch,
     };
-    let frames = synthetic_frames(900);
+    let frames = synthetic_frames(chain_id, batch, 900);
     open_grown_and_presealed_batch(&mut ctx, &sender, target, &settlement_program, &frames).await;
 
     let rpc = banks_rpc_client(ctx.banks_client.clone());
@@ -337,6 +368,7 @@ async fn finalize_and_verify_fails_a_900_leaf_batch_at_the_general_200k_cu_limit
             max_polls: 1,
         },
         &frames,
+        None,
     )
     .await
     .expect_err(
@@ -352,11 +384,12 @@ async fn finalize_and_verify_fails_a_900_leaf_batch_at_the_general_200k_cu_limit
                 err: solana_transaction_error::TransactionError::InstructionError(
                     _,
                     solana_instruction_error::InstructionError::ComputationalBudgetExceeded
+                        | solana_instruction_error::InstructionError::ProgramFailedToComplete
                 ),
                 ..
             })
         ),
-        "expected ComputationalBudgetExceeded, got {msg}"
+        "expected the compute budget to run out, got {msg}"
     );
 }
 
@@ -406,7 +439,7 @@ async fn finalize_and_verify_succeeds_a_900_leaf_batch_at_the_configured_finaliz
         chain_id,
         batch,
     };
-    let frames = synthetic_frames(900);
+    let frames = synthetic_frames(chain_id, batch, 900);
     open_grown_and_presealed_batch(&mut ctx, &sender, target, &settlement_program, &frames).await;
 
     let rpc = banks_rpc_client(ctx.banks_client.clone());
@@ -425,6 +458,7 @@ async fn finalize_and_verify_succeeds_a_900_leaf_batch_at_the_configured_finaliz
             max_polls: 5,
         },
         &frames,
+        None,
     )
     .await
     .expect("FinalizeBatch(900 leaves) must succeed at the configured 600,000 CU finalize limit");
@@ -432,4 +466,45 @@ async fn finalize_and_verify_succeeds_a_900_leaf_batch_at_the_configured_finaliz
     let reference_acc =
         pipeline::verify_acc(&decoded, &frames).expect("on-chain acc must match reference");
     assert_eq!(decoded.acc, reference_acc);
+}
+
+/// The widest finalize transaction the program accepts: a later batch (so the previous-batch account is a
+/// real one), a bridge named, a range that stops short of the queue's end (so `record(to - 1)` and `record(to)`
+/// are two different accounts). Built as the V1 transaction the sender would send, signed, and measured on
+/// the wire against the 4,096-byte envelope.
+#[test]
+fn the_widest_finalize_transaction_fits_a_v1_envelope() {
+    let payer = solana_keypair::Keypair::new();
+    let authority = {
+        use solana_signer::Signer;
+        rome_zk_batcher::sender::compat::from_v1_pubkey(&payer.pubkey())
+    };
+    let inbox = Pubkey::new_unique();
+    let settlement = Pubkey::new_unique();
+    let bridge = Pubkey::new_unique();
+    let ix = zk_inbox_client::finalize_batch_v2_ix(
+        &inbox,
+        &authority,
+        &settlement,
+        200_199,
+        7,
+        0,
+        3,
+        Some(&bridge),
+    );
+    assert_eq!(ix.accounts.len(), 8, "the finalize account list changed");
+    let tx = rome_zk_solana_sender::build_v1_tx(
+        &payer,
+        &[ix],
+        600_000,
+        1_048_576,
+        1_000,
+        solana_hash::Hash::default(),
+    )
+    .expect("a finalize must compile into a V1 transaction");
+    let size = wincode::serialize(&tx)
+        .expect("serializing a signed V1 transaction cannot fail")
+        .len();
+    eprintln!("finalize transaction (V1, 8 instruction accounts, widest shape): {size} B of 4,096");
+    assert!(size <= 4_096, "the finalize transaction is {size} B");
 }

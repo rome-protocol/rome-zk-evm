@@ -83,9 +83,16 @@ use solana_system_interface::{instruction as system_instruction, program as syst
 
 pub use rome_zk_layouts::batch::{
     account_len_for, bitmap_len, header_len, leaves_offset_for, MAGIC, OFF_ACC, OFF_AUTHORITY,
-    OFF_BATCH, OFF_CHAIN_ID, OFF_EXPECTED_COUNT, OFF_FINALIZED, OFF_FINALIZE_CURSOR,
-    OFF_FORCED_ROOT, OFF_LEAVES_PRESENT, OFF_MAGIC, OFF_OPEN_SLOT, OFF_OPEN_UNIX_TS, OFF_ROOT,
-    OFF_SETTLEMENT_PROGRAM, OFF_VERSION, VERSION,
+    OFF_BATCH, OFF_CHAIN_ID, OFF_DEPOSIT_FROM, OFF_DEPOSIT_HASH_FROM, OFF_DEPOSIT_HASH_TO,
+    OFF_DEPOSIT_TO, OFF_EXPECTED_COUNT, OFF_FINALIZED, OFF_FINALIZE_CURSOR, OFF_FORCED_ROOT,
+    OFF_LEAVES_PRESENT, OFF_MAGIC, OFF_OPEN_SLOT, OFF_OPEN_UNIX_TS, OFF_ROOT,
+    OFF_SETTLEMENT_PROGRAM, OFF_VERSION, VERSION, VERSION_V3,
+};
+use rome_zk_layouts::{
+    cursor as cursor_layout,
+    deposit::{self, queue_seed_hash},
+    deposit_queue::{deposit_queue, deposit_record},
+    exit::exit_config,
 };
 
 /// `["batch", settlement_program, chain_id, batch]`. The single definition is
@@ -136,6 +143,46 @@ pub enum BatchError {
     /// an impossible value into a named refusal instead of a silently-negative anchor a downstream
     /// reader (`rome-zk-derive`) would otherwise have to make sense of.
     NegativeUnixTimestamp = 14,
+    /// `FinalizeBatch` (6) was called. It is retired: its body would write the constant forced_root and
+    /// ignore the deposit queue, so every chain finalizes through `FinalizeBatchV2` (an empty range when
+    /// the chain has no deposits).
+    RetiredInstruction = 15,
+    /// `FinalizeBatchV2`'s `exit_config` account is not at `exit_config::pda(batch.settlement_program,
+    /// chain_id)`.
+    WrongExitConfigAddress = 16,
+    /// `FinalizeBatchV2`'s queue account is not at the deposit-queue PDA under
+    /// `exit_config.bridge_program`.
+    WrongDepositQueueAddress = 17,
+    /// A deposit record account `FinalizeBatchV2` reads is not at its record PDA under the bridge.
+    WrongDepositRecordAddress = 18,
+    /// A deposit record account `FinalizeBatchV2` reads is not owned by the bridge program.
+    WrongDepositRecordOwner = 19,
+    /// `FinalizeBatchV2` was given a non-empty range on a chain with no exit config, a zero bridge program
+    /// or no queue: nothing can have been deposited, so the range must be empty.
+    NoDepositQueue = 20,
+    /// `FinalizeBatchV2` was given a non-empty range for a batch with a v2 header, which has no room for
+    /// the range. A batch opened before the upgrade takes only an empty range.
+    HeaderV2TakesEmptyRange = 21,
+    /// `deposit_to` is below the cursor's `deposit_next` (the range's `from`).
+    DepositToBelowFrom = 22,
+    /// `deposit_to` is above the queue's `count`.
+    DepositToAboveCount = 23,
+    /// `deposit_to - from` is above the queue's active `max_per_batch`.
+    DepositRangeTooLarge = 24,
+    /// The deposit just after the range was already older than the queue's inclusion deadline when the batch
+    /// opened, and the range neither reaches the queue's end nor takes `max_per_block` deposits: the batch left an overdue deposit out.
+    DepositDeadlineMissed = 25,
+    /// The cursor is still a v1 account and holds less than the 69-byte rent minimum. The batcher sends one
+    /// plain transfer that brings it to that minimum before its first `FinalizeBatchV2` on the chain, so
+    /// this refusal means the top-up has not landed.
+    CursorShortOfRent = 26,
+    /// `FinalizeBatchV2`'s previous-batch account is not at `batch_pda(settlement_program, chain_id,
+    /// batch - 1)`.
+    WrongPreviousBatchAddress = 27,
+    /// The previous batch exists, is owned by this program and is not finalized yet: taking deposits now
+    /// would give this batch a range that comes before the earlier batch's, so the earlier batch settles
+    /// later than the deposits it should have credited first.
+    PreviousBatchNotFinalized = 28,
 }
 impl From<BatchError> for ProgramError {
     fn from(e: BatchError) -> Self {
@@ -268,8 +315,13 @@ pub fn seal_leaf(program_id: &Pubkey, accounts: &[AccountInfo], idx: u32) -> Pro
     seal_leaf_inner(program_id, &mut accounts.iter(), idx)
 }
 
-pub fn finalize_batch(program_id: &Pubkey, accounts: &[AccountInfo], step: u32) -> ProgramResult {
-    finalize_batch_inner(program_id, &mut accounts.iter(), step)
+pub fn finalize_batch_v2(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    step: u32,
+    deposit_to: u64,
+) -> ProgramResult {
+    finalize_batch_v2_inner(program_id, &mut accounts.iter(), step, deposit_to)
 }
 
 pub fn close_batch(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
@@ -355,8 +407,8 @@ fn open_batch_inner<'a, 'b: 'a>(
     // bytes in this one top-level instruction, so `expected_count` above ~312 leaves cannot be created
     // at its full `account_len` here — `GrowBatch` (a separate top-level instruction, so it gets its
     // own fresh realloc allowance) finishes the job.
-    let full_space =
-        account_len_for(VERSION, expected_count).map_err(|_| ProgramError::InvalidAccountData)?;
+    let full_space = account_len_for(VERSION_V3, expected_count)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
     let space = full_space.min(MAX_PERMITTED_DATA_INCREASE);
     // `batch`'s address is public and predictable (`(chain_id, batch)`-derived), and it is exactly the next
     // id the cursor will ever accept — so anyone can pre-fund it with the rent-exempt minimum before this
@@ -384,7 +436,7 @@ fn open_batch_inner<'a, 'b: 'a>(
     let open_unix_ts = clock.unix_timestamp;
     let mut d = pda.try_borrow_mut_data()?;
     d[OFF_MAGIC..OFF_MAGIC + 4].copy_from_slice(&MAGIC.to_le_bytes());
-    d[OFF_VERSION] = VERSION;
+    d[OFF_VERSION] = VERSION_V3;
     d[OFF_CHAIN_ID..OFF_CHAIN_ID + 8].copy_from_slice(&chain_id.to_le_bytes());
     d[OFF_BATCH..OFF_BATCH + 8].copy_from_slice(&batch.to_le_bytes());
     d[OFF_OPEN_SLOT..OFF_OPEN_SLOT + 8].copy_from_slice(&open_slot.to_le_bytes());
@@ -472,10 +524,228 @@ fn seal_leaf_inner<'a, 'b: 'a>(
     Ok(())
 }
 
-fn finalize_batch_inner<'a, 'b: 'a>(
+/// The deposit range a completing finalize settles on, with the cursor's state before it.
+struct DepositRange {
+    from: u64,
+    to: u64,
+    hash_from: [u8; 32],
+    hash_to: [u8; 32],
+}
+
+/// Reads one deposit record the bridge owns: the account must sit at the record PDA of `index` and be owned
+/// by the bridge, then it is decoded.
+fn load_record(
+    record: &AccountInfo,
+    bridge_program: &Pubkey,
+    settlement_program: &Pubkey,
+    chain_id: u64,
+    index: u64,
+) -> Result<deposit_record::DepositRecordFields, ProgramError> {
+    let expected = deposit_record::pda(
+        bridge_program,
+        &settlement_program.to_bytes(),
+        chain_id,
+        index,
+    )
+    .0;
+    if *record.key != expected {
+        return Err(BatchError::WrongDepositRecordAddress.into());
+    }
+    if record.owner != bridge_program {
+        return Err(BatchError::WrongDepositRecordOwner.into());
+    }
+    let d = record.try_borrow_data()?;
+    deposit_record::read(&d).map_err(|_| ProgramError::InvalidAccountData)
+}
+
+/// How long, in seconds, the open-time verdict on a deposit's deadline holds. A completing `FinalizeBatchV2`
+/// measures a waiting deposit's age at the later of the batch's open time and this long before the call, so
+/// no finalize later than a deposit's enqueue time plus its deadline plus this grace can leave it out. Fixed
+/// in the program, not configurable.
+pub const DEPOSIT_GRACE_SECS: i64 = 86_400;
+
+/// The range rules of a completing `FinalizeBatchV2`, in order: the address bindings, then the range.
+/// `accounts` are `[exit_config, deposit_queue, record(to-1), record(to)]`, read from `it` in that order
+/// and only here, so an earlier step of a resumable finalize takes none of them. Nothing is written.
+///
+/// Binding by address comes first: a wrong `exit_config` or queue address is refused by name, and only an
+/// account at the exact right address that is not owned by settlement (the exit config) or by the bridge
+/// (the queue) counts as absent. Without that an attacker could point either slot at an empty account and
+/// finalize an empty range past a deposit's deadline.
+#[allow(clippy::too_many_arguments)]
+fn resolve_range<'a, 'b: 'a>(
+    it: &mut std::slice::Iter<'a, AccountInfo<'b>>,
+    settlement_program: &Pubkey,
+    chain_id: u64,
+    version: u8,
+    open_unix_ts: i64,
+    deposit_to: u64,
+    from: u64,
+    hash_from: [u8; 32],
+) -> Result<DepositRange, ProgramError> {
+    let exit_config_acct = next_account_info(it)?;
+    let queue_acct = next_account_info(it)?;
+    let record_prev = next_account_info(it)?;
+    let record_to = next_account_info(it)?;
+
+    let exit_config_expected = exit_config::pda(settlement_program, chain_id).0;
+    if *exit_config_acct.key != exit_config_expected {
+        return Err(BatchError::WrongExitConfigAddress.into());
+    }
+    // `Some(bridge_program)` when the chain has an exit config that names one.
+    let bridge_program = if exit_config_acct.owner == settlement_program {
+        let d = exit_config_acct.try_borrow_data()?;
+        let f = exit_config::read(&d).map_err(|_| ProgramError::InvalidAccountData)?;
+        (f.bridge_program != [0u8; 32]).then(|| Pubkey::new_from_array(f.bridge_program))
+    } else {
+        None
+    };
+    let mut queue_live = None;
+    if let Some(bridge) = &bridge_program {
+        let queue_expected = deposit_queue::pda(bridge, &settlement_program.to_bytes(), chain_id).0;
+        if *queue_acct.key != queue_expected {
+            return Err(BatchError::WrongDepositQueueAddress.into());
+        }
+        if queue_acct.owner == bridge {
+            let d = queue_acct.try_borrow_data()?;
+            queue_live =
+                Some(deposit_queue::read(&d).map_err(|_| ProgramError::InvalidAccountData)?);
+        }
+    }
+
+    // A batch opened before the upgrade took no deposits: its blocks were sealed before any queue existed,
+    // so it takes the empty range whatever the queue holds now, and no deadline applies to it.
+    if version != VERSION_V3 {
+        if deposit_to != from {
+            return Err(BatchError::HeaderV2TakesEmptyRange.into());
+        }
+        return Ok(DepositRange {
+            from,
+            to: from,
+            hash_from,
+            hash_to: hash_from,
+        });
+    }
+    let (bridge, queue) = match (&bridge_program, &queue_live) {
+        (Some(bridge), Some(queue)) => (bridge, queue),
+        _ => {
+            if deposit_to != from {
+                return Err(BatchError::NoDepositQueue.into());
+            }
+            return Ok(DepositRange {
+                from,
+                to: from,
+                hash_from,
+                hash_to: hash_from,
+            });
+        }
+    };
+
+    // Only the active parameters count; a pending proposal is never read.
+    let params = &queue.params;
+    if deposit_to < from {
+        return Err(BatchError::DepositToBelowFrom.into());
+    }
+    if deposit_to > queue.count {
+        return Err(BatchError::DepositToAboveCount.into());
+    }
+    let taken = deposit_to - from;
+    if taken > u64::from(params.max_per_batch) {
+        return Err(BatchError::DepositRangeTooLarge.into());
+    }
+    // The deadline: the range may stop short of the queue only if it took `max_per_block` deposits or the
+    // next deposit is still inside its inclusion window. The age is measured at the time the batch was
+    // opened, which the batch itself commits to, so a batch that could finalize when it opened is not turned
+    // into one that cannot by waiting. That verdict holds for a fixed grace only: the age is measured at
+    // the later of the open time and `DEPOSIT_GRACE_SECS` before this call. Without that floor, batches
+    // opened early and held open could each finalize empty and keep a deposit out for as long as they like.
+    if deposit_to != queue.count && taken < u64::from(params.max_per_block) {
+        let next = load_record(record_to, bridge, settlement_program, chain_id, deposit_to)?;
+        let now = Clock::get()?.unix_timestamp;
+        let measured_at = open_unix_ts.max(now.saturating_sub(DEPOSIT_GRACE_SECS));
+        let age = measured_at.saturating_sub(next.enqueue_unix_ts);
+        if age >= i64::from(params.inclusion_deadline_secs) {
+            return Err(BatchError::DepositDeadlineMissed.into());
+        }
+    }
+    let hash_to = if deposit_to == from {
+        hash_from
+    } else {
+        load_record(
+            record_prev,
+            bridge,
+            settlement_program,
+            chain_id,
+            deposit_to - 1,
+        )?
+        .hash_after
+    };
+    Ok(DepositRange {
+        from,
+        to: deposit_to,
+        hash_from,
+        hash_to,
+    })
+}
+
+/// Batches take deposit ranges in id order: a completing finalize needs the batch before it to be final
+/// already. `prev` is that batch's account, read only. Its address is bound first, then: an account this
+/// program owns that is not finalized refuses; an absent one (abandoned, closed after it went final, or never
+/// opened) is fine, as is any call for batch 0, which has no predecessor. Applies to an empty range as well,
+/// since the cursor and the chain hash do not move but the batch is still ordered after its predecessor.
+fn check_previous_batch(
+    program_id: &Pubkey,
+    prev: &AccountInfo,
+    settlement_program: &Pubkey,
+    chain_id: u64,
+    batch: u64,
+) -> ProgramResult {
+    let Some(prev_id) = batch.checked_sub(1) else {
+        return Ok(());
+    };
+    let sd = seeds(settlement_program, chain_id, prev_id);
+    let expected = Pubkey::find_program_address(&[&sd[0], &sd[1], &sd[2], &sd[3]], program_id).0;
+    if *prev.key != expected {
+        return Err(BatchError::WrongPreviousBatchAddress.into());
+    }
+    if prev.owner == program_id {
+        let d = prev.try_borrow_data()?;
+        let finalized = d
+            .get(OFF_FINALIZED)
+            .ok_or(ProgramError::InvalidAccountData)?;
+        if *finalized == 0 {
+            return Err(BatchError::PreviousBatchNotFinalized.into());
+        }
+    }
+    Ok(())
+}
+
+/// Writes the cursor after a completing finalize. A v1 cursor becomes a 69-byte v2 cursor here, in place;
+/// a v2 cursor moves only when the range took deposits.
+fn advance_cursor(cursor: &AccountInfo, range: &DepositRange, was_v1: bool) -> ProgramResult {
+    if was_v1 {
+        cursor.resize(cursor_layout::LEN_V2)?;
+    } else if range.to == range.from {
+        return Ok(());
+    }
+    let mut cd = cursor.try_borrow_mut_data()?;
+    cd[cursor_layout::OFF_VERSION] = cursor_layout::VERSION_V2;
+    cd[cursor_layout::OFF_DEPOSIT_NEXT..cursor_layout::OFF_DEPOSIT_NEXT + 8]
+        .copy_from_slice(&range.to.to_le_bytes());
+    cd[cursor_layout::OFF_DEPOSIT_HASH..cursor_layout::OFF_DEPOSIT_HASH + 32]
+        .copy_from_slice(&range.hash_to);
+    // `deposit_final` is zero in a freshly grown cursor and untouched in a v2 one.
+    Ok(())
+}
+
+/// The shared finalize body. `FinalizeBatchV2 { step, deposit_to }`, accounts `[batch (w), authority
+/// (signer), cursor (w), exit_config, deposit_queue, record(deposit_to - 1), record(deposit_to), previous
+/// batch]`; the six accounts after the authority are read only on the call that completes the batch.
+fn finalize_batch_v2_inner<'a, 'b: 'a>(
     program_id: &Pubkey,
     it: &mut std::slice::Iter<'a, AccountInfo<'b>>,
     step: u32,
+    deposit_to: u64,
 ) -> ProgramResult {
     let batch_pda = next_account_info(it)?;
     let authority = next_account_info(it)?;
@@ -486,7 +756,7 @@ fn finalize_batch_inner<'a, 'b: 'a>(
     let (version, chain_id, batch, expected_count) = read_header(&d)?;
     // The trailing signer must be this batch's own stored `authority` — same check shape
     // `close_batch_inner` uses. Read directly off the raw header bytes (already borrowed above) rather
-    // than the full `rome_zk_layouts::batch::read` decode: this runs on every `FinalizeBatch` call,
+    // than the full `rome_zk_layouts::batch::read` decode: this runs on every finalize call,
     // including the per-step resumable path, so it stays on the same lightweight-offset-read discipline
     // `read_header` documents above (avoids the +23.5k CU the full decode costs on the 900-leaf path).
     if !authority.is_signer || *authority.key != pubkey_at(&d, OFF_AUTHORITY) {
@@ -510,13 +780,52 @@ fn finalize_batch_inner<'a, 'b: 'a>(
     let cap = if step == 0 { expected_count } else { step };
     let end = cursor.saturating_add(cap).min(expected_count);
     let h = rome_zk_merkle::keccak256;
+    // The call that completes the batch settles the deposit range first, before it spends CU on the leaves,
+    // so a refusal costs little. An earlier step reads no further account.
+    let settled = if end >= expected_count {
+        let settlement_program = pubkey_at(&d, OFF_SETTLEMENT_PROGRAM);
+        let cursor_acct = next_account_info(it)?;
+        let c = load_cursor(program_id, cursor_acct, &settlement_program, chain_id)?;
+        let (from, hash_from) = match c.deposit {
+            Some(dep) => (dep.next, dep.hash),
+            None => {
+                // A v1 cursor migrates now. It must already hold the rent for 69 bytes: the batcher sends one
+                // plain transfer to bring it there before its first call, because this instruction has no
+                // payer.
+                if cursor_acct.lamports() < Rent::get()?.minimum_balance(cursor_layout::LEN_V2) {
+                    return Err(BatchError::CursorShortOfRent.into());
+                }
+                (
+                    0,
+                    queue_seed_hash(&h, &settlement_program.to_bytes(), chain_id),
+                )
+            }
+        };
+        let range = resolve_range(
+            it,
+            &settlement_program,
+            chain_id,
+            version,
+            u64_at(&d, OFF_OPEN_UNIX_TS) as i64,
+            deposit_to,
+            from,
+            hash_from,
+        )?;
+        if batch != 0 {
+            let prev = next_account_info(it)?;
+            check_previous_batch(program_id, prev, &settlement_program, chain_id, batch)?;
+        }
+        Some((cursor_acct, c.deposit.is_none(), range))
+    } else {
+        None
+    };
     for i in cursor..end {
         let slot = lo + 32 * i as usize;
         let old: [u8; 32] = d[slot..slot + 32].try_into().unwrap();
         let leaf = rome_zk_merkle::indexed_leaf(&h, i, &old);
         d[slot..slot + 32].copy_from_slice(&leaf);
     }
-    if end < expected_count {
+    let Some((cursor_acct, was_v1, range)) = settled else {
         d[OFF_FINALIZE_CURSOR..OFF_FINALIZE_CURSOR + 4].copy_from_slice(&end.to_le_bytes());
         msg!(
             "finalize {}/{}: transformed {}..{}, not yet complete",
@@ -526,11 +835,13 @@ fn finalize_batch_inner<'a, 'b: 'a>(
             end
         );
         return Ok(());
-    }
+    };
     d[OFF_FINALIZE_CURSOR..OFF_FINALIZE_CURSOR + 4].copy_from_slice(&end.to_le_bytes());
     let n = expected_count as usize;
     let root = rome_zk_merkle::root_in_place(&h, &mut d[lo..lo + 32 * n], n);
-    let forced_root = rome_zk_layouts::forced_empty_root(&h);
+    // An empty range gives the constant a batch without deposits has always had.
+    let forced_root =
+        deposit::forced_root(&h, range.from, range.to, &range.hash_from, &range.hash_to);
     let open_slot = u64_at(&d, OFF_OPEN_SLOT);
     let acc = rome_zk_layouts::acc(
         &h,
@@ -544,12 +855,22 @@ fn finalize_batch_inner<'a, 'b: 'a>(
     d[OFF_ROOT..OFF_ROOT + 32].copy_from_slice(&root);
     d[OFF_FORCED_ROOT..OFF_FORCED_ROOT + 32].copy_from_slice(&forced_root);
     d[OFF_ACC..OFF_ACC + 32].copy_from_slice(&acc);
+    if version == VERSION_V3 {
+        d[OFF_DEPOSIT_FROM..OFF_DEPOSIT_FROM + 8].copy_from_slice(&range.from.to_le_bytes());
+        d[OFF_DEPOSIT_TO..OFF_DEPOSIT_TO + 8].copy_from_slice(&range.to.to_le_bytes());
+        d[OFF_DEPOSIT_HASH_FROM..OFF_DEPOSIT_HASH_FROM + 32].copy_from_slice(&range.hash_from);
+        d[OFF_DEPOSIT_HASH_TO..OFF_DEPOSIT_HASH_TO + 32].copy_from_slice(&range.hash_to);
+    }
     d[OFF_FINALIZED] = 1;
+    drop(d);
+    advance_cursor(cursor_acct, &range, was_v1)?;
     msg!(
-        "batch {}/{} finalized, {} leaves, acc {:02x?}",
+        "batch {}/{} finalized, {} leaves, deposits {}..{}, acc {:02x?}",
         chain_id,
         batch,
         expected_count,
+        range.from,
+        range.to,
         &acc[..8]
     );
     Ok(())
@@ -702,7 +1023,11 @@ pub fn abandon_batch(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramRe
 
 /// `AbandonBatch`: authority-only, only while `finalized == 0` — a finalized batch can
 /// only leave via `CloseBatch`, which requires the covering root to be final. Returns rent for a batch
-/// id that was opened but never posted.
+/// id that was opened but never posted. Accounts: `[authority (signer), batch (w), previous batch]`. The
+/// previous batch is read only, and checked the way a completing finalize checks it: its address is bound,
+/// and it must be final or absent. Batch 0 has no predecessor and does not read it. With this check an
+/// absent previous batch means every earlier batch is final or absent, so a finalize that sees an absent
+/// predecessor cannot be reordered ahead of an open batch.
 fn abandon_batch_inner<'a, 'b: 'a>(
     program_id: &Pubkey,
     it: &mut std::slice::Iter<'a, AccountInfo<'b>>,
@@ -720,6 +1045,11 @@ fn abandon_batch_inner<'a, 'b: 'a>(
         }
         if f.finalized {
             return Err(BatchError::AlreadyFinalized.into());
+        }
+        if f.batch != 0 {
+            let prev = next_account_info(it)?;
+            let settlement_program = Pubkey::new_from_array(f.settlement_program);
+            check_previous_batch(program_id, prev, &settlement_program, f.chain_id, f.batch)?;
         }
     }
     let lamports = batch_pda.lamports();

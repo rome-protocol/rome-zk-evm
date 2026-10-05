@@ -9,7 +9,6 @@
 use crate::chain::Chain;
 use crate::commands::{read, read_slot, Read};
 use crate::error::{Mode, OpsError, Report};
-use rome_zk_layouts::registry::LAYOUT_ZISK_V1;
 use solana_program::pubkey::Pubkey;
 
 pub async fn run<C: Chain>(
@@ -154,18 +153,10 @@ pub async fn run<C: Chain>(
         .as_ref()
         .map(|r| r.entries.as_slice())
         .unwrap_or(&[]);
-    report.line(format!("vkey_entries={}", entries.len()));
-    let proving: Vec<_> = entries
-        .iter()
-        .filter(|e| e.layout_id == LAYOUT_ZISK_V1 && !e.retired)
-        .collect();
-    let active = proving.iter().any(|e| e.activation_slot <= slot);
-    report.line(format!("vkey_active={}", if active { "yes" } else { "no" }));
-    if !active {
-        if let Some(next) = proving.iter().map(|e| e.activation_slot).min() {
-            report.line(format!("vkey_pending_activation_slot={next}"));
-        }
-    }
+    // The same lines `vkey show` prints, from the same function.
+    report
+        .lines
+        .extend(crate::commands::vkey::summary_lines(entries, slot));
     Ok(report)
 }
 
@@ -211,7 +202,7 @@ mod tests {
                 i,
                 &RegistryEntry {
                     curve: registry::CURVE_BN254,
-                    scheme: registry::SCHEME_PLONK,
+                    scheme: registry::SCHEME_ZISK_1_3_1,
                     vkey_hash: [i as u8 + 1; 32],
                     layout_id: *layout,
                 },

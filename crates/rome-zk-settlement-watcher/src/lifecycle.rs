@@ -31,7 +31,7 @@
 //! - `Seal` only ever `UPDATE`s an existing `inbox_chunk` row by `chunk_pda`; a `Seal`-only transaction
 //!   with no matching row is a genuine no-op (0 rows affected), not a fabricated one.
 //! - `Close` (rent reclaimed) sets `inbox_chunk.closed_tx`, never deletes the row.
-//! - `FinalizeBatch { step }` mirrors `finalize_batch_inner`'s own `cursor`/`cap`/`end` arithmetic
+//! - `FinalizeBatch { step }` and `FinalizeBatchV2 { step, .. }` (both decode to one `Finalized` event) mirror `finalize_batch_inner`'s own `cursor`/`cap`/`end` arithmetic
 //!   (`batch.rs`): `step == 0` means "the rest, in this call"; `status` only becomes `'finalized'` once
 //!   the cursor reaches `expected_count`. Applying the same
 //!   `(batch_pda, settlement_tx_id)` step twice (a `derive_cursor` reset for repair) must not double-count

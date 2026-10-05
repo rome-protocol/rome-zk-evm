@@ -6,8 +6,15 @@ pub mod vault_tool;
 
 use solana_program::{instruction::AccountMeta, pubkey::Pubkey};
 use zk_bridge::{
-    BridgeIx, CloseDepositArgs, DepositArgs, FundArgs, InitVaultArgs, ReleaseExitArgs,
+    ActivateDepositParamsArgs, BridgeIx, CloseDepositArgs, DepositArgs, FundArgs,
+    InitBridgeConfigArgs, InitDepositQueueArgs, InitVaultArgs, ProposeDepositParamsArgs,
+    ReleaseExitArgs,
 };
+
+pub use zk_bridge::deposit_queue::{
+    MAX_DEADLINE_SECS, MAX_FEE_LAMPORTS, MAX_PER_BATCH_CEILING, MIN_AMOUNT_FLOOR, MIN_DEADLINE_SECS,
+};
+pub use zk_bridge::DepositParamsArgs;
 
 pub use zk_bridge::state::{vault_authority_pda, vault_config_pda, vault_token_pda};
 
@@ -68,7 +75,8 @@ pub fn create_recipient_ata_idempotent_ix(
 /// accounts: `[payer (signer, writable), vault_config (writable, NEW), mint (read-only), vault_token
 /// (writable, NEW), vault_authority (read-only), chain_authority (signer — must equal the settlement
 /// `root.authority` for `chain_id`; see `programs/zk-bridge/README.md`), root (read-only — the settlement `["root",
-/// chain_id]` PDA, derived here from `settlement_program`), token_program, system_program]`.
+/// chain_id]` PDA, derived here from `settlement_program`), token_program, system_program, bridge_config
+/// (read-only)]`. `settlement_program` must be the one in the bridge config.
 pub fn init_vault_ix(
     program_id: &Pubkey,
     payer: &Pubkey,
@@ -82,6 +90,7 @@ pub fn init_vault_ix(
     let (vault_token, _) = vault_token_pda(program_id, &settlement_program, chain_id, &mint);
     let (vault_authority, _) = vault_authority_pda(program_id, &settlement_program, chain_id);
     let (root, _) = rome_zk_layouts::root::pda(&settlement_program, chain_id);
+    let (config, _) = rome_zk_layouts::deposit_queue::bridge_config::pda(program_id);
     ix(
         program_id,
         vec![
@@ -94,6 +103,7 @@ pub fn init_vault_ix(
             AccountMeta::new_readonly(root, false),
             AccountMeta::new_readonly(zk_bridge::token::TOKEN_PROGRAM_ID, false),
             AccountMeta::new_readonly(solana_system_interface::program::id(), false),
+            AccountMeta::new_readonly(config, false),
         ],
         BridgeIx::InitVault(InitVaultArgs {
             chain_id,
@@ -135,7 +145,8 @@ pub fn fund_ix(
 
 /// accounts: `[vault_config (read-only), exit_config (read-only), exit_record (writable), exit_consumer
 /// (read-only), settlement_program (read-only, executable), payer_refund (writable), vault_token
-/// (writable), vault_authority (read-only), recipient_ata (writable), token_program]`. Permissionless.
+/// (writable), vault_authority (read-only), recipient_ata (writable), token_program, bridge_config
+/// (read-only)]`. Permissionless.
 /// `mint`/`settlement_program`/`recipient` are read by the caller off the on-chain `vault_config`/
 /// `exit_record` accounts (e.g. via [`decode_vault_config_account`]/`zk_settlement_client::
 /// decode_exit_record_account`) — never chosen freely, since the program independently re-derives and
@@ -157,6 +168,7 @@ pub fn release_exit_ix(
     let (vault_authority, _) = vault_authority_pda(program_id, settlement_program, chain_id);
     let (exit_consumer, _) = rome_zk_layouts::exit::exit_consumer_pda(chain_id, program_id);
     let recipient_ata = recipient_ata(recipient, mint);
+    let (config, _) = rome_zk_layouts::deposit_queue::bridge_config::pda(program_id);
     ix(
         program_id,
         vec![
@@ -170,6 +182,7 @@ pub fn release_exit_ix(
             AccountMeta::new_readonly(vault_authority, false),
             AccountMeta::new(recipient_ata, false),
             AccountMeta::new_readonly(zk_bridge::token::TOKEN_PROGRAM_ID, false),
+            AccountMeta::new_readonly(config, false),
         ],
         BridgeIx::ReleaseExit(ReleaseExitArgs {
             chain_id,
@@ -210,6 +223,144 @@ pub fn deposit_record_pda(
     )
 }
 
+/// The bridge's `["bridge_config"]` address under the bridge program.
+pub fn bridge_config_pda(program_id: &Pubkey) -> (Pubkey, u8) {
+    rome_zk_layouts::deposit_queue::bridge_config::pda(program_id)
+}
+
+/// The address of the bridge program's `ProgramData` account, which holds its upgrade authority.
+pub fn bridge_program_data(program_id: &Pubkey) -> Pubkey {
+    const UPGRADEABLE_LOADER: Pubkey =
+        solana_program::pubkey!("BPFLoaderUpgradeab1e11111111111111111111111");
+    Pubkey::find_program_address(&[program_id.as_ref()], &UPGRADEABLE_LOADER).0
+}
+
+/// `InitBridgeConfig`: writes the bridge's one-time config, naming the canonical settlement and inbox programs.
+/// Run once per bridge deployment by the bridge program's upgrade authority.
+///
+/// accounts: `[payer (signer, writable), authority (signer, the bridge program's upgrade authority),
+/// bridge_config (writable, NEW), program_data (read-only), system_program]`.
+pub fn init_bridge_config_ix(
+    program_id: &Pubkey,
+    payer: &Pubkey,
+    upgrade_authority: &Pubkey,
+    settlement_program: &Pubkey,
+    inbox_program: &Pubkey,
+) -> solana_program::instruction::Instruction {
+    let (config, _) = bridge_config_pda(program_id);
+    ix(
+        program_id,
+        vec![
+            AccountMeta::new(*payer, true),
+            AccountMeta::new_readonly(*upgrade_authority, true),
+            AccountMeta::new(config, false),
+            AccountMeta::new_readonly(bridge_program_data(program_id), false),
+            AccountMeta::new_readonly(solana_system_interface::program::id(), false),
+        ],
+        BridgeIx::InitBridgeConfig(InitBridgeConfigArgs {
+            settlement_program: *settlement_program,
+            inbox_program: *inbox_program,
+        }),
+    )
+}
+
+/// `InitDepositQueue`: creates a chain's deposit queue with `params`. Gated by the chain authority. The chain's
+/// root must have taken a posted batch, and its vault must exist.
+///
+/// accounts: `[payer (signer, writable), chain_authority (signer), bridge_config (read-only), root (read-only),
+/// registry (read-only), vault_config (read-only), fee_recipient (read-only), deposit_queue (writable, NEW),
+/// system_program]`. `params.fee_recipient` is the account passed as `fee_recipient`.
+pub fn init_deposit_queue_ix(
+    program_id: &Pubkey,
+    payer: &Pubkey,
+    chain_authority: &Pubkey,
+    settlement_program: &Pubkey,
+    chain_id: u64,
+    params: DepositParamsArgs,
+) -> solana_program::instruction::Instruction {
+    let (config, _) = bridge_config_pda(program_id);
+    let (root, _) = rome_zk_layouts::root::pda(settlement_program, chain_id);
+    let (registry, _) = rome_zk_layouts::registry::pda(settlement_program, chain_id);
+    let (vault_config, _) = vault_config_pda(program_id, settlement_program, chain_id);
+    let (queue, _) = deposit_queue_pda(program_id, settlement_program, chain_id);
+    ix(
+        program_id,
+        vec![
+            AccountMeta::new(*payer, true),
+            AccountMeta::new_readonly(*chain_authority, true),
+            AccountMeta::new_readonly(config, false),
+            AccountMeta::new_readonly(root, false),
+            AccountMeta::new_readonly(registry, false),
+            AccountMeta::new_readonly(vault_config, false),
+            AccountMeta::new_readonly(params.fee_recipient, false),
+            AccountMeta::new(queue, false),
+            AccountMeta::new_readonly(solana_system_interface::program::id(), false),
+        ],
+        BridgeIx::InitDepositQueue(InitDepositQueueArgs {
+            chain_id,
+            settlement_program: *settlement_program,
+            params,
+        }),
+    )
+}
+
+/// `ProposeDepositParams`: records `params` as the queue's pending parameters, to take effect at
+/// `activation_slot`. Gated by the chain authority. A new proposal replaces a pending one. The slot must be at
+/// least one and at most two challenge windows from now.
+///
+/// accounts: `[chain_authority (signer), bridge_config (read-only), root (read-only), deposit_queue (writable),
+/// fee_recipient (read-only)]`. `params.fee_recipient` is the account passed as `fee_recipient`.
+pub fn propose_deposit_params_ix(
+    program_id: &Pubkey,
+    chain_authority: &Pubkey,
+    settlement_program: &Pubkey,
+    chain_id: u64,
+    activation_slot: u64,
+    params: DepositParamsArgs,
+) -> solana_program::instruction::Instruction {
+    let (config, _) = bridge_config_pda(program_id);
+    let (root, _) = rome_zk_layouts::root::pda(settlement_program, chain_id);
+    let (queue, _) = deposit_queue_pda(program_id, settlement_program, chain_id);
+    ix(
+        program_id,
+        vec![
+            AccountMeta::new_readonly(*chain_authority, true),
+            AccountMeta::new_readonly(config, false),
+            AccountMeta::new_readonly(root, false),
+            AccountMeta::new(queue, false),
+            AccountMeta::new_readonly(params.fee_recipient, false),
+        ],
+        BridgeIx::ProposeDepositParams(ProposeDepositParamsArgs {
+            chain_id,
+            activation_slot,
+            params,
+        }),
+    )
+}
+
+/// `ActivateDepositParams`: makes the pending parameters the live ones once the activation slot has passed.
+/// Permissionless. `pending_fee_recipient` is the fee recipient named in the pending parameters.
+///
+/// accounts: `[bridge_config (read-only), deposit_queue (writable), fee_recipient (read-only)]`.
+pub fn activate_deposit_params_ix(
+    program_id: &Pubkey,
+    settlement_program: &Pubkey,
+    chain_id: u64,
+    pending_fee_recipient: &Pubkey,
+) -> solana_program::instruction::Instruction {
+    let (config, _) = bridge_config_pda(program_id);
+    let (queue, _) = deposit_queue_pda(program_id, settlement_program, chain_id);
+    ix(
+        program_id,
+        vec![
+            AccountMeta::new_readonly(config, false),
+            AccountMeta::new(queue, false),
+            AccountMeta::new_readonly(*pending_fee_recipient, false),
+        ],
+        BridgeIx::ActivateDepositParams(ActivateDepositParamsArgs { chain_id }),
+    )
+}
+
 /// `Deposit`: locks `amount` of the vault's mint (in base units) and queues a credit of the same value, in
 /// gwei, to `l2_recipient`.
 ///
@@ -221,7 +372,8 @@ pub fn deposit_record_pda(
 ///
 /// accounts: `[depositor (signer, writable), depositor_token (writable), vault_config (read-only),
 /// vault_token (writable), deposit_queue (writable), deposit_record (writable), exit_config (read-only),
-/// fee_recipient (writable), token_program, system_program, root (read-only), registry (read-only)]`.
+/// fee_recipient (writable), token_program, system_program, root (read-only), registry (read-only),
+/// bridge_config (read-only)]`. The chain's root must have taken a posted batch.
 #[allow(clippy::too_many_arguments)]
 pub fn deposit_ix(
     program_id: &Pubkey,
@@ -242,6 +394,7 @@ pub fn deposit_ix(
     let (exit_config, _) = rome_zk_layouts::exit::exit_config::pda(settlement_program, chain_id);
     let (root, _) = rome_zk_layouts::root::pda(settlement_program, chain_id);
     let (registry, _) = rome_zk_layouts::registry::pda(settlement_program, chain_id);
+    let (config, _) = rome_zk_layouts::deposit_queue::bridge_config::pda(program_id);
     ix(
         program_id,
         vec![
@@ -257,6 +410,7 @@ pub fn deposit_ix(
             AccountMeta::new_readonly(solana_system_interface::program::id(), false),
             AccountMeta::new_readonly(root, false),
             AccountMeta::new_readonly(registry, false),
+            AccountMeta::new_readonly(config, false),
         ],
         BridgeIx::Deposit(DepositArgs {
             chain_id,
@@ -440,7 +594,7 @@ mod tests {
         );
         assert_eq!(ix.program_id, program_id);
         assert_eq!(ix.data[0], 0); // InitVault
-        assert_eq!(ix.accounts.len(), 9);
+        assert_eq!(ix.accounts.len(), 10);
         assert!(ix.accounts[5].is_signer, "chain_authority must sign");
         assert!(!ix.accounts[6].is_signer, "root is read-only");
 
@@ -468,7 +622,7 @@ mod tests {
             &Pubkey::new_unique(),
         );
         assert_eq!(ix.data[0], 2); // ReleaseExit
-        assert_eq!(ix.accounts.len(), 10);
+        assert_eq!(ix.accounts.len(), 11);
     }
 
     #[test]

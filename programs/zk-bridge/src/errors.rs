@@ -49,7 +49,9 @@ pub enum BridgeError {
     /// The `bridge_config` account is not the bridge's `["bridge_config"]` PDA, is not owned by this
     /// program, or does not hold a config.
     WrongBridgeConfig = 13,
-    /// `InitDepositQueue`: `args.settlement_program` is not the settlement program in the bridge config.
+    /// `InitDepositQueue` or `InitVault`: `args.settlement_program` is not the settlement program in the
+    /// bridge config. `ReleaseExit`: the vault config names a settlement program other than the bridge
+    /// config's.
     WrongSettlementProgram = 14,
     /// `InitDepositQueue`: the chain id is below 2^32, a reserved id. Reserved chains take no deposits.
     ReservedChainId = 15,
@@ -92,7 +94,8 @@ pub enum BridgeError {
     ChallengeWindowZero = 30,
     /// `ProposeDepositParams`: `activation_slot` is less than one challenge window from the current slot.
     ActivationTooSoon = 31,
-    /// `ProposeDepositParams`: a proposal is already pending. Activate it first.
+    /// No longer returned: a new valid proposal replaces a pending one. The code stays reserved so no
+    /// later code is renumbered.
     PendingParamsExist = 32,
     /// `ActivateDepositParams`: no proposal is pending.
     NoPendingParams = 33,
@@ -130,6 +133,12 @@ pub enum BridgeError {
     WrongRentRecipient = 46,
     /// The fee recipient is an executable account or a sysvar, which cannot take the fee.
     FeeRecipientNotPlain = 47,
+    /// `InitDepositQueue` or `Deposit`: the chain's root has never taken a posted batch
+    /// (`head_pending_batch` is 0). Such a chain can still be reclaimed by anyone, which would strand every
+    /// deposit, so it may not hold a queue or take deposits until it has posted.
+    ChainNeverPosted = 48,
+    /// `ProposeDepositParams`: `activation_slot` is more than two challenge windows from the current slot.
+    ActivationTooLate = 49,
 }
 
 impl From<BridgeError> for ProgramError {

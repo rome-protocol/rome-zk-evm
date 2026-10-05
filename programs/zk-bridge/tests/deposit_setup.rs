@@ -94,6 +94,17 @@ fn root_account(chain_id: u64, authority: &Pubkey, owner: Pubkey, window: u32) -
     let mut a = rome_zk_testkit::root_account_with_authority(chain_id, authority, owner);
     let o = rome_zk_layouts::root::OFF_CHALLENGE_WINDOW_SLOTS;
     a.data[o..o + 4].copy_from_slice(&window.to_le_bytes());
+    // The chain has posted: a queue is only set up for a chain that has.
+    let o = rome_zk_layouts::root::OFF_HEAD_PENDING_BATCH;
+    a.data[o..o + 8].copy_from_slice(&1u64.to_le_bytes());
+    a
+}
+
+/// The same root for a chain that has never posted.
+fn never_posted_root(chain_id: u64, authority: &Pubkey, owner: Pubkey, window: u32) -> Account {
+    let mut a = root_account(chain_id, authority, owner, window);
+    let o = rome_zk_layouts::root::OFF_HEAD_PENDING_BATCH;
+    a.data[o..o + 8].copy_from_slice(&0u64.to_le_bytes());
     a
 }
 
@@ -683,6 +694,43 @@ async fn init_deposit_queue_creates_an_empty_queue_at_the_seed_hash() {
     assert_eq!(f.activation_slot, 0);
 }
 
+/// A chain that has never posted can be reclaimed by anyone, so it may not hold a queue: refused by name, with
+/// no queue created.
+#[tokio::test]
+async fn init_deposit_queue_refuses_a_chain_that_never_posted() {
+    let mut rig = Rig::new();
+    rig.root.1 = never_posted_root(
+        CHAIN,
+        &rig.authority.pubkey(),
+        settlement_program_id(),
+        CHALLENGE_WINDOW,
+    );
+    rig.init_refused(BridgeError::ChainNeverPosted).await;
+}
+
+/// The first posted batch is enough.
+#[tokio::test]
+async fn init_deposit_queue_accepts_a_chain_that_posted_one_batch() {
+    let mut rig = Rig::new();
+    let mut a = never_posted_root(
+        CHAIN,
+        &rig.authority.pubkey(),
+        settlement_program_id(),
+        CHALLENGE_WINDOW,
+    );
+    let o = rome_zk_layouts::root::OFF_HEAD_PENDING_BATCH;
+    a.data[o..o + 8].copy_from_slice(&1u64.to_le_bytes());
+    rig.root.1 = a;
+    let mut ctx = rig.start().await;
+    rig.send(
+        &mut ctx,
+        rig.init_ix(),
+        "InitDepositQueue (one batch posted)",
+    )
+    .await
+    .expect("a chain with one posted batch may hold a queue");
+}
+
 #[tokio::test]
 async fn init_deposit_queue_accepts_the_bounds_exactly() {
     let mut rig = Rig::new();
@@ -1196,26 +1244,140 @@ async fn propose_deposit_params_refuses_a_missing_bridge_config() {
     assert_custom(r, BridgeError::WrongBridgeConfig);
 }
 
+/// A pending proposal that can never activate (an activation slot out of reach) is replaced by a new valid one.
 #[tokio::test]
-async fn propose_deposit_params_refuses_a_second_proposal_while_one_is_pending() {
+async fn propose_deposit_params_replaces_a_stuck_proposal() {
     let mut rig = Rig::with_queue();
     rig.params = new_params();
+    // The shape an earlier build let through: a proposal with no upper bound on its activation slot.
+    rig.set_queue(Some((&default_params(), u64::MAX)));
+    let mut ctx = rig.start().await;
+    ctx.warp_to_slot(100).unwrap();
+    let activation = 100 + CHALLENGE_WINDOW as u64;
+    rig.send(
+        &mut ctx,
+        rig.propose_ix(activation),
+        "ProposeDepositParams (replace)",
+    )
+    .await
+    .expect("a new valid proposal must replace the stuck one");
+    let f = read_queue(&mut ctx, rig.queue.0).await;
+    assert_eq!(f.pending, to_layout(&new_params()));
+    assert_eq!(f.activation_slot, activation);
+    assert_eq!(
+        f.params,
+        to_layout(&default_params()),
+        "live parameters must not move"
+    );
+
+    // And the replacement activates.
+    ctx.warp_to_slot(activation).unwrap();
+    rig.send(&mut ctx, rig.activate_ix(), "ActivateDepositParams")
+        .await
+        .expect("the replacement must activate");
+    let f = read_queue(&mut ctx, rig.queue.0).await;
+    assert_eq!(f.params, to_layout(&new_params()));
+    assert_eq!(f.activation_slot, 0);
+}
+
+/// A pending proposal whose fee recipient was sabotaged after the proposal (it can no longer activate) is
+/// replaced by a proposal naming another recipient.
+#[tokio::test]
+async fn propose_deposit_params_replaces_a_proposal_whose_fee_recipient_was_sabotaged() {
+    let mut rig = Rig::with_queue();
+    let mut stuck = new_params();
+    let sabotaged = Pubkey::new_from_array([0xab; 32]);
+    stuck.fee_recipient = sabotaged;
+    rig.set_queue(Some((&stuck, 200)));
+    rig.params = new_params();
+    let mut ctx = rig.start().await;
+    // The holder of the proposed fee recipient's key hands the account to the sysvar owner.
+    let mut a = fee_recipient_account(1_000_000);
+    a.owner = solana_sdk_ids::sysvar::id();
+    ctx.set_account(&sabotaged, &a.into());
+    ctx.warp_to_slot(200).unwrap();
+    // Activation of the stuck proposal fails.
+    let mut ix = rig.activate_ix();
+    ix.accounts[2] = AccountMeta::new_readonly(sabotaged, false);
+    let r = rig
+        .send(&mut ctx, ix, "ActivateDepositParams (sabotaged)")
+        .await;
+    assert_custom(r, BridgeError::FeeRecipientNotPlain);
+    // A new proposal replaces it, and activates.
+    let activation = 200 + CHALLENGE_WINDOW as u64;
+    rig.send(
+        &mut ctx,
+        rig.propose_ix(activation),
+        "ProposeDepositParams (replace)",
+    )
+    .await
+    .expect("a new valid proposal must replace the sabotaged one");
+    ctx.warp_to_slot(activation).unwrap();
+    rig.send(&mut ctx, rig.activate_ix(), "ActivateDepositParams")
+        .await
+        .expect("the replacement must activate");
+    let f = read_queue(&mut ctx, rig.queue.0).await;
+    assert_eq!(f.params, to_layout(&new_params()));
+}
+
+/// A replacement still has to be valid, and a refused one leaves the pending proposal as it was.
+#[tokio::test]
+async fn propose_deposit_params_refuses_an_invalid_replacement_and_keeps_the_pending_one() {
+    let mut rig = Rig::with_queue();
     rig.set_queue(Some((&new_params(), 500)));
+    rig.params = new_params();
+    rig.params.inclusion_deadline_secs = 3_599;
     let mut ctx = rig.start().await;
     ctx.warp_to_slot(100).unwrap();
     let r = rig
         .send(
             &mut ctx,
-            rig.propose_ix(1_000),
+            rig.propose_ix(100 + CHALLENGE_WINDOW as u64),
             "ProposeDepositParams (refused)",
         )
         .await;
-    assert_custom(r, BridgeError::PendingParamsExist);
+    assert_custom(r, BridgeError::DeadlineBelowFloor);
     let f = read_queue(&mut ctx, rig.queue.0).await;
-    assert_eq!(
-        f.activation_slot, 500,
-        "the pending proposal must be untouched"
-    );
+    assert_eq!(f.pending, to_layout(&new_params()));
+    assert_eq!(f.activation_slot, 500);
+}
+
+/// An activation slot is at most two challenge windows away: exactly two is accepted, one more is refused, and
+/// so is the far-future value that used to freeze the queue's parameters.
+#[tokio::test]
+async fn propose_deposit_params_accepts_exactly_two_windows_and_refuses_beyond() {
+    let mut rig = Rig::with_queue();
+    rig.params = new_params();
+    let mut ctx = rig.start().await;
+    ctx.warp_to_slot(100).unwrap();
+    let two = 100 + 2 * CHALLENGE_WINDOW as u64;
+    let r = rig
+        .send(
+            &mut ctx,
+            rig.propose_ix(two + 1),
+            "ProposeDepositParams (too late)",
+        )
+        .await;
+    assert_custom(r, BridgeError::ActivationTooLate);
+    let r = rig
+        .send(
+            &mut ctx,
+            rig.propose_ix(u64::MAX),
+            "ProposeDepositParams (u64::MAX)",
+        )
+        .await;
+    assert_custom(r, BridgeError::ActivationTooLate);
+    let f = read_queue(&mut ctx, rig.queue.0).await;
+    assert_eq!(f.activation_slot, 0, "a refused proposal records nothing");
+    rig.send(
+        &mut ctx,
+        rig.propose_ix(two),
+        "ProposeDepositParams (two windows)",
+    )
+    .await
+    .expect("an activation exactly two windows away must be accepted");
+    let f = read_queue(&mut ctx, rig.queue.0).await;
+    assert_eq!(f.activation_slot, two);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1309,6 +1471,61 @@ async fn activate_deposit_params_refuses_a_fee_recipient_account_that_is_not_the
         .send(&mut ctx, ix, "ActivateDepositParams (refused)")
         .await;
     assert_custom(r, BridgeError::FeeRecipientNotRentExempt);
+}
+
+/// The bounds are checked again at activation, on the pending values themselves: a proposal that is out of
+/// bounds when it activates (for instance after an upgrade tightened them) is refused and changes nothing.
+async fn activation_refused_with_pending(pending: DepositParamsArgs, want: BridgeError) {
+    let mut rig = Rig::with_queue();
+    rig.set_queue(Some((&pending, 200)));
+    let mut ctx = rig.start().await;
+    ctx.warp_to_slot(200).unwrap();
+    let r = rig
+        .send(
+            &mut ctx,
+            rig.activate_ix(),
+            "ActivateDepositParams (refused)",
+        )
+        .await;
+    assert_custom(r, want);
+    let f = read_queue(&mut ctx, rig.queue.0).await;
+    assert_eq!(f.params, to_layout(&default_params()));
+    assert_eq!(f.pending, to_layout(&pending));
+    assert_eq!(f.activation_slot, 200);
+}
+
+#[tokio::test]
+async fn activate_deposit_params_refuses_a_pending_deadline_out_of_bounds() {
+    let mut p = new_params();
+    p.inclusion_deadline_secs = 3_599;
+    activation_refused_with_pending(p, BridgeError::DeadlineBelowFloor).await;
+    let mut p = new_params();
+    p.inclusion_deadline_secs = 86_401;
+    activation_refused_with_pending(p, BridgeError::DeadlineAboveCeiling).await;
+}
+
+#[tokio::test]
+async fn activate_deposit_params_refuses_pending_caps_out_of_bounds() {
+    let mut p = new_params();
+    p.max_per_batch = 257;
+    activation_refused_with_pending(p, BridgeError::MaxPerBatchTooLarge).await;
+    let mut p = new_params();
+    p.max_per_block = 0;
+    activation_refused_with_pending(p, BridgeError::MaxPerBlockOutOfRange).await;
+    let mut p = new_params();
+    p.max_per_batch = 8;
+    p.max_per_block = 9;
+    activation_refused_with_pending(p, BridgeError::MaxPerBlockOutOfRange).await;
+}
+
+#[tokio::test]
+async fn activate_deposit_params_refuses_a_pending_minimum_or_fee_out_of_bounds() {
+    let mut p = new_params();
+    p.min_amount = 0;
+    activation_refused_with_pending(p, BridgeError::MinAmountZero).await;
+    let mut p = new_params();
+    p.fee_lamports = 10_000_001;
+    activation_refused_with_pending(p, BridgeError::FeeTooHigh).await;
 }
 
 #[tokio::test]

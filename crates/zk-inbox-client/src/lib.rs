@@ -42,10 +42,11 @@ pub fn batch_account_index(ix: &InboxIx) -> Option<usize> {
         InboxIx::Close => Some(2),       // close_chunk_ix: [authority, chunk, batch_acct, root]
         InboxIx::OpenBatch { .. } => Some(1), // open_batch_ix: [payer, batch_pda, root, cursor, system_program]
         InboxIx::GrowBatch { .. } => Some(1), // grow_batch_ix: [payer, batch_pda, system_program]
-        InboxIx::AbandonBatch => Some(1),     // abandon_batch_ix: [authority, batch_pda]
-        InboxIx::CloseBatch => Some(1), // close_batch_ix: [authority, batch_pda, root, cursor]
+        InboxIx::AbandonBatch => Some(1), // abandon_batch_ix: [authority, batch_pda, previous_batch]
+        InboxIx::CloseBatch => Some(1),   // close_batch_ix: [authority, batch_pda, root, cursor]
         InboxIx::SealLeaf { .. } => Some(0), // seal_leaf_ix: [batch_acct, chunk]
         InboxIx::FinalizeBatch { .. } => Some(0), // finalize_batch_ix: [batch_acct, authority]
+        InboxIx::FinalizeBatchV2 { .. } => Some(0), // finalize_batch_v2_ix: [batch_acct, authority, cursor, ..]
         _ => None,
     }
 }
@@ -357,10 +358,9 @@ pub fn seal_leaf_ix(
     )
 }
 
-/// Authority-gated: `authority` must be the batch's stored `authority` (the value `OpenBatch` wrote) and must sign
-/// — otherwise a third party could finalize a later batch id ahead of the real poster's own, stranding it.
-/// `step = 0` means "transform every remaining leaf, then combine, in this call" — use a smaller `step` to spread
-/// the transform pass across several transactions for large batches; every step call needs the signer.
+/// The retired `FinalizeBatch` (6): the program refuses it by name (`RetiredInstruction`), so a transaction
+/// built with this fails on chain. It stays so recorded history, the watcher's decoder and the tests that
+/// check the refusal can still name the instruction; build [`finalize_batch_v2_ix`] to finalize.
 pub fn finalize_batch_ix(
     program_id: &Pubkey,
     authority: &Pubkey,
@@ -377,6 +377,84 @@ pub fn finalize_batch_ix(
             AccountMeta::new_readonly(*authority, true),
         ],
         InboxIx::FinalizeBatch { step },
+    )
+}
+
+/// `["exit_config", chain_id]` under `settlement_program` — the single definition is
+/// `rome_zk_layouts::exit::exit_config::pda`.
+pub fn exit_config_pda(settlement_program: &Pubkey, chain_id: u64) -> (Pubkey, u8) {
+    rome_zk_layouts::exit::exit_config::pda(settlement_program, chain_id)
+}
+
+/// Authority-gated: `authority` must be the batch's stored `authority` (the value `OpenBatch` wrote) and must sign
+/// — otherwise a third party could finalize a later batch id ahead of the real poster's own, stranding it.
+/// `step = 0` means "transform every remaining leaf, then combine, in this call" — use a smaller `step` to spread
+/// the transform pass across several transactions for large batches; every step call needs the signer.
+///
+/// `deposit_to` ends the batch's deposit range, which starts at the cursor's `deposit_next`; a chain with no
+/// deposits passes the cursor's `deposit_next` itself (0 until a deposit has been taken), an empty range.
+/// `bridge_program` is `exit_config.bridge_program` when the chain has one, so the builder can name the queue and
+/// the two records the program reads: `record(deposit_to - 1)` and `record(deposit_to)`. With `None` the queue and
+/// both record slots carry the system program, which the program never reads on a chain with no queue. A slot the
+/// program does not read for this range (`record(deposit_to - 1)` when `deposit_to` is 0) carries the queue's
+/// address. The last account is the previous batch, `batch_pda(.., batch - 1)`, which the program requires to be
+/// final or absent so deposit ranges follow batch order; for batch 0 it carries the system program, which the
+/// program does not read. Only the call that completes the batch reads the six accounts after `authority`;
+/// earlier steps carry them anyway so every step has one shape.
+///
+/// Accounts: `[batch (w), authority (signer), cursor (w), exit_config, deposit_queue, record(to - 1),
+/// record(to), previous batch]`. A v1 cursor must already hold the rent for 69 bytes when the first V2 completes a batch: send it a
+/// plain system transfer of the shortfall first.
+#[allow(clippy::too_many_arguments)]
+pub fn finalize_batch_v2_ix(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    settlement_program: &Pubkey,
+    chain_id: u64,
+    batch: u64,
+    step: u32,
+    deposit_to: u64,
+    bridge_program: Option<&Pubkey>,
+) -> solana_program::instruction::Instruction {
+    use rome_zk_layouts::deposit_queue::{deposit_queue, deposit_record};
+    let (batch_acct, _) = batch_pda(program_id, settlement_program, chain_id, batch);
+    let (cursor, _) = cursor_pda(program_id, settlement_program, chain_id);
+    let (exit_config, _) = exit_config_pda(settlement_program, chain_id);
+    let sp = settlement_program.to_bytes();
+    let (queue, record_prev, record_to) = match bridge_program {
+        Some(bridge) => {
+            let queue = deposit_queue::pda(bridge, &sp, chain_id).0;
+            let record_at = |index: u64| deposit_record::pda(bridge, &sp, chain_id, index).0;
+            (
+                queue,
+                deposit_to.checked_sub(1).map_or(queue, record_at),
+                record_at(deposit_to),
+            )
+        }
+        None => (
+            system_program::id(),
+            system_program::id(),
+            system_program::id(),
+        ),
+    };
+    let previous_batch = batch
+        .checked_sub(1)
+        .map_or_else(system_program::id, |prev| {
+            batch_pda(program_id, settlement_program, chain_id, prev).0
+        });
+    ix(
+        program_id,
+        vec![
+            AccountMeta::new(batch_acct, false),
+            AccountMeta::new_readonly(*authority, true),
+            AccountMeta::new(cursor, false),
+            AccountMeta::new_readonly(exit_config, false),
+            AccountMeta::new_readonly(queue, false),
+            AccountMeta::new_readonly(record_prev, false),
+            AccountMeta::new_readonly(record_to, false),
+            AccountMeta::new_readonly(previous_batch, false),
+        ],
+        InboxIx::FinalizeBatchV2 { step, deposit_to },
     )
 }
 
@@ -403,7 +481,11 @@ pub fn close_batch_ix(
 }
 
 /// Authority-only; only while the batch is not yet finalized. Returns rent for a batch id that was opened but never
-/// posted.
+/// posted. The last account is the previous batch, `batch_pda(.., batch - 1)`, which the program requires to be final
+/// or absent so an absent batch always means everything before it is settled or gone; for batch 0 it carries the
+/// system program, which the program does not read.
+///
+/// Accounts: `[authority (signer), batch (w), previous batch]`.
 pub fn abandon_batch_ix(
     program_id: &Pubkey,
     authority: &Pubkey,
@@ -412,11 +494,17 @@ pub fn abandon_batch_ix(
     batch: u64,
 ) -> solana_program::instruction::Instruction {
     let (batch_acct, _) = batch_pda(program_id, settlement_program, chain_id, batch);
+    let previous_batch = batch
+        .checked_sub(1)
+        .map_or_else(system_program::id, |prev| {
+            batch_pda(program_id, settlement_program, chain_id, prev).0
+        });
     ix(
         program_id,
         vec![
             AccountMeta::new(*authority, true),
             AccountMeta::new(batch_acct, false),
+            AccountMeta::new_readonly(previous_batch, false),
         ],
         InboxIx::AbandonBatch,
     )
@@ -1230,6 +1318,16 @@ mod tests {
             finalize_batch_ix(&program_id, &authority, &settlement_program, 7, 3, 0),
             close_batch_ix(&program_id, &authority, &settlement_program, 7, 3),
             abandon_batch_ix(&program_id, &authority, &settlement_program, 7, 3),
+            finalize_batch_v2_ix(
+                &program_id,
+                &authority,
+                &settlement_program,
+                7,
+                3,
+                0,
+                0,
+                None,
+            ),
         ];
 
         for ix in &cases {
@@ -1251,7 +1349,7 @@ mod tests {
         // Every case above touches a chunk, a batch, or both -- assert the helpers actually found
         // something for each, not just that any hit was correct when found.
         let with_chunk = [0, 1, 2, 3, 6]; // Open, Write, Seal, Close, SealLeaf
-        let with_batch = [0, 3, 4, 5, 6, 7, 8, 9]; // Open, Close, OpenBatch, Grow, SealLeaf, Finalize, Close/Abandon Batch
+        let with_batch = [0, 3, 4, 5, 6, 7, 8, 9, 10]; // Open, Close, OpenBatch, Grow, SealLeaf, Finalize, Close/Abandon Batch, FinalizeV2
         for i in with_chunk {
             let decoded = decode_instruction(&cases[i].data).unwrap();
             assert!(

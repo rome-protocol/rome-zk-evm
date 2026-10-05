@@ -666,6 +666,16 @@ pub(crate) mod test_support {
             chain
         }
 
+        /// A chain whose `exit_config` names the bridge but whose deposit queue was never created: what a chain
+        /// looks like when the operator has turned deposits on in the sequencer before running `deposit-queue init`.
+        pub fn without_queue() -> Self {
+            let chain = Self::new(0);
+            let (queue_key, _) =
+                deposit_queue::pda(&chain.bridge, &chain.settlement.to_bytes(), CHAIN_ID);
+            chain.reader.accounts.lock().unwrap().remove(&queue_key);
+            chain
+        }
+
         /// The queue's hash-chain value before deposit `index`, for the records `put_record` writes.
         pub fn hash_before(&self, index: u64) -> [u8; 32] {
             let settlement = self.settlement.to_bytes();
@@ -943,6 +953,32 @@ mod tests {
         poller.poll_once().await.unwrap();
         assert!(feed.next_block().is_empty());
         assert_eq!(feed.oldest_waiting_enqueue_ts(), None);
+    }
+
+    /// The chain has an exit config that names the bridge, but no queue was created: a poll succeeds, reads
+    /// nothing else, and leaves the feed exactly as it was. A queue created later is picked up by the next poll.
+    #[tokio::test]
+    async fn a_chain_with_no_queue_yet_leaves_the_feed_untouched() {
+        let chain = MockChain::without_queue();
+        let feed = feed();
+        let mut poller = chain.poller(&feed);
+        for _ in 0..3 {
+            poller.poll_once().await.unwrap();
+        }
+        assert!(feed.next_block().is_empty());
+        assert_eq!(feed.oldest_waiting_enqueue_ts(), None);
+        assert_eq!(feed.metrics().finalized_count.get(), 0);
+        // Each poll read the exit config and the queue, one account each, and nothing else: no record, no cursor.
+        {
+            let calls = chain.reader.calls.lock().unwrap();
+            assert_eq!(calls.len(), 6);
+            assert!(calls.iter().all(|keys| keys.len() == 1));
+        }
+        // The operator creates the queue and one deposit lands: the same poller now credits it.
+        chain.set_queue(0, params(4), params(0), 0);
+        chain.deposit_up_to(1, 4, 1_757_000_000);
+        poller.poll_once().await.unwrap();
+        assert_eq!(indices(&feed.next_block()), vec![0]);
     }
 
     #[tokio::test]

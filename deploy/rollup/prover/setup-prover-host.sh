@@ -1,70 +1,180 @@
 #!/usr/bin/env bash
-# Sets up a fresh Ubuntu GPU host to run the rollup prover: the ZisK 1.2.0-alpha GPU build and its proving keys under
+# Sets up a fresh Ubuntu GPU host to run the rollup prover: the ZisK 1.3.1-alpha GPU build and its proving keys under
 # ZISK_HOME, an unlimited locked-memory limit, and Docker with the NVIDIA container toolkit. Run it once as root:
 #
 #   sudo ZISK_HOME=/opt/zisk bash setup-prover-host.sh
 #
 # It is safe to run again: a step that is already done is skipped, and a key set that is already installed is never
-# downloaded a second time (ziskup wipes and recreates its install directory on every run).
+# downloaded a second time.
+#
+# What is checked against the sha256 pins of the release, and when:
+#   - the installer (ziskup), before it is run;
+#   - both key archives, before either is unpacked. The script downloads them itself and unpacks the checked files;
+#     ziskup runs with --nokey and downloads no key;
+#   - the two GPU binaries cargo-zisk and cargo-zisk-dev, after ziskup has installed them and before this script runs
+#     either of them.
+# Nothing else is checked. In particular, ziskup downloads the release's binary archive (cargo_zisk_linux_amd64.tar.gz)
+# with no hash check, unpacks it under ZISK_HOME, and runs `cargo-zisk toolchain install` from it as root, all before
+# this script checks any binary. The rest of that archive (for example zisk-worker, zisk-coordinator, ziskemu, the libraries, the ZisK sources) is
+# never checked.
 #
 # Modes:
 #   (none)    install everything that is missing, then run the final checks
-#   --check   change nothing; run the final checks only (GPU driver, GPU memory, cargo-zisk is the GPU build, the
+#   --check-ziskup
+#             change nothing; check the installer at ZISKUP_BIN against the sha256 pinned for this release, and stop
+#   --check-binaries
+#             change nothing; check cargo-zisk and cargo-zisk-dev under ZISK_HOME against the pinned sha256 of the
+#             release's GPU binaries, and stop
+#   --check-archives
+#             change nothing; check the two key archives in DOWNLOAD_DIR against their pinned sha256, and stop
+#   --check   change nothing; run the final checks only (GPU driver, GPU memory, cargo-zisk is the pinned GPU build, the
 #             proving keys against keys.sha256, the memlock limit, Docker with the NVIDIA runtime)
 #
 # Every refusal is a named line on stderr starting with its name, and a non-zero exit:
 #   NotRoot, UnsupportedPlatform, NoGpuDriver, GpuDriverTooOld, GpuMemoryTooSmall, NotEnoughDisk, ZiskupFailed,
-#   KeysShaMismatch, NotGpuBuild, WrongZiskVersion, MemlockNotUnlimited, NoNvidiaDockerRuntime
+#   ZiskupHashMismatch, ZiskPinMissing, KeysShaMismatch, NotGpuBuild, WrongZiskVersion, MemlockNotUnlimited,
+#   NoNvidiaDockerRuntime, KeyArchiveHashMismatch, KeyArchiveMissing, BinaryHashMismatch, KeysUrlMissing
 #
-# What it needs from you: an NVIDIA GPU with more than 30 GB of memory (a 24 GB card is not enough), an NVIDIA driver
+# What it needs from you: an NVIDIA GPU with at least 30,720 MiB (32.2 GB) of memory (a 24 GB card is not enough), an NVIDIA driver
 # at version 525.60.13 or later (install it first, see docs/PROVER-HOST.md; INSTALL_NVIDIA_DRIVER=1 installs the
-# distribution's recommended driver and then stops so you can reboot), and about 125 GB of free disk at ZISK_HOME
-# (about 26 GB is downloaded into ZISK_HOME and about 81 GB is installed; the download is deleted afterwards).
+# distribution's recommended driver and then stops so you can reboot), and about 125 GB of free disk at ZISK_HOME.
+# All sizes are decimal gigabytes (GB). About 27 GB is downloaded into DOWNLOAD_DIR and deleted afterwards; the
+# unpacked keys take about 42 GB, about 62 GB once the constant trees are generated, and about 102 GB after the first
+# proof.
 #
 # Settings (environment):
 #   ZISK_HOME             where ZisK and the keys are installed (default /opt/zisk)
-#   ZISK_VERSION          the ZisK release (default 1.2.0-alpha; the keys manifest is pinned to this release's keys)
+#   ZISK_VERSION          the ZisK release (default 1.3.1-alpha; the keys manifest is pinned to this release's keys)
+#   PIN_FILE              the release's pin file (default guest-build/zisk/<ZISK_VERSION>.env, next to this folder); the
+#                         ziskup sha256 and the commit of the release are read from it
+#   ZISKUP_SHA256         the sha256 the installer must have (default: ZISKUP_SHA256 in the pin file)
+#   ZISK_COMMIT           the commit of the release (default: ZISK_COMMIT in the pin file); cargo-zisk's version line
+#                         must carry its first seven digits
+#   HOST_PIN_FILE         the pins of the downloads this script checks itself (default host-pins/<ZISK_VERSION>.env next
+#                         to this script): the sha256 of the two key archives and of the GPU cargo-zisk and
+#                         cargo-zisk-dev inside the release's binary archive
+#   ARCHIVE_SHA256, ARCHIVE_PLONK_SHA256, GPU_CARGO_ZISK_SHA256, GPU_CARGO_ZISK_DEV_SHA256
+#                         override the matching line of HOST_PIN_FILE
+#   KEYS_URL_BASE         where the key archives are downloaded from (default: the BUCKET_URL line of the checked ziskup, the
+#                         place ziskup itself downloads them from; the script stops by name if neither gives a URL)
+#   DOWNLOAD_DIR          where the key archives are downloaded to (default ZISK_HOME/.downloads); it must be on a disk
+#                         with room for 27 GB
 #   MANIFEST              the key hashes to check against (default: keys.sha256 next to this script)
-#   MIN_FREE_GB           free disk required at ZISK_HOME before installing (default 125)
-#   MIN_GPU_MIB           GPU memory required, in MiB (default 30720, which is 30 GiB)
+#   MIN_FREE_GB           free disk required at ZISK_HOME before installing, in GB (default 125)
+#   MIN_GPU_MIB           GPU memory required, in MiB, the unit nvidia-smi reports (default 30720, which is 32.2 GB)
 #   INSTALL_NVIDIA_DRIVER set to 1 to install the recommended NVIDIA driver when none is present
 set -euo pipefail
 export LC_ALL=C
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ZISK_HOME="${ZISK_HOME:-/opt/zisk}"
-ZISK_VERSION="${ZISK_VERSION:-1.2.0-alpha}"
+ZISK_VERSION="${ZISK_VERSION:-1.3.1-alpha}"
 MANIFEST="${MANIFEST:-$SCRIPT_DIR/keys.sha256}"
 MIN_FREE_GB="${MIN_FREE_GB:-125}"
 MIN_GPU_MIB="${MIN_GPU_MIB:-30720}"
 NVIDIA_MIN_VERSION="525.60.13"
 ZISKUP_BIN="${ZISKUP_BIN:-/usr/local/bin/ziskup}"
+PIN_FILE="${PIN_FILE:-$SCRIPT_DIR/../guest-build/zisk/$ZISK_VERSION.env}"
+HOST_PIN_FILE="${HOST_PIN_FILE:-$SCRIPT_DIR/host-pins/$ZISK_VERSION.env}"
+KEYS_URL_BASE="${KEYS_URL_BASE:-}"
+DOWNLOAD_DIR="${DOWNLOAD_DIR:-$ZISK_HOME/.downloads}"
 LIMITS_CONF="${LIMITS_CONF:-/etc/security/limits.d/90-zisk-memlock.conf}"
 SYSTEMD_CONF="${SYSTEMD_CONF:-/etc/systemd/system.conf.d/90-zisk-memlock.conf}"
 # The prover container runs as this user; it must be able to write the proving cache under ZISK_HOME/cache.
 CONTAINER_UID="${CONTAINER_UID:-999}"
 
 MODE="install"
-case "${1:-}" in
-  "") ;;
-  --check) MODE="check" ;;
-  *) echo "usage: setup-prover-host.sh [--check]" >&2; exit 1 ;;
-esac
+FETCHED_TMP=""
 
 log() { echo "[setup-prover-host] $*"; }
 refuse() { echo "$1: $2" >&2; exit 1; }
 
+# The pins of this release: a KEY=VALUE line of a pin file, read as text (nothing in it is run by a shell). The release's
+# own pin file (PIN_FILE, shared with the guest build) holds the ziskup sha256 and the commit; the host pin file
+# (HOST_PIN_FILE) holds the hashes of what only this script downloads or installs.
+pin_in() { # $1 = pin file, $2 = key -> its value, or nothing
+  [[ -f "$1" ]] || return 0
+  { grep -E "^$2=" "$1" || true; } | head -n1 | cut -d= -f2-
+}
+pin() { pin_in "$PIN_FILE" "$1"; }
+host_pin() { pin_in "$HOST_PIN_FILE" "$1"; }
+ZISKUP_SHA256="${ZISKUP_SHA256:-$(pin ZISKUP_SHA256)}"
+ZISK_COMMIT="${ZISK_COMMIT:-$(pin ZISK_COMMIT)}"
+ZISKUP_URL="${ZISKUP_URL:-$(pin ZISKUP_URL)}"
+# The sha256 of the two key archives, and of the GPU cargo-zisk and cargo-zisk-dev inside the release's binary archive.
+ARCHIVE_SHA256="${ARCHIVE_SHA256:-$(host_pin ARCHIVE_SHA256)}"
+ARCHIVE_PLONK_SHA256="${ARCHIVE_PLONK_SHA256:-$(host_pin ARCHIVE_PLONK_SHA256)}"
+GPU_CARGO_ZISK_SHA256="${GPU_CARGO_ZISK_SHA256:-$(host_pin GPU_CARGO_ZISK_SHA256)}"
+GPU_CARGO_ZISK_DEV_SHA256="${GPU_CARGO_ZISK_DEV_SHA256:-$(host_pin GPU_CARGO_ZISK_DEV_SHA256)}"
+ZISKUP_URL="${ZISKUP_URL:-https://raw.githubusercontent.com/0xPolygonHermez/zisk/v${ZISK_VERSION}/ziskup/ziskup}"
+
+sha256_of() { # $1 = file -> its sha256
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+  else shasum -a 256 "$1" | awk '{print $1}'; fi
+}
+
+# The installer is downloaded and then run as root, so it is checked against the sha256 pinned for the release before
+# every run, whether this script fetched it or it was already on the host.
+verify_ziskup() { # $1 = the file to check
+  [[ "$ZISKUP_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+    || refuse ZiskPinMissing "no ziskup sha256 is pinned for ZisK $ZISK_VERSION (looked in $PIN_FILE; set ZISKUP_SHA256 to override); not running an installer that cannot be checked"
+  local got
+  got="$(sha256_of "$1")"
+  [[ "$got" == "$ZISKUP_SHA256" ]] \
+    || refuse ZiskupHashMismatch "$1 hashes to $got but ZisK $ZISK_VERSION pins $ZISKUP_SHA256; not running it. If it is an installer of another release, move it away and run this script again"
+}
+
+# Where the key archives are downloaded from: KEYS_URL_BASE if it is set, otherwise the BUCKET_URL line of the ziskup of
+# this release, which is the place ziskup itself downloads the key archives from. The line is read as text from the
+# installer after verify_ziskup has checked it (nothing in it is run or expanded); a value that is not a plain https:// or
+# file:// URL is not used. With neither, the script stops by name rather than guess a host.
+resolve_keys_url() { # $1 = the checked ziskup file
+  [[ -z "$KEYS_URL_BASE" ]] || return 0
+  local line plain='^(https|file)://[^[:space:]$"'"'"'`\\]+$'
+  line="$({ grep -E '^BUCKET_URL=' "$1" || true; } | head -n1 | cut -d= -f2-)"
+  line="${line%\"}"; line="${line#\"}"; line="${line%/}"
+  if [[ "$line" =~ $plain ]]; then
+    KEYS_URL_BASE="$line"
+    return 0
+  fi
+  refuse KeysUrlMissing "no download location for the key archives: KEYS_URL_BASE is not set and $1 has no plain BUCKET_URL line (found: '${line:-nothing}'); set KEYS_URL_BASE to the folder that holds the key archives"
+}
+
+require_pin() { # $1 = the pin's name, $2 = its value
+  [[ "$2" =~ ^[0-9a-f]{64}$ ]] \
+    || refuse ZiskPinMissing "no $1 is pinned for ZisK $ZISK_VERSION (looked in $HOST_PIN_FILE; set $1 to override); not using a download that cannot be checked"
+}
+
+# A key archive is checked before it is unpacked: it holds the key files and the files ziskup generates the constant
+# trees from, and the constant-tree step runs native code over them.
+verify_archive() { # $1 = the archive file, $2 = its pin's name, $3 = the sha256 it must have
+  require_pin "$2" "$3"
+  local got
+  got="$(sha256_of "$1")"
+  [[ "$got" == "$3" ]] \
+    || refuse KeyArchiveHashMismatch "$1 hashes to $got but ZisK $ZISK_VERSION pins $3; not unpacking it"
+}
+
+# The GPU binaries ziskup installs come from the release's binary archive, which ziskup downloads and unpacks itself with
+# no hash check. Only these two files of it are checked, here, against the sha256 of the GPU binary inside that archive:
+# after ziskup has installed them and before this script runs either of them.
+verify_binaries() {
+  local name var f want got
+  for name in cargo-zisk cargo-zisk-dev; do
+    if [[ "$name" == cargo-zisk ]]; then var=GPU_CARGO_ZISK_SHA256; else var=GPU_CARGO_ZISK_DEV_SHA256; fi
+    f="$ZISK_HOME/bin/$name"
+    [[ -f "$f" ]] || refuse NotGpuBuild "$f does not exist; ZisK is not installed under $ZISK_HOME"
+    want="${!var}"
+    require_pin "$var" "$want"
+    got="$(sha256_of "$f")"
+    [[ "$got" == "$want" ]] \
+      || refuse BinaryHashMismatch "$f hashes to $got but the GPU build of ZisK $ZISK_VERSION pins $want; not running it. Move $ZISK_HOME away and run this script again"
+  done
+}
+
 version_at_least() { # $1 = installed, $2 = minimum
   [[ "$(printf '%s\n' "$2" "$1" | sort -V | head -n1)" == "$2" ]]
 }
-
-# --- 0. platform -----------------------------------------------------------------------------------------------
-if [[ "$MODE" == "install" && "${EUID:-$(id -u)}" -ne 0 ]]; then
-  refuse NotRoot "run this as root (sudo bash $0); it installs packages and writes system limits"
-fi
-if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
-  refuse UnsupportedPlatform "ZisK's GPU build runs on Linux x86_64 only (found $(uname -s) $(uname -m))"
-fi
 
 # --- 1. NVIDIA driver and GPU memory ---------------------------------------------------------------------------
 check_gpu() {
@@ -74,11 +184,13 @@ check_gpu() {
   version_at_least "$drv" "$NVIDIA_MIN_VERSION" \
     || refuse GpuDriverTooOld "NVIDIA driver $drv is older than the minimum $NVIDIA_MIN_VERSION that ZisK's GPU build needs"
   mem="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | sort -n | tail -n1 | tr -d ' ')"
+  # nvidia-smi reports MiB; every size in this script's messages is in decimal GB.
   [[ "$mem" =~ ^[0-9]+$ && "$mem" -ge "$MIN_GPU_MIB" ]] \
-    || refuse GpuMemoryTooSmall "the largest GPU has ${mem:-unknown} MiB; the final proof step needs more than 30 GB (a 24 GB card is not enough)"
-  log "GPU ok: $(nvidia-smi --query-gpu=name --format=csv,noheader | head -n1), driver $drv, ${mem} MiB"
+    || refuse GpuMemoryTooSmall "the largest GPU has $( [[ "$mem" =~ ^[0-9]+$ ]] && echo "$((mem * 1048576 / 1000000000)) GB" || echo unknown ); the final proof step needs more than 30 GB (a 24 GB card is not enough)"
+  log "GPU ok: $(nvidia-smi --query-gpu=name --format=csv,noheader | head -n1), driver $drv, $((mem * 1048576 / 1000000000)) GB"
 }
 
+ensure_gpu() {
 if ! command -v nvidia-smi >/dev/null 2>&1; then
   if [[ "$MODE" == "install" && "${INSTALL_NVIDIA_DRIVER:-0}" == "1" ]]; then
     log "no NVIDIA driver found; installing the recommended one"
@@ -91,6 +203,7 @@ if ! command -v nvidia-smi >/dev/null 2>&1; then
   refuse NoGpuDriver "nvidia-smi not found. Install an NVIDIA driver at version $NVIDIA_MIN_VERSION or later (on Ubuntu: sudo ubuntu-drivers install, then reboot) or run with INSTALL_NVIDIA_DRIVER=1"
 fi
 check_gpu
+}
 
 # --- 2. packages, memlock, Docker and the NVIDIA container toolkit -----------------------------------------------
 check_memlock() {
@@ -152,10 +265,56 @@ keys_state() { # prints the check-keys.sh exit code
   echo "$rc"
 }
 
-free_gb_at() { # the nearest existing parent of $1
+free_gb_at() { # the free space at the nearest existing parent of $1, in decimal GB (df -k counts 1024-byte blocks)
   local d="$1"
   while [[ ! -d "$d" ]]; do d="$(dirname "$d")"; done
-  df -P -BG "$d" | awk 'NR==2 {gsub("G","",$4); print $4}'
+  df -Pk "$d" | awk 'NR==2 {printf "%d\n", $4 * 1024 / 1000000000}'
+}
+
+# Downloads one key archive into DOWNLOAD_DIR and leaves it there only once it has the pinned hash. The download goes to a
+# .part file, which a run that was cut short resumes; the name without .part exists only for a checked archive.
+fetch_archive() { # $1 = the archive's file name, $2 = its pin's name, $3 = the sha256 it must have
+  local name="$1" file="$DOWNLOAD_DIR/$1" part="$DOWNLOAD_DIR/$1.part" rc=0 got
+  require_pin "$2" "$3"
+  if [[ -f "$file" && "$(sha256_of "$file")" == "$3" ]]; then
+    log "$name is already downloaded and matches its pin"
+    return 0
+  fi
+  rm -f "$file"
+  log "downloading $name"
+  curl -fL --retry 3 -C - -o "$part" "$KEYS_URL_BASE/$name" || rc=$?
+  [[ -f "$part" ]] || refuse ZiskupFailed "could not download $KEYS_URL_BASE/$name"
+  got="$(sha256_of "$part")"
+  if [[ "$got" != "$3" ]]; then
+    # A download that stopped early has the wrong hash too, but it is not a bad archive: keep it to resume.
+    [[ $rc -eq 0 ]] || refuse ZiskupFailed "could not finish downloading $KEYS_URL_BASE/$name (curl exit $rc); run this script again to resume, or delete $part to start over"
+    rm -f "$part"
+    refuse KeyArchiveHashMismatch "$name hashes to $got but ZisK $ZISK_VERSION pins $3; not unpacking it"
+  fi
+  mv "$part" "$file"
+}
+
+# The proving key, then the PLONK key, unpacked from the archives checked above. This is what ziskup would download and
+# unpack itself (it checks only an md5 that comes from the same bucket as the archive).
+install_keys() {
+  local pk="zisk-provingkey-$ZISK_VERSION.tar.gz" snark="zisk-provingkey-plonk-$ZISK_VERSION.tar.gz" check_bin
+  log "unpacking the proving key into $ZISK_HOME"
+  rm -rf "$ZISK_HOME/provingKey" "$ZISK_HOME/verifyKey" "$ZISK_HOME/cache"
+  tar --no-same-owner --overwrite -xf "$DOWNLOAD_DIR/$pk" -C "$ZISK_HOME" \
+    || refuse ZiskupFailed "could not unpack $DOWNLOAD_DIR/$pk"
+  rm -f "$DOWNLOAD_DIR/$pk"
+  # The constant trees are generated from the key, by the binary checked above. --proving-key is explicit because the
+  # default is the home directory of whoever runs this, and under sudo that is root's.
+  check_bin="$ZISK_HOME/bin/cargo-zisk-dev"
+  log "generating the constant trees (about 3 minutes on 32 CPU cores)"
+  (cd "$ZISK_HOME" && ZISK_HOME="$ZISK_HOME" "$check_bin" check-setup --proving-key "$ZISK_HOME/provingKey" -a --gpu >/dev/null) \
+    || refuse ZiskupFailed "cargo-zisk-dev check-setup failed on the proving key"
+  log "unpacking the PLONK (snark) key into $ZISK_HOME"
+  rm -rf "$ZISK_HOME/provingKeySnark"
+  tar --no-same-owner --overwrite -xf "$DOWNLOAD_DIR/$snark" -C "$ZISK_HOME" \
+    || refuse ZiskupFailed "could not unpack $DOWNLOAD_DIR/$snark"
+  rm -f "$DOWNLOAD_DIR/$snark"
+  rmdir "$DOWNLOAD_DIR" 2>/dev/null || true
 }
 
 install_zisk() {
@@ -171,27 +330,36 @@ install_zisk() {
   local free
   free="$(free_gb_at "$ZISK_HOME")"
   [[ "$free" =~ ^[0-9]+$ && "$free" -ge "$MIN_FREE_GB" ]] \
-    || refuse NotEnoughDisk "$ZISK_HOME has ${free:-unknown} GB free; the keys need about 26 GB to download and about 81 GB installed (set MIN_FREE_GB to override the $MIN_FREE_GB GB check)"
+    || refuse NotEnoughDisk "$ZISK_HOME has ${free:-unknown} GB free; the keys need about 27 GB to download, about 42 GB unpacked, about 62 GB once the constant trees are generated and about 102 GB after the first proof (set MIN_FREE_GB to override the $MIN_FREE_GB GB check)"
 
-  if [[ ! -x "$ZISKUP_BIN" ]]; then
+  if [[ ! -e "$ZISKUP_BIN" ]]; then
+    # Fetch to a file of its own and check it there: an installer that fails the check never sits at $ZISKUP_BIN.
+    FETCHED_TMP="$(mktemp)"
     log "fetching ziskup v$ZISK_VERSION"
-    curl -fsSL -o "$ZISKUP_BIN" "https://raw.githubusercontent.com/0xPolygonHermez/zisk/v${ZISK_VERSION}/ziskup/ziskup"
-    chmod +x "$ZISKUP_BIN"
+    curl -fsSL -o "$FETCHED_TMP" "$ZISKUP_URL" || refuse ZiskupFailed "could not download $ZISKUP_URL"
+    verify_ziskup "$FETCHED_TMP"
+    install -m 0755 "$FETCHED_TMP" "$ZISKUP_BIN"
+    rm -f "$FETCHED_TMP"
   fi
-  mkdir -p "$ZISK_HOME"
+  verify_ziskup "$ZISKUP_BIN"
+  resolve_keys_url "$ZISKUP_BIN"
+  mkdir -p "$ZISK_HOME" "$DOWNLOAD_DIR"
+  # The key archives are downloaded and checked first, so a bad one stops the install before ziskup runs and before either
+  # archive is unpacked.
+  fetch_archive "zisk-provingkey-$ZISK_VERSION.tar.gz" ARCHIVE_SHA256 "$ARCHIVE_SHA256"
+  fetch_archive "zisk-provingkey-plonk-$ZISK_VERSION.tar.gz" ARCHIVE_PLONK_SHA256 "$ARCHIVE_PLONK_SHA256"
   # --prefix is what selects the install directory. ziskup exports a ZISK_HOME of its own but never reads one, so
-  # setting ZISK_HOME alone would install into the home directory of whoever runs it.
-  # ziskup downloads the key archives into the directory it is run from, so run it from ZISK_HOME: the download lands on
-  # the disk the free-space check above measured. rustup puts cargo on PATH under ~/.cargo/bin, which ziskup needs.
+  # setting ZISK_HOME alone would install into the home directory of whoever runs it. --nokey: ziskup installs the
+  # binaries only; the keys are the checked archives above. rustup puts cargo on PATH under ~/.cargo/bin, which ziskup
+  # needs (it runs `cargo-zisk toolchain install`).
   export PATH="$HOME/.cargo/bin:$PATH"
-  log "installing the GPU build and the proving key into $ZISK_HOME (about 26 GB to download)"
-  (cd "$ZISK_HOME" && "$ZISKUP_BIN" -v "$ZISK_VERSION" --gpu --provingkey -y --prefix "$ZISK_HOME") \
-    || refuse ZiskupFailed "ziskup -v $ZISK_VERSION --gpu --provingkey failed"
-  # The PLONK wrap needs a second key set. `ziskup setup_snark` has no --prefix; it installs into the directory in the
-  # ZISK_DIR environment variable, and into the home directory when that is unset.
-  log "installing the PLONK (snark) key"
-  (cd "$ZISK_HOME" && ZISK_DIR="$ZISK_HOME" "$ZISKUP_BIN" setup_snark) \
-    || refuse ZiskupFailed "ziskup setup_snark failed"
+  log "installing the GPU build into $ZISK_HOME"
+  (cd "$ZISK_HOME" && "$ZISKUP_BIN" -v "$ZISK_VERSION" --gpu --nokey -y --prefix "$ZISK_HOME") \
+    || refuse ZiskupFailed "ziskup -v $ZISK_VERSION --gpu --nokey failed"
+  # ziskup has already run an unchecked cargo-zisk (its toolchain step); from here on this script runs only the two
+  # binaries it has checked.
+  verify_binaries
+  install_keys
 }
 
 prepare_cache() {
@@ -204,7 +372,8 @@ prepare_cache() {
 # --- 4. the final checks -----------------------------------------------------------------------------------------
 final_checks() {
   local bin="$ZISK_HOME/bin/cargo-zisk" line state
-  [[ -x "$bin" ]] || refuse NotGpuBuild "$bin does not exist; ZisK is not installed under $ZISK_HOME"
+  # The binaries are hashed before either is run: the version line below is what a binary says about itself.
+  verify_binaries
   line="$("$bin" --version 2>&1 | head -n1)"
   case "$line" in
     *"[gpu]"*) ;;
@@ -212,6 +381,11 @@ final_checks() {
   esac
   [[ "$line" == *" $ZISK_VERSION "* ]] \
     || refuse WrongZiskVersion "$bin reports '$line'; this setup is for ZisK $ZISK_VERSION"
+  # The version line ends "(<first seven digits of the commit> <build date>)". Two builds can share a release name.
+  [[ "$ZISK_COMMIT" =~ ^[0-9a-f]{40}$ ]] \
+    || refuse ZiskPinMissing "no commit is pinned for ZisK $ZISK_VERSION (looked in $PIN_FILE; set ZISK_COMMIT to override)"
+  [[ "$line" == *"(${ZISK_COMMIT:0:7} "* ]] \
+    || refuse WrongZiskVersion "$bin reports '$line'; ZisK $ZISK_VERSION is built from commit ${ZISK_COMMIT:0:7}"
   log "cargo-zisk is the GPU build: $line"
 
   state="$(keys_state)"
@@ -224,14 +398,57 @@ final_checks() {
   log "all checks passed"
 }
 
-if [[ "$MODE" == "install" ]]; then
-  install_system
-  install_zisk
-  prepare_cache
-  # The limit is only read by new login sessions; the checks below would fail in this one. Say so rather than fail.
-  if [[ "$(ulimit -l)" != "unlimited" ]]; then
-    log "memlock is configured but not yet active in this shell; log out and back in, then run: sudo bash $0 --check"
-    SKIP_MEMLOCK_CHECK=1
+main() {
+  case "${1:-}" in
+    "") ;;
+    --check) MODE="check" ;;
+    --check-ziskup) MODE="check-ziskup" ;;
+    --check-binaries) MODE="check-binaries" ;;
+    --check-archives) MODE="check-archives" ;;
+    *) echo "usage: setup-prover-host.sh [--check | --check-ziskup | --check-binaries | --check-archives]" >&2; exit 1 ;;
+  esac
+  trap '[[ -z "$FETCHED_TMP" ]] || rm -f "$FETCHED_TMP"' EXIT
+
+  case "$MODE" in
+    check-ziskup)
+      [[ -f "$ZISKUP_BIN" ]] || refuse ZiskupFailed "there is no installer at $ZISKUP_BIN"
+      verify_ziskup "$ZISKUP_BIN"
+      log "$ZISKUP_BIN is the ziskup of ZisK $ZISK_VERSION ($ZISKUP_SHA256)"
+      exit 0 ;;
+    check-binaries)
+      verify_binaries
+      log "cargo-zisk and cargo-zisk-dev under $ZISK_HOME are the GPU build of ZisK $ZISK_VERSION"
+      exit 0 ;;
+    check-archives)
+      local a
+      for a in "zisk-provingkey-$ZISK_VERSION.tar.gz:ARCHIVE_SHA256:$ARCHIVE_SHA256" "zisk-provingkey-plonk-$ZISK_VERSION.tar.gz:ARCHIVE_PLONK_SHA256:$ARCHIVE_PLONK_SHA256"; do
+        [[ -f "$DOWNLOAD_DIR/${a%%:*}" ]] || refuse KeyArchiveMissing "there is no ${a%%:*} in $DOWNLOAD_DIR"
+        verify_archive "$DOWNLOAD_DIR/${a%%:*}" "$(echo "$a" | cut -d: -f2)" "$(echo "$a" | cut -d: -f3)"
+        log "${a%%:*} matches its pin"
+      done
+      exit 0 ;;
+  esac
+
+  # --- 0. platform -----------------------------------------------------------------------------------------------
+  if [[ "$MODE" == "install" && "${EUID:-$(id -u)}" -ne 0 ]]; then
+    refuse NotRoot "run this as root (sudo bash $0); it installs packages and writes system limits"
   fi
-fi
-final_checks
+  if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
+    refuse UnsupportedPlatform "ZisK's GPU build runs on Linux x86_64 only (found $(uname -s) $(uname -m))"
+  fi
+  ensure_gpu
+  if [[ "$MODE" == "install" ]]; then
+    install_system
+    install_zisk
+    prepare_cache
+    # The limit is only read by new login sessions; the checks below would fail in this one. Say so rather than fail.
+    if [[ "$(ulimit -l)" != "unlimited" ]]; then
+      log "memlock is configured but not yet active in this shell; log out and back in, then run: sudo bash $0 --check"
+      SKIP_MEMLOCK_CHECK=1
+    fi
+  fi
+  final_checks
+}
+
+# Run when executed; a test that sources this file calls the functions above on its own.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

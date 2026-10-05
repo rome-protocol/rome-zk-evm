@@ -34,7 +34,7 @@ ENVEOF
 # $STUB_NONCE (default 0); the id is 4295391538 + nonce (a stand-in: the real derivation is unit-tested in
 # crates/zk-settlement-client). `register` reports the id of $STUB_REGISTERED_ID when set, otherwise the derived one.
 # $STUB_CHAIN_ID_FAIL makes chain-id fail like an RPC error, $STUB_AUTHORITY changes the payer's public key, and
-# `init-cursor` fails while the file $WORK/init_cursor_fail exists. `pdas`, `chain-status` and `exit-config show` answer
+# `init-cursor` fails while the file $WORK/init_cursor_fail exists. `pdas`, `chain-status`, `exit-config show`, `deposit-queue show`, `vkey show` and `vault show` answer
 # from the files under $WORK/state when they exist (see check_stubs.sh), `chain-status` and `exit-config show` fail while
 # $WORK/state/chain_status_fail or exit_config_fail exists. Every `docker compose` call is appended to $WORK/docker_calls;
 # `compose ps --services --status running` prints $WORK/state/running when that file exists. `up -d sequencer` makes the
@@ -73,11 +73,22 @@ if [ "\${1:-}" = run ]; then
     *" chain-status "*)
       [ ! -f "\$W/state/chain_status_fail" ] || { echo "RootLookupFailed: stub RPC error" >&2; exit 1; }
       if [ -f "\$W/state/chain_status" ]; then cat "\$W/state/chain_status"; else
-        echo "chain_id=4295391538"; echo "slot=1000"; echo "reclaim_slots_left=none"; echo "vkey_entries=1"; echo "vkey_active=yes"; fi ;;
+        echo "chain_id=4295391538"; echo "slot=1000"; echo "head_pending_batch=1"; echo "head_final_batch=1"; echo "reclaim_slots_left=none"; echo "vkey_entries=1"; echo "vkey_active=yes"; fi ;;
     *" exit-config show "*)
       [ ! -f "\$W/state/exit_config_fail" ] || { echo "ExitConfigLookupFailed: stub RPC error" >&2; exit 1; }
       echo "exit_config StubEc (chain 4295391538):"; echo "  exit_portal (current)      0x4200000000000000000000000000000000000016"
-      echo "  pending_mask                0 (none)"; echo "  activation_slot             n/a (nothing pending)" ;;
+      if [ -f "\$W/state/exit_config" ]; then cat "\$W/state/exit_config"; else
+        echo "  pending_mask                0 (none)"; echo "  activation_slot             n/a (nothing pending)"; fi ;;
+    *" deposit-queue show "*)
+      [ ! -f "\$W/state/deposit_queue_fail" ] || { echo "DepositQueueLookupFailed: stub RPC error" >&2; exit 1; }
+      if [ -f "\$W/state/deposit_queue" ]; then cat "\$W/state/deposit_queue"; else echo "chain_id=4295391538"; echo "queue_exists=false"; fi ;;
+    *" vkey show "*)
+      [ ! -f "\$W/state/vkey_show_fail" ] || { echo "RegistryLookupFailed: stub RPC error" >&2; exit 1; }
+      if [ -f "\$W/state/vkey_show" ]; then cat "\$W/state/vkey_show"; else
+        echo "chain_id=4295391538"; echo "slot=1000"; echo "vkey_entries=0"; echo "vkey_active=no"; fi ;;
+    *" vault show "*)
+      [ ! -f "\$W/state/vault_show_fail" ] || { echo "VaultConfigFetchFailed: stub RPC error" >&2; exit 1; }
+      if [ -f "\$W/state/vault_show" ]; then cat "\$W/state/vault_show"; else echo "vault_config StubVault (chain 4295391538): not initialized"; fi ;;
     *) echo "stub rome-zk-ops ok: \${args[*]}" ;;
   esac
   exit 0

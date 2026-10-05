@@ -524,23 +524,26 @@ pub fn post_root_proved(
         .try_into()
         .map_err(|_| ProgramError::InvalidInstructionData)?;
 
-    // Registry: the (BN254, PLONK, vkey) triple must exist as one entry (matching
-    // only (curve, scheme) let a proof under a *different* registered vkey satisfy this check whenever
-    // two entries shared a curve and scheme; the vkey is part of the lookup key, not a value to
-    // double-check after the fact).
+    // Registry: one active BN254 entry under a ZisK scheme must hold this programVK. The vkey is part of the
+    // lookup key, not a value to double-check after the fact: matching only the curve and scheme would let a
+    // proof under a different registered vkey satisfy this check. The proof never names its release. The
+    // release is the matching entry's scheme, so the poster cannot choose which key verifies the proof.
     let entry = {
         let d = a.registry.try_borrow_data()?;
-        registry::find(
-            &d,
-            registry::CURVE_BN254,
-            registry::SCHEME_PLONK,
-            &program_vk,
-            Clock::get()?.slot,
-        )
-        .map_err(|_| ProgramError::InvalidAccountData)?
-        .ok_or(SettleError::RegistryEntryNotFound)?
-        .1
+        registry::find_zisk(&d, &program_vk, Clock::get()?.slot)
+            .map_err(|_| ProgramError::InvalidAccountData)?
+            .ok_or(SettleError::RegistryEntryNotFound)?
+            .1
     };
+    // A release this build has no open or closing row for is refused by name, instead of failing the pairing.
+    let version = veritas::zisk_version(entry.scheme)
+        .filter(|v| v.status != veritas::Status::Withdrawn)
+        .ok_or(SettleError::ZiskVersionWithdrawn)?;
+    // The recursion root is a constant of the release, never a value taken from the proof. Veritas checks it
+    // again inside `verify_zisk`; this check puts the refusal before the layout work and under its own name.
+    if proof_abi[800..832] != version.root_c {
+        return Err(SettleError::RootCNotOfVersion.into());
+    }
 
     // `parent_hash`/`block_hash` to advance the root with once the pairing verifies — either the layout's
     // own decoded pair (layout 1) or the parsed header's (layout 2), so the shared tail below is
@@ -613,7 +616,7 @@ pub fn post_root_proved(
     }
 
     // The expensive part last.
-    if !veritas::verify_zisk(&proof_abi)? {
+    if !veritas::verify_zisk(version, &proof_abi)? {
         return Err(ProgramError::InvalidInstructionData);
     }
 

@@ -6,6 +6,9 @@
 # Reads /in/genesis.json (mounted read-only). Writes /out/<elf sha256>.elf and /out/vkey.json. With a ZisK proving key
 # directory it also computes the programVK (cargo-zisk setup -e: no proof, about 40 seconds, about 36 GB of memory);
 # without one, or on a machine with too little memory, vkey.json is written without programVK and the output says so.
+# The ZisK release is the image's, a file written when the image was built (never the container's environment, which `docker
+# run -e` can set); its pins are the pin file zisk/<release>.env, copied into the image. The cargo-zisk in the image must be
+# that release at the pin file's commit, or the build does not start.
 # Every refusal starts with a CamelCase name on stderr and exits non-zero.
 set -uo pipefail
 
@@ -16,14 +19,36 @@ OUT="${GUEST_BUILD_OUT:-/out}"
 WORK_DIR="${GUEST_BUILD_WORK:-/work}"
 MEMINFO="${GUEST_BUILD_MEMINFO:-/proc/meminfo}"
 GUEST_DIR="$WORK_DIR/rome-zk-evm/.fork/bin/guests/stateless-validator-rome"
-# The root of the vadcop_final verification key in the ZisK 1.2.0-alpha key set, the four 64-bit limbs of
-# vadcop_final.verkey.json written as one 32-byte big-endian number. It is a property of the key set, the same for every
-# guest. With the keys mounted it is read from them and must match.
-ROOT_C_VADCOP_FINAL=0x564c2b1bcbd5932c81cfad1fa786a98372eb3d6495257c2d944544334f84382f
+# The pin files of every release the image knows (the image carries them all) and the release this image was built for.
+PIN_DIR="${GUEST_BUILD_PINS:-/usr/local/share/guest-build/zisk}"
+RELEASE_FILE="${GUEST_BUILD_RELEASE_FILE:-/usr/local/share/guest-build/release}"
+RELEASE="$(head -n 1 "$RELEASE_FILE" 2>/dev/null || true)"
 # cargo-zisk setup measured 36.6 GB resident for a guest of this size. Below this much memory it is not tried.
 MIN_MEM_KIB=41943040   # 40 GiB
 
 die() { echo "$1: $2" >&2; exit 1; }
+
+# One value of a pin file. The files are plain KEY=VALUE lines and are read, never run.
+pin() { sed -n "s/^$2=//p" "$1" | head -n 1; }
+PIN_FILE="$PIN_DIR/$RELEASE.env"
+[[ -n "$RELEASE" && "$RELEASE" != */* && -f "$PIN_FILE" ]] || die ZiskReleaseUnknown "this image's ZisK release '${RELEASE}' (from $RELEASE_FILE) has no pin file in $PIN_DIR"
+# A key named twice is refused rather than one of the two picked.
+DUP="$(grep -E '^[A-Z0-9_]+=' "$PIN_FILE" | cut -d= -f1 | sort | uniq -d | head -n 1)"
+[[ -z "$DUP" ]] || die PinFileInvalid "$PIN_FILE names $DUP more than once"
+[[ "$(pin "$PIN_FILE" ZISK_VERSION)" == "$RELEASE" ]] || die ZiskReleaseUnknown "$PIN_FILE does not pin $RELEASE"
+# The root of the vadcop_final verification key in this release's key set, and the release's scheme number in a chain's
+# registry entry.
+ROOT_C_VADCOP_FINAL="$(pin "$PIN_FILE" ROOT_C_VADCOP_FINAL)"
+SCHEME="$(pin "$PIN_FILE" ZISK_SCHEME)"
+[[ "$ROOT_C_VADCOP_FINAL" =~ ^0x[0-9a-f]{64}$ && "$SCHEME" =~ ^[0-9]+$ ]] || die ZiskReleaseUnknown "$PIN_FILE has no valid vadcop_final root and scheme"
+
+# The cargo-zisk of this image is the release, built from the pin file's commit. The line it prints is
+# "cargo-zisk <release> (<7 digits of the commit> <date>)".
+ZISK_COMMIT="$(pin "$PIN_FILE" ZISK_COMMIT)"
+ZISK_SAYS="$(cargo-zisk --version 2>&1 | head -n 1 || true)"
+if [[ " $ZISK_SAYS " != *" $RELEASE "* || "$ZISK_SAYS" != *"(${ZISK_COMMIT:0:7}"* || ${#ZISK_COMMIT} -ne 40 ]]; then
+  die ZiskToolchainMismatch "this image is for ZisK $RELEASE (commit ${ZISK_COMMIT:0:7}), but its cargo-zisk says '${ZISK_SAYS:-nothing}'; the image was not built from this pin file"
+fi
 
 EXPECT=""
 KEYS=""
@@ -43,13 +68,23 @@ done
 if [[ -n "$KEYS" ]]; then
   [[ -d "$KEYS" ]] || die ProvingKeyDirMissing "$KEYS is not mounted"
   vk_json="$KEYS/zisk/vadcop_final/vadcop_final.verkey.json"
-  [[ -f "$vk_json" ]] || die ProvingKeyInvalid "$vk_json is not there; $KEYS is not a ZisK 1.2.0-alpha proving key directory"
+  [[ -f "$vk_json" ]] || die ProvingKeyInvalid "$vk_json is not there; $KEYS is not a ZisK $RELEASE proving key directory"
   root_c="$(python3 -c 'import json,sys; l=json.load(open(sys.argv[1])); assert len(l)==4; print("0x"+"".join("%016x"%int(x) for x in l))' "$vk_json" 2>/dev/null)" \
     || die ProvingKeyInvalid "$vk_json is not a verification key file"
-  [[ "$root_c" == "$ROOT_C_VADCOP_FINAL" ]] || die ProvingKeyMismatch "$KEYS has vadcop_final root $root_c, but the ZisK 1.2.0-alpha key set has $ROOT_C_VADCOP_FINAL"
+  if [[ "$root_c" != "$ROOT_C_VADCOP_FINAL" ]]; then
+    # Name the release the keys are of, when it is one this image knows.
+    other=""
+    for f in "$PIN_DIR"/*.env; do [[ "$(pin "$f" ROOT_C_VADCOP_FINAL)" == "$root_c" ]] && other="$(pin "$f" ZISK_VERSION)"; done
+    if [[ -n "$other" ]]; then die ProvingKeyMismatch "$KEYS is the ZisK $other key set (vadcop_final root $root_c), but this image builds for ZisK $RELEASE, whose key set has $ROOT_C_VADCOP_FINAL"
+    else die ProvingKeyMismatch "$KEYS has vadcop_final root $root_c, which is the root of no ZisK release this image knows; ZisK $RELEASE has $ROOT_C_VADCOP_FINAL"; fi
+  fi
 fi
 
-echo "guest-build: rome-zk-evm $(cat "$WORK_DIR/rome-zk-evm.rev") (${ROME_ZK_EVM_TAG:-unknown}), rome-zk-guest $(cat "$WORK_DIR/rome-zk-guest.rev") (${ROME_ZK_GUEST_TAG:-unknown})" >&2
+# The two source tags are the ones the image cloned, written next to the revisions when it was built.
+EVM_TAG="$(head -n 1 "$WORK_DIR/rome-zk-evm.tag" 2>/dev/null || true)"
+GUEST_TAG="$(head -n 1 "$WORK_DIR/rome-zk-guest.tag" 2>/dev/null || true)"
+[[ -n "$EVM_TAG" && -n "$GUEST_TAG" ]] || die SourceTagMissing "$WORK_DIR has no rome-zk-evm.tag or rome-zk-guest.tag: the image did not record which sources it cloned"
+echo "guest-build: rome-zk-evm $(cat "$WORK_DIR/rome-zk-evm.rev") ($EVM_TAG), rome-zk-guest $(cat "$WORK_DIR/rome-zk-guest.rev") ($GUEST_TAG), ZisK $RELEASE" >&2
 LOG="$(mktemp)"
 "$GUEST_DIR/build-elf.sh" --genesis "$GENESIS" --expect-chain-id "$EXPECT" 2>&1 >"$LOG.out" | tee "$LOG" >&2
 rc=${PIPESTATUS[0]}
@@ -98,9 +133,9 @@ print("0x"+"".join("%016x"%x for x in l) if len(l)==4 else "")')"
 fi
 
 # --- vkey.json: the format rome-zk-prover reads (crates/rome-zk-prover/src/config.rs) ----------------------------------
-python3 - "$OUT/vkey.json" "$PROGRAM_VK" "$ROOT_C_VADCOP_FINAL" "$SHA" "$CID" "$GSHA" "${ROME_ZK_EVM_TAG:-unknown}" "${ROME_ZK_GUEST_TAG:-unknown}" <<'PY' || die VkeyWriteFailed "could not write $OUT/vkey.json"
+python3 - "$OUT/vkey.json" "$PROGRAM_VK" "$ROOT_C_VADCOP_FINAL" "$SHA" "$CID" "$GSHA" "$EVM_TAG" "$GUEST_TAG" "$RELEASE" "$SCHEME" <<'PY' || die VkeyWriteFailed "could not write $OUT/vkey.json"
 import json, sys
-path, pvk, root_c, sha, cid, gsha, evm_tag, guest_tag = sys.argv[1:]
+path, pvk, root_c, sha, cid, gsha, evm_tag, guest_tag, release, scheme = sys.argv[1:]
 d = {}
 if pvk:
     d["programVK"] = pvk
@@ -109,7 +144,8 @@ d.update({
     "elf_sha256": sha,
     "chain_id": int(cid),
     "layout_id": 1,
-    "zisk": "1.2.0-alpha",
+    "zisk": release,
+    "scheme": int(scheme),
     "genesis_sha256": gsha,
     "source": "built by rollup guest-build from rome-zk-evm %s and rome-zk-guest %s" % (evm_tag, guest_tag),
 })

@@ -49,6 +49,32 @@ program.
   would take it over the queue's `max_per_batch`, using the stricter of the active and pending values, and the
   next group starts where that one ended (`CloseReason::Deposits`). A log without deposits gives the same
   stream and frame bytes as before (`tests/deposits_stream.rs`).
+- **`FinalizeBatchV2` is sent with a range the batcher works out itself, from the batch's own posted stream.**
+  No caller passes a range. `finalize_and_verify` decodes the posted frames and `deposits::plan_range` takes
+  `from` from the live cursor (`deposit_next`, read once every earlier batch is finalized or abandoned; 0 while
+  the cursor is still v1) and `to` from `resolve_deposits_end` over the decoded stream. The normal path and the
+  restart path (`resume_open_batches`) both go through it, so a restart cannot send a range the stream does not
+  carry; a finalized batch with the wrong range cannot be proved and `AbandonBatch` refuses it. Before any
+  send the posted stream must decode to exactly the blocks the frames were cut from, the fifth field included
+  (the re-derive comparison covers `deposits_end`), and a stream that takes deposits on a chain with no bridge
+  is refused by name. The bridge program named in the instruction is read from the chain's `exit_config` at its
+  PDA under the settlement program; a chain with no exit config finalizes an empty range. After the finalize,
+  `verify_acc` recomputes `acc` from the chunks and the header's range, checks that the header's range ends
+  where the stream's does, and the batcher checks that the header's range is the one it sent.
+- **A batch the inbox would refuse is not opened.** The inbox measures a deposit's age at the batch's own open
+  time, so whether a batch can finalize is settled when it opens, and a batch that leaves out an overdue deposit
+  could afterwards only be abandoned. Before `OpenBatch`, `WindowedPoster::submit_group` works out the batch's
+  range (it starts where the previously opened batch's range ends, or at the cursor for the first one), and
+  `deposits::check_deadline_at_open` applies the inbox's rule with the batcher's clock as the open time, 300 s
+  early (the host clock and the cluster clock differ, and `OpenBatch` lands after the check), and with the
+  shorter of the active and a pending inclusion deadline. A batch that fails it is not opened and the batcher stops with a named error, so the batch id is not used up; the
+  sequencer has to put the overdue deposit into the stream. A chain with no bridge or no queue is not checked.
+- **A v1 cursor is topped up once before the chain's first V2.** The instruction that grows the cursor to its
+  69-byte layout has no payer, so the batcher sends one plain system transfer from its payer for the missing
+  rent first. It reads the cursor and its balance before sending, so a restart or a second pass never pays
+  twice. At startup the batcher also reads the cursor's `deposit_next` and the deposit queue's active and
+  pending `max_per_batch` and hands them to `BlockSource::with_deposit_start` and `SizeCappedGrouper`'s
+  `DepositCap`. To abandon batches by hand (`examples/abandon_batches.rs`), list the ids oldest first.
 - **`BlockSource` refuses rather than truncate.** If the log genuinely holds more sub-blocks for a block
   than this process is configured for, `BlockSource` peeks one record ahead before ever handing back a
   "complete" block and refuses (`SourceError::ProfileMismatch`) — a misconfigured `sub_blocks_per_block`

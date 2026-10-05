@@ -259,16 +259,18 @@ pub async fn resume_open_batches<A: AccountOps, S: Sender>(
     let w = cfg.window;
     let (cursor_pda, _) =
         zk_inbox_client::cursor_pda(&w.inbox_program_id, &w.settlement_program_id, w.chain_id);
-    let next_batch = match accounts
+    let (next_batch, deposit_next) = match accounts
         .get_account(&cursor_pda)
         .await
         .map_err(PipelineError::from)?
     {
         None => return Ok(Vec::new()), // InitBatchCursor never run for this chain — nothing open.
         Some(data) => {
-            zk_inbox_client::decode_batch_cursor(&data)
-                .map_err(PipelineError::from)?
-                .next_batch
+            let cursor =
+                zk_inbox_client::decode_batch_cursor(&data).map_err(PipelineError::from)?;
+            // Every batch below the first open one is finalized or gone, so the cursor's `deposit_next` is
+            // where the first open batch's range starts: the log is read from there.
+            (cursor.next_batch, cursor.deposit.map_or(0, |d| d.next))
         }
     };
     let (root_pda, _) = zk_settlement_client::root_pda(&w.settlement_program_id, w.chain_id);
@@ -402,7 +404,8 @@ pub async fn resume_open_batches<A: AccountOps, S: Sender>(
             anchor0.from_block,
             anchor0.prev_block_timestamp_secs,
         )
-        .map_err(|e| log_err(open[0].batch, format!("opening the ordered log: {e}")))?;
+        .map_err(|e| log_err(open[0].batch, format!("opening the ordered log: {e}")))?
+        .with_deposit_start(deposit_next);
         while (log.blocks.len() as u64) < wanted {
             match source
                 .next_block()
@@ -506,6 +509,7 @@ pub async fn resume_open_batches<A: AccountOps, S: Sender>(
                 max_polls: w.finalize_max_polls,
             },
             &chosen.frames,
+            Some(&chosen.blocks),
         )
         .await?;
         pipeline::verify_acc(&decoded, &chosen.frames)?;

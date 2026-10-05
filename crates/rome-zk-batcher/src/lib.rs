@@ -41,6 +41,7 @@
 pub mod anchor;
 pub mod channel;
 pub mod config;
+pub mod deposits;
 pub mod grouping;
 pub mod loaded_accounts;
 pub mod metrics;

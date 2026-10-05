@@ -1,8 +1,13 @@
 //! The `Prover` trait and its implementation, `LocalCargoZisk` — a `cargo-zisk` subprocess
-//! (`cargo-zisk prove --plonk` behind a `Prover` trait). Verified against `cargo-zisk` 1.2.0-alpha:
+//! (`cargo-zisk prove --plonk` behind a `Prover` trait). Written against `cargo-zisk` 1.3.1-alpha:
 //! `-e/--elf`, `-i/--inputs`, `-o/--output`, `--plonk`, `-y/--verify-proof`; `-o <path>` produces the
 //! proof at that exact FILE path (not a directory); `--plonk` runs the STARK then the wrap in one
 //! invocation.
+//!
+//! Release: the child runs `<zisk_home>/bin/cargo-zisk` with `ZISK_HOME=<zisk_home>`, so the binary, the
+//! proving key and the cache all come from one install. Before every proof the `--version` line is read and
+//! its release has to be the one the vkey of record names (`ZiskVersionMismatch`), so keys of one release are
+//! never used by a binary of another.
 //!
 //! GPU: the GPU build of `cargo-zisk` has a runtime `-g/--gpu` flag on `prove`, and WITHOUT it the GPU
 //! build proves on the CPU. The CPU-only build has no such flag at all (it is compiled out) and prints
@@ -72,6 +77,29 @@ pub enum ProveError {
     /// missing or zero-byte proof file as a real one.
     #[error("cargo-zisk exited and printed a verified line, but {path} is missing or empty")]
     OutputMissing { path: PathBuf },
+    /// The `cargo-zisk` at `<zisk_home>/bin` is not the release the vkey of record names: its `--version` line
+    /// says `{found}`. Its proofs would be made under another release's keys and refused by the program.
+    #[error(
+        "ZiskVersionMismatch: {bin} is not ZisK {expected} (its --version line says \"{found}\"); \
+         point zisk_home at the install of the release the vkey of record names"
+    )]
+    ZiskVersionMismatch {
+        bin: PathBuf,
+        expected: String,
+        found: String,
+    },
+    /// The proving key under `<zisk_home>` is not the key set of the release the vkey of record names: the root of
+    /// its `vadcop_final` verification key is `{found}`, the release's pinned root is `{expected}`.
+    #[error(
+        "ProvingKeyMismatch: {path} has vadcop_final root {found}, but ZisK {zisk}'s key set has {expected}; \
+         zisk_home holds the proving key of another release or an unreadable one"
+    )]
+    ProvingKeyMismatch {
+        path: PathBuf,
+        zisk: String,
+        expected: String,
+        found: String,
+    },
 }
 
 /// Produces one PLONK proof file from a guest ELF and a witness input file.
@@ -86,6 +114,9 @@ pub trait Prover {
 /// type carries no attempt count of its own.
 pub struct LocalCargoZisk {
     pub zisk_home: PathBuf,
+    /// The ZisK release this install has to be, as the vkey of record names it (`1.3.1-alpha`). The `--version`
+    /// line is checked against it before every proof.
+    pub zisk: String,
     /// Prove on the GPU: passes `-g` and refuses to run unless `cargo-zisk` is the GPU build (see the module doc).
     pub gpu: bool,
     pub timeout: Duration,
@@ -98,7 +129,7 @@ pub enum BuildKind {
     Cpu,
 }
 
-/// Reads the tag out of a `cargo-zisk --version` line, e.g. `cargo-zisk 1.2.0-alpha [gpu] (fbbc69b 2026-08-26T22:06:35Z)`.
+/// Reads the tag out of a `cargo-zisk --version` line, e.g. `cargo-zisk 1.3.1-alpha [gpu] (306a9c9 <build time>)`.
 pub fn parse_build_kind(version_output: &str) -> Option<BuildKind> {
     let mut found = None;
     for line in version_output.lines() {
@@ -111,10 +142,19 @@ pub fn parse_build_kind(version_output: &str) -> Option<BuildKind> {
     found
 }
 
-/// Runs `<zisk_home>/bin/cargo-zisk --version` and refuses, by name, unless it is the GPU build.
-/// Called by `prove()` when `gpu` is set, and once at start-up by the binary so a wrong install stops the
-/// service before the first batch instead of after it.
-pub fn require_gpu_build(zisk_home: &Path) -> Result<(), ProveError> {
+/// Reads the release out of a `cargo-zisk --version` line: the word after `cargo-zisk` on the first line that
+/// has it (`1.3.1-alpha` in the example above).
+pub fn parse_zisk_release(version_output: &str) -> Option<&str> {
+    version_output.lines().find_map(|line| {
+        let mut words = line.split_whitespace();
+        (words.next() == Some("cargo-zisk"))
+            .then(|| words.next())
+            .flatten()
+    })
+}
+
+/// Runs `<zisk_home>/bin/cargo-zisk --version`: the whole answer, and its first non-empty line for messages.
+fn version_line(zisk_home: &Path) -> Result<(PathBuf, String, String), ProveError> {
     let bin = zisk_home.join("bin").join("cargo-zisk");
     let out = Command::new(&bin)
         .arg("--version")
@@ -135,6 +175,25 @@ pub fn require_gpu_build(zisk_home: &Path) -> Result<(), ProveError> {
         .unwrap_or("")
         .trim()
         .to_string();
+    Ok((bin, text, first_line))
+}
+
+/// Runs `<zisk_home>/bin/cargo-zisk --version` and refuses, by name, unless it is ZisK `release`
+/// (`ZiskVersionMismatch`) and, when `gpu` is set, the GPU build (`GpuBuildRequired`, `BuildUnknown`).
+/// Called by `prove()` before every proof, and once at start-up by the binary so a wrong install stops the
+/// service before the first batch instead of after it.
+pub fn require_install(zisk_home: &Path, release: &str, gpu: bool) -> Result<(), ProveError> {
+    let (bin, text, first_line) = version_line(zisk_home)?;
+    if parse_zisk_release(&text) != Some(release) {
+        return Err(ProveError::ZiskVersionMismatch {
+            bin,
+            expected: release.to_string(),
+            found: first_line,
+        });
+    }
+    if !gpu {
+        return Ok(());
+    }
     match parse_build_kind(&text) {
         Some(BuildKind::Gpu) => Ok(()),
         Some(BuildKind::Cpu) => Err(ProveError::GpuBuildRequired {
@@ -144,6 +203,46 @@ pub fn require_gpu_build(zisk_home: &Path) -> Result<(), ProveError> {
         None => Err(ProveError::BuildUnknown {
             bin,
             found: first_line,
+        }),
+    }
+}
+
+/// The root of the `vadcop_final` verification key in `<zisk_home>`'s proving key, as `0x` + 64 hex digits (four
+/// 64-bit words, each written big-endian, in file order): the same value `guest-build.sh` reads. `None` when the
+/// file is missing or is not four numbers.
+fn installed_vadcop_final_root(path: &Path) -> Option<String> {
+    let words: Vec<u64> = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    (words.len() == 4).then(|| {
+        format!(
+            "0x{}",
+            words
+                .iter()
+                .map(|w| format!("{w:016x}"))
+                .collect::<String>()
+        )
+    })
+}
+
+/// Refuses, by name, a `zisk_home` whose proving key is not the key set of `release`: the `vadcop_final` root in
+/// it has to be `expected_root_c`, the release's pinned recursion root. Run once at start-up.
+pub fn require_proving_key(
+    zisk_home: &Path,
+    release: &str,
+    expected_root_c: &[u8; 32],
+) -> Result<(), ProveError> {
+    let path = zisk_home
+        .join("provingKey")
+        .join("zisk")
+        .join("vadcop_final")
+        .join("vadcop_final.verkey.json");
+    let expected = format!("0x{}", hex::encode(expected_root_c));
+    match installed_vadcop_final_root(&path) {
+        Some(found) if found == expected => Ok(()),
+        found => Err(ProveError::ProvingKeyMismatch {
+            path,
+            zisk: release.to_string(),
+            expected,
+            found: found.unwrap_or_else(|| "missing or unreadable".to_string()),
         }),
     }
 }
@@ -184,9 +283,7 @@ impl Prover for LocalCargoZisk {
         input_bin: &Path,
         out_file: &Path,
     ) -> Result<ProofFile, ProveError> {
-        if self.gpu {
-            require_gpu_build(&self.zisk_home)?;
-        }
+        require_install(&self.zisk_home, &self.zisk, self.gpu)?;
         let call_started = Instant::now();
         // The wait loop below is bounded by `self.timeout`; the drain step after it gets a
         // further half of that as its own bound of last resort (a grandchild the process-group
@@ -197,6 +294,8 @@ impl Prover for LocalCargoZisk {
 
         let bin = self.zisk_home.join("bin").join("cargo-zisk");
         let mut cmd = Command::new(&bin);
+        // One install for the binary, the proving key and the cache.
+        cmd.env("ZISK_HOME", &self.zisk_home);
         cmd.arg("prove")
             .arg("-e")
             .arg(elf)
@@ -398,9 +497,13 @@ mod tests {
             .clone()
     }
 
+    /// The release every fake `cargo-zisk` in `tests/fake-cargo-zisk` reports, unless a test says otherwise.
+    const TEST_RELEASE: &str = "1.3.1-alpha";
+
     fn prover(zisk_home: &Path, timeout: Duration) -> LocalCargoZisk {
         LocalCargoZisk {
             zisk_home: zisk_home.to_path_buf(),
+            zisk: TEST_RELEASE.to_string(),
             gpu: false,
             timeout,
         }
@@ -744,6 +847,7 @@ mod tests {
     fn gpu_prover(zisk_home: &Path) -> LocalCargoZisk {
         LocalCargoZisk {
             zisk_home: zisk_home.to_path_buf(),
+            zisk: TEST_RELEASE.to_string(),
             gpu: true,
             timeout: Duration::from_secs(5),
         }
@@ -752,14 +856,127 @@ mod tests {
     #[test]
     fn the_version_tag_is_read_as_gpu_or_cpu() {
         assert_eq!(
-            parse_build_kind("cargo-zisk 1.2.0-alpha [gpu] (fbbc69b 2026-08-26T22:06:35Z)"),
+            parse_build_kind("cargo-zisk 1.3.1-alpha [gpu] (306a9c9 fake-build)"),
             Some(BuildKind::Gpu)
         );
         assert_eq!(
-            parse_build_kind("cargo-zisk 1.2.0-alpha [cpu] (fbbc69b 2026-08-26T22:06:35Z)"),
+            parse_build_kind("cargo-zisk 1.3.1-alpha [cpu] (306a9c9 fake-build)"),
             Some(BuildKind::Cpu)
         );
-        assert_eq!(parse_build_kind("cargo-zisk 1.2.0-alpha"), None);
+        assert_eq!(parse_build_kind("cargo-zisk 1.3.1-alpha"), None);
+    }
+
+    #[test]
+    fn the_release_is_read_from_the_version_line() {
+        assert_eq!(
+            parse_zisk_release("cargo-zisk 1.3.1-alpha [gpu] (306a9c9 fake-build)"),
+            Some("1.3.1-alpha")
+        );
+        assert_eq!(
+            parse_zisk_release("\ncargo-zisk 1.2.0-alpha [cpu] (fbbc69b fake-build)\n"),
+            Some("1.2.0-alpha")
+        );
+        assert_eq!(parse_zisk_release("zisk 1.3.1-alpha"), None);
+        assert_eq!(parse_zisk_release(""), None);
+    }
+
+    #[test]
+    fn an_install_of_another_release_than_the_vkey_names_is_refused_by_name_before_any_proving() {
+        let tmp = own_fake_home("old-release-build.sh");
+        let home = tmp.path().to_path_buf();
+        let out_dir = tempfile::tempdir().unwrap();
+        let out_file = out_dir.path().join("proof");
+        // The GPU flag does not matter: the release is checked either way.
+        for gpu in [true, false] {
+            let p = LocalCargoZisk {
+                gpu,
+                ..prover(&home, Duration::from_secs(5))
+            };
+            let err = p
+                .prove(Path::new("elf"), Path::new("input.bin"), &out_file)
+                .unwrap_err();
+            assert!(
+                matches!(err, ProveError::ZiskVersionMismatch { ref expected, .. } if expected == "1.3.1-alpha"),
+                "expected ZiskVersionMismatch, got {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(msg.starts_with("ZiskVersionMismatch:"), "{msg}");
+            assert!(
+                msg.contains("1.2.0-alpha"),
+                "the message quotes what it found: {msg}"
+            );
+        }
+        assert!(!out_file.exists(), "no proof may be produced");
+        assert!(
+            !home.join("bin").join("proved").exists(),
+            "the old build must never have been asked to prove"
+        );
+    }
+
+    #[test]
+    fn the_child_runs_with_zisk_home_set_to_the_configured_install() {
+        let tmp = own_fake_home("gpu-build.sh");
+        let home = tmp.path().to_path_buf();
+        let out_dir = tempfile::tempdir().unwrap();
+        gpu_prover(&home)
+            .prove(
+                Path::new("elf"),
+                Path::new("input.bin"),
+                &out_dir.path().join("proof"),
+            )
+            .expect("the GPU build proves");
+        let seen = std::fs::read_to_string(home.join("bin").join("zisk_home.txt")).unwrap();
+        assert_eq!(seen.trim(), home.to_str().unwrap());
+    }
+
+    fn write_verkey(home: &Path, words: &str) {
+        let dir = home.join("provingKey/zisk/vadcop_final");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("vadcop_final.verkey.json"), words).unwrap();
+    }
+
+    /// The four words of the 1.3.1 key set's `vadcop_final` verification key, as the install writes them.
+    const VERKEY_1_3_1: &str =
+        "[14119114270948443809, 16820367087179580139, 16121478031581406534, 4945938373577087684]";
+
+    fn root_c_1_3_1() -> [u8; 32] {
+        veritas::zisk_version(rome_zk_layouts::registry::SCHEME_ZISK_1_3_1)
+            .unwrap()
+            .root_c
+    }
+
+    #[test]
+    fn the_proving_key_of_the_release_is_accepted() {
+        let home = tempfile::tempdir().unwrap();
+        write_verkey(home.path(), VERKEY_1_3_1);
+        require_proving_key(home.path(), "1.3.1-alpha", &root_c_1_3_1())
+            .expect("the 1.3.1 key set matches the 1.3.1 root");
+    }
+
+    #[test]
+    fn a_proving_key_of_another_release_is_refused_by_name() {
+        let home = tempfile::tempdir().unwrap();
+        write_verkey(home.path(), "[1, 2, 3, 4]");
+        let err = require_proving_key(home.path(), "1.3.1-alpha", &root_c_1_3_1()).unwrap_err();
+        assert!(
+            matches!(err, ProveError::ProvingKeyMismatch { .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().starts_with("ProvingKeyMismatch:"));
+    }
+
+    #[test]
+    fn a_missing_or_malformed_proving_key_is_refused_by_name() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            require_proving_key(home.path(), "1.3.1-alpha", &root_c_1_3_1()),
+            Err(ProveError::ProvingKeyMismatch { .. })
+        ));
+        write_verkey(home.path(), "[1, 2, 3]");
+        assert!(matches!(
+            require_proving_key(home.path(), "1.3.1-alpha", &root_c_1_3_1()),
+            Err(ProveError::ProvingKeyMismatch { .. })
+        ));
     }
 
     #[test]
@@ -823,7 +1040,7 @@ mod tests {
             "the CPU build must never have been asked to prove"
         );
         assert!(matches!(
-            require_gpu_build(&home),
+            require_install(&home, TEST_RELEASE, true),
             Err(ProveError::GpuBuildRequired { .. })
         ));
     }
@@ -832,7 +1049,7 @@ mod tests {
     fn gpu_required_with_an_untagged_build_is_refused_by_name() {
         let home = fake_home("no-tag-build.sh");
         assert!(matches!(
-            require_gpu_build(&home),
+            require_install(&home, TEST_RELEASE, true),
             Err(ProveError::BuildUnknown { .. })
         ));
     }
@@ -841,7 +1058,7 @@ mod tests {
     fn gpu_required_with_nothing_installed_is_a_named_spawn_error() {
         let empty_home = tempfile::tempdir().unwrap();
         assert!(matches!(
-            require_gpu_build(empty_home.path()),
+            require_install(empty_home.path(), TEST_RELEASE, true),
             Err(ProveError::Spawn { .. })
         ));
     }

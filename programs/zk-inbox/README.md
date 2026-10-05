@@ -31,7 +31,7 @@ side; this program's batch accumulator is what makes root posting a fixed-size, 
   wrong-address or read-only cursor is refused.
 - **Only the batch's own authority can open it, open a chunk under it, or finalize it.** `OpenBatch`'s
   signer must be the chain's registered authority (read from the settlement program's root account);
-  `Open` (a chunk) and `FinalizeBatch` both require the signer to match that same batch's stored
+  `Open` (a chunk) and `FinalizeBatchV2` both require the signer to match that same batch's stored
   authority — refused (`MissingRequiredSignature`) when the account is absent, unsigned, or simply the
   wrong key, even for a third party who sealed every leaf itself. Sealing, by contrast, is
   permissionless — deterministic given the chunk bytes already on chain, so there is nothing to gate.
@@ -39,14 +39,52 @@ side; this program's batch accumulator is what makes root posting a fixed-size, 
   batch account and is a no-op if the same leaf is sealed twice with the same hash (an error if sealed
   twice with different hashes) — nothing about this program's correctness depends on chunks being sealed
   in any particular order.
-- **Finalization is resumable, and produces a byte-exact, cross-checked commitment.** `FinalizeBatch`
-  advances a cursor through the leaf-transform pass a bounded number of leaves at a time (so a very large
-  batch does not need to fit in one transaction, and every resumed call needs the same authority signer),
-  then combines the whole tree in one pass once every leaf is transformed. The resulting `acc` commitment
-  is computed by
-  [`rome-zk-layouts`](../../crates/rome-zk-layouts) — the exact same function the settlement program and
-  every off-chain client use — so there is only one implementation of "what a batch's commitment means" in
-  this whole system, not a program-side copy that could drift from a client-side one.
+- **Finalization is resumable, and produces a byte-exact, cross-checked commitment.** `FinalizeBatchV2 {
+  step, deposit_to }` (discriminant 11) advances a cursor through the leaf-transform pass a bounded number of
+  leaves at a time (so a very large batch does not need to fit in one transaction, and every resumed call needs
+  the same authority signer), then combines the whole tree in one pass once every leaf is transformed. The
+  resulting `acc` commitment is computed by [`rome-zk-layouts`](../../crates/rome-zk-layouts) — the exact same
+  function the settlement program and every off-chain client use — so there is only one implementation of
+  "what a batch's commitment means" in this whole system, not a program-side copy that could drift from a
+  client-side one. The retired `FinalizeBatch` (discriminant 6) is still decoded for history but refused by
+  name: its body wrote the constant forced root and ignored the deposit queue.
+- **The call that completes a batch also takes the batch's deposits.** Accounts: batch (writable), authority
+  (signer), the chain's cursor (writable), the chain's exit config, the deposit queue, the deposit record just
+  before `deposit_to`, the record at `deposit_to`, and the previous batch (read only). Earlier steps of a
+  resumable finalize read none of these accounts. On the completing call the program first binds every account by address: the exit config
+  must sit at its PDA under the batch's settlement program, the queue at its PDA under the bridge program the
+  exit config names, and each record at its PDA and owned by that bridge; a wrong address is refused by name,
+  and "absent" only ever means the account at the exact address is not owned by the settlement or bridge
+  program. With no exit config, a zero bridge program or no queue, the range must be empty. Otherwise
+  `from` is the cursor's `deposit_next`, and the program requires `from <= deposit_to <= queue.count`,
+  `deposit_to - from <= max_per_batch` (the queue's active parameters only), and the inclusion deadline: the
+  deposit just after the range may not be overdue unless the range reaches the queue's end or already holds
+  `max_per_block` deposits. "Overdue" is measured at the batch's committed open time (`open_unix_ts` in its
+  header), not at the time of the call, so a batch that could finalize when it opened can still finalize for a
+  fixed grace afterwards. The grace is `DEPOSIT_GRACE_SECS`, 24 hours, fixed in the program: the age is
+  measured at the later of the open time and 24 hours before the finalizing call. The longest a waiting deposit
+  can be left out is therefore its deadline plus 24 hours, however many batches were opened early; a batch held
+  open more than 24 hours past a waiting deposit's deadline can only take that deposit or be abandoned. The
+  range goes into the header (an empty range carries the cursor's hash on both
+  ends), the forced root is built by the shared deposit functions (`rome-zk-layouts::deposit`) — the empty
+  constant for an empty range, so a batch without deposits is byte-identical to what `FinalizeBatch` gave —
+  and the cursor then moves to `deposit_next = deposit_to` with the matching chain hash. A batch opened with a
+  version-2 header has no room for a range: it takes only an empty one, and no deadline applies to it, since its
+  blocks were sealed before any queue existed.
+- **Batches take their deposits in id order.** `OpenBatch` lets batch N open while N - 1 is still open, so the
+  completing call of batch N also reads batch N - 1, at `batch_pda(settlement_program, chain_id, N - 1)`.
+  The account must sit at exactly that address (`WrongPreviousBatchAddress` otherwise), and if this program
+  owns it and it is not finalized the call is refused as `PreviousBatchNotFinalized`. An absent previous batch
+  (abandoned, or closed after it went final) is accepted, and batch 0 skips the check. It applies to an empty
+  range too. `AbandonBatch` takes the same account and applies the same check, so an absent previous batch
+  means every earlier batch is final or absent: by induction, batches take their deposits in id order.
+  Without the rule a later batch could finalize first and take deposits 0..2, then the earlier batch
+  take 2..3: settlement would post the earlier batch first, L2 would credit deposit 2 before 0 and 1, and
+  closing the earlier batch would let records the later one still needs be closed.
+- **A version-1 cursor grows to version 2 on the first call that completes a batch.** The cursor must
+  already hold the 69-byte rent minimum (a plain transfer tops it up) before the first `FinalizeBatchV2`; the program
+  reallocates the account, writes `deposit_next` 0, the queue's seed hash and `deposit_final` 0, and moves no
+  lamports. A version-1 cursor that is short of that rent is refused by name and nothing changes.
 - **A sealed chunk is immutable in bytes and length.** `Seal { len, body_hash }` requires `body_hash ==
   keccak256(body[..len])` — computed from the account's own bytes, not merely asserted by the caller — so a
   short-seal (a hole a `Write` never covered) is unconstructable, not just a client-side bound. `Write` on

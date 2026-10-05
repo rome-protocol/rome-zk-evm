@@ -47,7 +47,9 @@
 //! and refuses `InvalidAccountData` outright if a second match is ever found — defence in depth for a shape the writer
 //! should never be able to see.
 //!
-//! `curve`: 0 = BN254, 1 = BLS12-381. `scheme`: 0 = Groth16, 1 = PLONK. `layout_id`: 1 = the full
+//! `curve`: 0 = BN254, 1 = BLS12-381. `scheme`: 0 = Groth16, and every other value is the number of a ZisK
+//! release: 1 = ZisK 1.2.0-alpha, 2 = ZisK 1.3.1-alpha (see [`ZISK_RELEASES`]). Every entry written before
+//! releases were named carries `1`. A number is never reused and the next release takes the next unused one. `layout_id`: 1 = the full
 //! v2, 208-byte public-values struct (`rome_zk_layouts::public_values`, accumulator- and
 //! drift-bound; `PostRootProved` binds it, the guest commits it), 2 = the
 //! header-only fallback (number/parent_hash/state_root from a block header, no inbox binding — today's
@@ -58,7 +60,44 @@ pub const MAGIC: u32 = 0x5a4b_5652; // "ZKVR"
 pub const CURVE_BN254: u8 = 0;
 pub const CURVE_BLS12_381: u8 = 1;
 pub const SCHEME_GROTH16: u8 = 0;
-pub const SCHEME_PLONK: u8 = 1;
+/// ZisK 1.2.0-alpha: the PLONK wrapper key every entry written before releases were named was registered
+/// against.
+pub const SCHEME_ZISK_1_2_0: u8 = 1;
+/// ZisK 1.3.1-alpha.
+pub const SCHEME_ZISK_1_3_1: u8 = 2;
+
+/// One ZisK release as the registry names it: the `scheme` byte an entry carries and the release's name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZiskRelease {
+    pub scheme: u8,
+    pub name: &'static str,
+}
+
+/// Every ZisK release, in scheme order. Numbers count up from 1; a row never changes and a number is
+/// never reused. A new release is appended with the next unused number.
+pub const ZISK_RELEASES: [ZiskRelease; 2] = [
+    ZiskRelease {
+        scheme: SCHEME_ZISK_1_2_0,
+        name: "1.2.0-alpha",
+    },
+    ZiskRelease {
+        scheme: SCHEME_ZISK_1_3_1,
+        name: "1.3.1-alpha",
+    },
+];
+
+/// The release a `scheme` byte names, or `None` for Groth16 and for numbers no release has taken yet.
+pub fn zisk_release_name(scheme: u8) -> Option<&'static str> {
+    ZISK_RELEASES
+        .iter()
+        .find(|r| r.scheme == scheme)
+        .map(|r| r.name)
+}
+
+/// Whether `scheme` names a ZisK release.
+pub fn is_zisk_scheme(scheme: u8) -> bool {
+    zisk_release_name(scheme).is_some()
+}
 /// The full v2 public-values struct (accumulator- and drift-bound, 208 B — see
 /// `crate::public_values`). `PostRootProved`'s layout-1 path binds a proof under this
 /// layout id; the guest commits it.
@@ -240,6 +279,49 @@ pub fn find(
     Ok(None)
 }
 
+/// Why [`find_zisk`] could not answer.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FindZiskError {
+    /// The registry bytes did not decode.
+    Layout(crate::LayoutError),
+    /// Two active entries carry the same `vkey_hash` on BN254 under ZisK schemes. The program refuses to write
+    /// that state, so reading it means the account is not one the program wrote.
+    TwoActiveMatches,
+}
+
+impl From<crate::LayoutError> for FindZiskError {
+    fn from(e: crate::LayoutError) -> Self {
+        FindZiskError::Layout(e)
+    }
+}
+
+/// The one active entry whose curve is BN254, whose scheme names a ZisK release and whose `vkey_hash` is
+/// `vkey_hash`, whichever release that is. Same visibility rules as [`find`]: only populated entries, and
+/// nothing whose `activation_slot > at_slot`, which also hides a retired entry. The proof carries no release;
+/// the release is the matching entry's `scheme`. Two active matches are refused, so a vkey can never pick
+/// between two releases' keys.
+pub fn find_zisk(
+    d: &[u8],
+    vkey_hash: &[u8; 32],
+    at_slot: u64,
+) -> Result<Option<(usize, RegistryEntry)>, FindZiskError> {
+    let hdr = read_header(d)?;
+    let mut found = None;
+    for i in 0..(hdr.count as usize).min(MAX_ENTRIES) {
+        let (e, activation_slot) = entry_at(d, i)?;
+        if activation_slot > at_slot {
+            continue;
+        }
+        if e.curve == CURVE_BN254 && is_zisk_scheme(e.scheme) && &e.vkey_hash == vkey_hash {
+            if found.is_some() {
+                return Err(FindZiskError::TwoActiveMatches);
+            }
+            found = Some((i, e));
+        }
+    }
+    Ok(found)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,7 +353,7 @@ mod tests {
     fn header_and_entries_round_trip() {
         let e0 = RegistryEntry {
             curve: CURVE_BN254,
-            scheme: SCHEME_PLONK,
+            scheme: SCHEME_ZISK_1_2_0,
             vkey_hash: [7u8; 32],
             layout_id: LAYOUT_HEADER_FALLBACK,
         };
@@ -299,12 +381,12 @@ mod tests {
     fn find_matches_curve_scheme_and_vkey_within_count_only() {
         let e0 = RegistryEntry {
             curve: CURVE_BN254,
-            scheme: SCHEME_PLONK,
+            scheme: SCHEME_ZISK_1_2_0,
             vkey_hash: [7u8; 32],
             layout_id: LAYOUT_HEADER_FALLBACK,
         };
         let d = build(1, [0u8; 32], &[e0]);
-        let (idx, got) = find(&d, CURVE_BN254, SCHEME_PLONK, &[7u8; 32], 0)
+        let (idx, got) = find(&d, CURVE_BN254, SCHEME_ZISK_1_2_0, &[7u8; 32], 0)
             .unwrap()
             .unwrap();
         assert_eq!(idx, 0);
@@ -312,7 +394,7 @@ mod tests {
         assert!(find(&d, CURVE_BN254, SCHEME_GROTH16, &[7u8; 32], 0)
             .unwrap()
             .is_none());
-        assert!(find(&d, CURVE_BLS12_381, SCHEME_PLONK, &[7u8; 32], 0)
+        assert!(find(&d, CURVE_BLS12_381, SCHEME_ZISK_1_2_0, &[7u8; 32], 0)
             .unwrap()
             .is_none());
     }
@@ -324,29 +406,29 @@ mod tests {
     fn find_selects_by_vkey_when_curve_and_scheme_collide() {
         let primary = RegistryEntry {
             curve: CURVE_BN254,
-            scheme: SCHEME_PLONK,
+            scheme: SCHEME_ZISK_1_2_0,
             vkey_hash: [1u8; 32],
             layout_id: LAYOUT_HEADER_FALLBACK,
         };
         let fallback = RegistryEntry {
             curve: CURVE_BN254,
-            scheme: SCHEME_PLONK,
+            scheme: SCHEME_ZISK_1_2_0,
             vkey_hash: [2u8; 32],
             layout_id: LAYOUT_HEADER_FALLBACK,
         };
         let d = build(1, [0u8; 32], &[primary, fallback]);
-        let (idx0, got0) = find(&d, CURVE_BN254, SCHEME_PLONK, &[1u8; 32], 0)
+        let (idx0, got0) = find(&d, CURVE_BN254, SCHEME_ZISK_1_2_0, &[1u8; 32], 0)
             .unwrap()
             .unwrap();
         assert_eq!(idx0, 0);
         assert_eq!(got0, primary);
-        let (idx1, got1) = find(&d, CURVE_BN254, SCHEME_PLONK, &[2u8; 32], 0)
+        let (idx1, got1) = find(&d, CURVE_BN254, SCHEME_ZISK_1_2_0, &[2u8; 32], 0)
             .unwrap()
             .unwrap();
         assert_eq!(idx1, 1);
         assert_eq!(got1, fallback);
         // an unregistered vkey under the same (curve, scheme) matches neither entry
-        assert!(find(&d, CURVE_BN254, SCHEME_PLONK, &[9u8; 32], 0)
+        assert!(find(&d, CURVE_BN254, SCHEME_ZISK_1_2_0, &[9u8; 32], 0)
             .unwrap()
             .is_none());
     }
@@ -384,7 +466,7 @@ mod tests {
     fn entry_at_activation_slot_is_zero_on_v1() {
         let e0 = RegistryEntry {
             curve: CURVE_BN254,
-            scheme: SCHEME_PLONK,
+            scheme: SCHEME_ZISK_1_2_0,
             vkey_hash: [7u8; 32],
             layout_id: LAYOUT_ZISK_V1,
         };
@@ -401,7 +483,7 @@ mod tests {
         to_v2(&mut d);
         let e = RegistryEntry {
             curve: CURVE_BN254,
-            scheme: SCHEME_PLONK,
+            scheme: SCHEME_ZISK_1_2_0,
             vkey_hash: [0x44u8; 32],
             layout_id: LAYOUT_ZISK_V1,
         };
@@ -423,23 +505,25 @@ mod tests {
         d[OFF_COUNT] = 1;
         let e = RegistryEntry {
             curve: CURVE_BN254,
-            scheme: SCHEME_PLONK,
+            scheme: SCHEME_ZISK_1_2_0,
             vkey_hash: [0x44u8; 32],
             layout_id: LAYOUT_ZISK_V1,
         };
         write_entry(&mut d, 0, &e, 1_000).unwrap();
 
-        assert!(find(&d, CURVE_BN254, SCHEME_PLONK, &e.vkey_hash, 999)
+        assert!(find(&d, CURVE_BN254, SCHEME_ZISK_1_2_0, &e.vkey_hash, 999)
             .unwrap()
             .is_none());
-        let (idx, got) = find(&d, CURVE_BN254, SCHEME_PLONK, &e.vkey_hash, 1_000)
+        let (idx, got) = find(&d, CURVE_BN254, SCHEME_ZISK_1_2_0, &e.vkey_hash, 1_000)
             .unwrap()
             .unwrap();
         assert_eq!(idx, 0);
         assert_eq!(got, e);
-        assert!(find(&d, CURVE_BN254, SCHEME_PLONK, &e.vkey_hash, 1_001)
-            .unwrap()
-            .is_some());
+        assert!(
+            find(&d, CURVE_BN254, SCHEME_ZISK_1_2_0, &e.vkey_hash, 1_001)
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// `RETIRED_SLOT` is the tombstone value, and `find` already skips it for every real slot
@@ -453,21 +537,216 @@ mod tests {
         d[OFF_COUNT] = 1;
         let e = RegistryEntry {
             curve: CURVE_BN254,
-            scheme: SCHEME_PLONK,
+            scheme: SCHEME_ZISK_1_2_0,
             vkey_hash: [0x55u8; 32],
             layout_id: LAYOUT_ZISK_V1,
         };
         write_entry(&mut d, 0, &e, RETIRED_SLOT).unwrap();
 
         // Every real slot a chain's Clock can ever report is well below u64::MAX.
-        assert!(find(&d, CURVE_BN254, SCHEME_PLONK, &e.vkey_hash, 0)
+        assert!(find(&d, CURVE_BN254, SCHEME_ZISK_1_2_0, &e.vkey_hash, 0)
             .unwrap()
             .is_none());
-        assert!(
-            find(&d, CURVE_BN254, SCHEME_PLONK, &e.vkey_hash, u64::MAX - 1)
-                .unwrap()
-                .is_none()
+        assert!(find(
+            &d,
+            CURVE_BN254,
+            SCHEME_ZISK_1_2_0,
+            &e.vkey_hash,
+            u64::MAX - 1
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    // --- ZisK releases: scheme numbers and `find_zisk` ---
+
+    fn zisk_entry(scheme: u8, vk: u8) -> RegistryEntry {
+        RegistryEntry {
+            curve: CURVE_BN254,
+            scheme,
+            vkey_hash: [vk; 32],
+            layout_id: LAYOUT_ZISK_V1,
+        }
+    }
+
+    /// A v2-length registry holding `entries`, each with its own activation slot.
+    fn v2_with(entries: &[(RegistryEntry, u64)]) -> Vec<u8> {
+        let mut d = build(1, [0u8; 32], &[]);
+        to_v2(&mut d);
+        d[OFF_COUNT] = entries.len() as u8;
+        for (i, (e, slot)) in entries.iter().enumerate() {
+            write_entry(&mut d, i, e, *slot).unwrap();
+        }
+        d
+    }
+
+    #[test]
+    fn find_zisk_returns_the_scheme_2_entry_for_its_programvk() {
+        let other = zisk_entry(SCHEME_ZISK_1_2_0, 0x11);
+        let wanted = zisk_entry(SCHEME_ZISK_1_3_1, 0x22);
+        let d = v2_with(&[(other, 0), (wanted, 0)]);
+        let (idx, got) = find_zisk(&d, &[0x22; 32], 0).unwrap().unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(got, wanted);
+        assert_eq!(got.scheme, SCHEME_ZISK_1_3_1);
+        // a vkey nobody registered finds nothing
+        assert!(find_zisk(&d, &[0x33; 32], 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn find_zisk_finds_an_entry_written_before_releases_were_named() {
+        // A v1-length account whose only entry carries scheme 1, the value every earlier entry has.
+        let e = zisk_entry(1, 0x44);
+        let d = build(1, [0u8; 32], &[e]);
+        assert_eq!(d.len(), REGISTRY_LEN);
+        let (idx, got) = find_zisk(&d, &[0x44; 32], 0).unwrap().unwrap();
+        assert_eq!((idx, got), (0, e));
+    }
+
+    #[test]
+    fn find_zisk_skips_retired_entries() {
+        let d = v2_with(&[
+            (zisk_entry(SCHEME_ZISK_1_3_1, 0x55), RETIRED_SLOT),
+            (zisk_entry(SCHEME_ZISK_1_3_1, 0x66), 0),
+        ]);
+        assert!(find_zisk(&d, &[0x55; 32], 0).unwrap().is_none());
+        assert!(find_zisk(&d, &[0x55; 32], u64::MAX - 1).unwrap().is_none());
+        assert!(find_zisk(&d, &[0x66; 32], 0).unwrap().is_some());
+    }
+
+    #[test]
+    fn find_zisk_skips_entries_that_start_in_the_future() {
+        let e = zisk_entry(SCHEME_ZISK_1_3_1, 0x77);
+        let d = v2_with(&[(e, 1_000)]);
+        assert!(find_zisk(&d, &[0x77; 32], 999).unwrap().is_none());
+        assert_eq!(find_zisk(&d, &[0x77; 32], 1_000).unwrap(), Some((0, e)));
+        assert_eq!(find_zisk(&d, &[0x77; 32], 1_001).unwrap(), Some((0, e)));
+    }
+
+    #[test]
+    fn find_zisk_refuses_two_active_matches_under_schemes_1_and_2() {
+        let d = v2_with(&[
+            (zisk_entry(SCHEME_ZISK_1_2_0, 0x88), 0),
+            (zisk_entry(SCHEME_ZISK_1_3_1, 0x88), 0),
+        ]);
+        assert_eq!(
+            find_zisk(&d, &[0x88; 32], 0).unwrap_err(),
+            FindZiskError::TwoActiveMatches
         );
+        // The same two entries are not ambiguous while one of them is not yet active, or once it is retired.
+        let future = v2_with(&[
+            (zisk_entry(SCHEME_ZISK_1_2_0, 0x88), 0),
+            (zisk_entry(SCHEME_ZISK_1_3_1, 0x88), 500),
+        ]);
+        let (idx, got) = find_zisk(&future, &[0x88; 32], 499).unwrap().unwrap();
+        assert_eq!((idx, got.scheme), (0, SCHEME_ZISK_1_2_0));
+        assert_eq!(
+            find_zisk(&future, &[0x88; 32], 500).unwrap_err(),
+            FindZiskError::TwoActiveMatches
+        );
+        let retired = v2_with(&[
+            (zisk_entry(SCHEME_ZISK_1_2_0, 0x88), RETIRED_SLOT),
+            (zisk_entry(SCHEME_ZISK_1_3_1, 0x88), 0),
+        ]);
+        let (idx, got) = find_zisk(&retired, &[0x88; 32], 10).unwrap().unwrap();
+        assert_eq!((idx, got.scheme), (1, SCHEME_ZISK_1_3_1));
+    }
+
+    #[test]
+    fn find_zisk_refuses_the_same_vkey_twice_under_one_scheme() {
+        let e = zisk_entry(SCHEME_ZISK_1_3_1, 0x99);
+        let d = v2_with(&[(e, 0), (e, 0)]);
+        assert_eq!(
+            find_zisk(&d, &[0x99; 32], 0).unwrap_err(),
+            FindZiskError::TwoActiveMatches
+        );
+    }
+
+    #[test]
+    fn find_zisk_ignores_other_curves_other_families_and_unassigned_numbers() {
+        let groth = RegistryEntry {
+            scheme: SCHEME_GROTH16,
+            ..zisk_entry(SCHEME_ZISK_1_3_1, 0xaa)
+        };
+        let bls = RegistryEntry {
+            curve: CURVE_BLS12_381,
+            ..zisk_entry(SCHEME_ZISK_1_3_1, 0xaa)
+        };
+        let unassigned = zisk_entry(3, 0xaa);
+        let top = zisk_entry(255, 0xaa);
+        let d = v2_with(&[(groth, 0), (bls, 0), (unassigned, 0), (top, 0)]);
+        assert!(find_zisk(&d, &[0xaa; 32], 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn find_zisk_reads_only_populated_entries() {
+        let mut d = v2_with(&[(zisk_entry(SCHEME_ZISK_1_3_1, 0xbb), 0)]);
+        d[OFF_COUNT] = 0;
+        assert!(find_zisk(&d, &[0xbb; 32], 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn find_zisk_passes_layout_errors_through() {
+        let d = vec![0u8; REGISTRY_LEN - 1];
+        assert!(matches!(
+            find_zisk(&d, &[0; 32], 0).unwrap_err(),
+            FindZiskError::Layout(crate::LayoutError::TooShort { .. })
+        ));
+        let mut bad = build(1, [0u8; 32], &[]);
+        bad[OFF_MAGIC] ^= 0xff;
+        assert_eq!(
+            find_zisk(&bad, &[0; 32], 0).unwrap_err(),
+            FindZiskError::Layout(crate::LayoutError::BadMagic)
+        );
+    }
+
+    /// The published release numbers. A row here never changes and a number is never reused: a new
+    /// release is appended to `ZISK_RELEASES` with the next unused number and its row is appended here.
+    const PUBLISHED_RELEASES: [(u8, &str); 2] = [(1, "1.2.0-alpha"), (2, "1.3.1-alpha")];
+
+    #[test]
+    fn zisk_release_numbers_are_never_reused() {
+        assert!(ZISK_RELEASES.len() >= PUBLISHED_RELEASES.len());
+        for (i, (scheme, name)) in PUBLISHED_RELEASES.iter().enumerate() {
+            assert_eq!(
+                ZISK_RELEASES[i].scheme, *scheme,
+                "row {i} changed its number"
+            );
+            assert_eq!(ZISK_RELEASES[i].name, *name, "row {i} changed its name");
+        }
+        // Numbers count up from 1 with no gap, so a skipped or repeated number is a change to the list.
+        for (i, r) in ZISK_RELEASES.iter().enumerate() {
+            assert_eq!(
+                r.scheme as usize,
+                i + 1,
+                "release numbers must be 1, 2, 3, ..."
+            );
+        }
+        // Names are unique too, and none of them is the Groth16 value.
+        for (i, a) in ZISK_RELEASES.iter().enumerate() {
+            assert_ne!(a.scheme, SCHEME_GROTH16);
+            for b in &ZISK_RELEASES[i + 1..] {
+                assert_ne!(a.name, b.name);
+            }
+        }
+    }
+
+    #[test]
+    fn release_constants_have_their_published_values() {
+        assert_eq!(SCHEME_ZISK_1_2_0, 1);
+        assert_eq!(SCHEME_ZISK_1_3_1, 2);
+        assert_eq!(SCHEME_GROTH16, 0);
+    }
+
+    #[test]
+    fn zisk_release_lookup_by_scheme() {
+        assert_eq!(zisk_release_name(SCHEME_ZISK_1_2_0), Some("1.2.0-alpha"));
+        assert_eq!(zisk_release_name(SCHEME_ZISK_1_3_1), Some("1.3.1-alpha"));
+        assert_eq!(zisk_release_name(SCHEME_GROTH16), None);
+        assert_eq!(zisk_release_name(3), None);
+        assert_eq!(zisk_release_name(255), None);
+        assert!(is_zisk_scheme(1) && is_zisk_scheme(2));
+        assert!(!is_zisk_scheme(0) && !is_zisk_scheme(3) && !is_zisk_scheme(255));
     }
 
     #[test]

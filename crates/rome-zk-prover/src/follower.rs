@@ -296,6 +296,7 @@ fn try_resume(
     sidecar_path: &Path,
     proof_path: &Path,
     vkey: &VkeyOfRecord,
+    zisk_scheme: u8,
     chain_id: u64,
     inbox_batch: &zk_inbox_client::BatchAccount,
 ) -> Option<(RecordChecked, u32, f64)> {
@@ -339,7 +340,7 @@ fn try_resume(
     // SAME check `build_post_ix` runs before every send, run here too before trusting a cached
     // artefact — any failure falls through to `None` (wipe + rebuild), never a halt.
     let verify_started = std::time::Instant::now();
-    poster::verify_checked(&checked, vkey).ok()?;
+    poster::verify_checked(&checked, vkey, zisk_scheme).ok()?;
     let verify_wall_ms = verify_started.elapsed().as_secs_f64() * 1000.0;
     Some((checked, sidecar.provenance.attempt, verify_wall_ms))
 }
@@ -494,6 +495,7 @@ where
             &sidecar_path,
             &proof_path,
             &cfg.vkey,
+            anchor1.zisk_scheme,
             cfg.chain_id,
             &anchor1.inbox_batch_head_plus_1,
         ) {
@@ -754,7 +756,8 @@ where
                 // but fails the real BN254 pairing (a subprocess writing a structurally-valid but
                 // cryptographically broken file) is retry material, counted against
                 // `max_prove_attempts`, never an unbounded halt.
-                poster::verify_checked(&checked, &cfg.vkey).map_err(|e| e.to_string())?;
+                poster::verify_checked(&checked, &cfg.vkey, anchor1.zisk_scheme)
+                    .map_err(|e| e.to_string())?;
                 Ok(checked)
             })();
             match verified {
@@ -1639,9 +1642,9 @@ mod tests {
     fn gate_proof_bytes() -> Vec<u8> {
         std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../fixtures/prover-input/txv1-dev-reset6-batch-1.plonk.bin"
+            "/../../fixtures/prover-input/txv1-dev-reset6-batch-1.zisk-1.3.1.plonk.bin"
         ))
-        .expect("fixtures/prover-input/txv1-dev-reset6-batch-1.plonk.bin")
+        .expect("fixtures/prover-input/txv1-dev-reset6-batch-1.zisk-1.3.1.plonk.bin")
     }
 
     /// The real reset-6 batch-1 chunk bodies + `open_slot`, decoded straight out of the committed
@@ -1707,7 +1710,7 @@ mod tests {
     fn tiber_vkey() -> VkeyOfRecord {
         VkeyOfRecord::load(std::path::Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../fixtures/vkeys/tiber-200101-layout1.json"
+            "/../../fixtures/vkeys/tiber-200101-layout1.zisk-1.3.1.json"
         )))
         .expect("load vkey of record")
     }
@@ -2193,7 +2196,7 @@ mod tests {
             d[OFF_COUNT] = 1;
             let e = OFF_ENTRIES;
             d[e] = CURVE_BN254;
-            d[e + 1] = SCHEME_PLONK;
+            d[e + 1] = SCHEME_ZISK_1_3_1;
             d[e + 2..e + 34].copy_from_slice(&vkey.program_vk);
             d[e + 34] = LAYOUT_ZISK_V1;
             let a = OFF_ACTIVATION;
@@ -3989,6 +3992,7 @@ mod tests {
                 &sidecar_path,
                 &proof_path,
                 &cfg.vkey,
+                anchor1.zisk_scheme,
                 cfg.chain_id,
                 &anchor1.inbox_batch_head_plus_1,
             )
@@ -4005,6 +4009,7 @@ mod tests {
                 &sidecar_path,
                 &proof_path,
                 &cfg.vkey,
+                anchor1.zisk_scheme,
                 cfg.chain_id,
                 &other_acc,
             )
@@ -4019,6 +4024,7 @@ mod tests {
                 &sidecar_path,
                 &proof_path,
                 &cfg.vkey,
+                anchor1.zisk_scheme,
                 cfg.chain_id + 1,
                 &anchor1.inbox_batch_head_plus_1,
             )
@@ -4633,7 +4639,12 @@ mod tests {
         let checked = crate::calldata::check_against_record(&cd, &vkey)
             .expect("still checks clean vs record");
         assert!(
-            poster::verify_checked(&checked, &vkey).is_err(),
+            poster::verify_checked(
+                &checked,
+                &vkey,
+                rome_zk_layouts::registry::SCHEME_ZISK_1_3_1
+            )
+            .is_err(),
             "a flipped proof_bytes byte must fail the real BN254 pairing"
         );
     }

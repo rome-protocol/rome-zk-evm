@@ -1,12 +1,255 @@
 # Changelog
 
+## Unreleased
+
+- Every default that names a release now names v0.3.0 and ZisK 1.3.1-alpha: `./rollup guest-build`, its image, and `rome-zk-ops vkey register --evm-tag`.
+
 ## v0.2.2
 
 - The licence is now Rome Protocol's licence. Releases up to v0.2.1 keep Apache-2.0.
 - `SECURITY.md` explains how to report a security problem.
 - The guides now name v0.2.2, the first release with `./rollup guest-build`.
 
-The sections below describe the code in this release. Deposits are built but not deployed on devnet yet.
+v0.2.2 was cut from an earlier commit than this one. The sections below describe `main`, which runs ahead of the
+programs deployed on devnet: deposits are built but not deployed there yet.
+
+## The prover host on ZisK 1.3.1
+
+- `deploy/rollup/prover/setup-prover-host.sh` sets up a GPU host for ZisK 1.3.1-alpha, now the default release. It
+  downloads both key archives itself and unpacks the files it has checked. `ziskup` runs with `--nokey`, so it installs
+  the binaries and downloads no key. The archives come from the location named in the `BUCKET_URL` line of the checked
+  `ziskup`; `KEYS_URL_BASE` overrides it, and with neither the script stops with `KeysUrlMissing`.
+- What is hash-checked, and when: `ziskup` before it runs (`ZiskupHashMismatch`); both key archives before either is
+  unpacked (`KeyArchiveHashMismatch`); the two GPU binaries, `cargo-zisk` and `cargo-zisk-dev`, after `ziskup` has
+  installed them and before the script runs either (`BinaryHashMismatch`). A missing pin is `ZiskPinMissing`. The pins sit
+  in `deploy/rollup/guest-build/zisk/1.3.1-alpha.env` and `deploy/rollup/prover/host-pins/1.3.1-alpha.env`.
+- Nothing else is checked. `ziskup` downloads the release's binary archive with no hash check, unpacks it and runs
+  `cargo-zisk toolchain install` as root before the script checks any binary, and the rest of that archive
+  (`zisk-worker`, `ziskemu`, `libziskclib.a`, the ZisK sources) is never checked.
+- The keys manifest, `keys.sha256`, now holds the pins of the 1.3.1-alpha key set (it held the 1.2.0-alpha pins before). A key set
+  that differs is refused with `KeysShaMismatch`.
+- `setup-prover-host.sh` has the modes `--check-ziskup`, `--check-archives` and `--check-binaries`, which check one
+  download against its pin and change nothing.
+
+## The operator tool and ZisK releases
+
+- `vkey register` takes `--zisk <release>`, which is required. A release that is not open is refused before any file is
+  read or the guest is rebuilt (`ZiskVersionNotOpen`, or `ZiskVersionUnknown` for a name the registry does not have). The
+  guest is rebuilt in that release's image and keys, and the instruction carries the release's scheme number. A
+  programVK that a live entry already holds under another release is refused before the rebuild
+  (`VkeyUnderOtherZiskVersion`). `--anchor-zisk` names the release of the anchor key when it differs.
+- Each ZisK release is rebuilt with its own proving keys: the image refuses the keys of another release, so an anchor in
+  another release could not succeed with one directory. `--proving-key-dir` is the `--zisk` release's and the new
+  `--anchor-proving-key-dir` is the `--anchor-zisk` release's. A release with no directory is refused by name
+  (`ProvingKeyDirMissing`) before any rebuild starts.
+- `vkey register` reads the registry and the slot again after the rebuild, so the activation slot and the already-active
+  check are of the chain as it is when the key is sent, not as it was when the build began.
+- `scripts/vkey-register.sh` requires `--zisk` and passes it, `--anchor-zisk` and `--anchor-proving-key-dir` on. Its test
+  now holds the flags it sends against the ones `vkey register` takes.
+- `vkey show` prints the release and its standing for every entry, and warns about a live entry under a release that is
+  closing or withdrawn.
+- `vkey retire-version --zisk <release>` retires every live entry under a release on every chain, one transaction each.
+  A dry run lists them.
+- `./rollup guest-build` reads `ZISK_RELEASE` from `.env`, passes the release and its toolchain tag to the image, and the
+  image name carries the release. `rome-zk-ops` builds in the same image.
+- `rome-zk-ops` now depends on the `veritas` crate for the release table, so `Cargo.lock` gained one line; it was
+  regenerated on the build box.
+
+## Deposit commands and checks
+
+- `./rollup check` judges the vault against the genesis balance until the chain has a final batch (an exit needs one),
+  so a short vault fails once a deposit queue exists; and "inbox batches" fails by name on an unreadable
+  `BLOCKS_PER_BATCH` instead of skipping.
+
+- `zk-bridge-client` gains builders for `InitBridgeConfig`, `InitDepositQueue`, `ProposeDepositParams` and
+  `ActivateDepositParams`, with program tests that send each and check a refusal by name.
+- `rome-zk-ops` gains `deposit-queue init|propose|activate|show`, `close-deposit` and `bridge-config init|show`.
+  `deposit-queue init` and `propose` refuse values outside the program's bounds, a per-block limit that does not fit a
+  batch, a chain that has never posted a root and an activation slot outside one to two challenge windows, each by name
+  and before sending anything.
+- `./rollup` gains `deposit-queue`, `deposit` and `close-deposit`. `./rollup init` renders the sequencer's `[deposits]`
+  section from the Solana RPC URL and settlement program it already has; a chain with no queue yet seals as it would
+  without the section, and the sequencer's tests hold that.
+- `./rollup check` gains items for the deposit-capable key, the per-block and per-batch limits, the genesis balance and the
+  vault, the exit configuration's bridge, the `[deposits]` section, the batch cursor's format, the oldest waiting
+  deposit against the deadline and the queue backlog.
+
+## guest-build: a pin file per ZisK release
+
+- The guest-build image takes the ZisK release as a build argument (`ZISK_RELEASE`, 1.2.0-alpha until a build names
+  another). Everything that belongs to a release moves out of the Dockerfile and `guest-build.sh` into one file,
+  `deploy/rollup/guest-build/zisk/<release>.env`: the download URLs with their sha256 values, the Rust toolchain tag,
+  the vadcop_final root of the key set and the scheme number. Files for 1.2.0-alpha and 1.3.1-alpha (commit 306a9c9,
+  Rust toolchain `zisk-4.0.0`) are there. The guest tag is a build argument (`ROME_ZK_GUEST_TAG`) and the image's labels
+  record the ZisK release, the toolchain tag and both source tags.
+- The release in `vkey.json` is the image's own: it is written to a file when the image is built, and the environment of
+  a container cannot change it. The build stops with `GuestZiskMismatch` unless the guest's `Cargo.lock` pins `ziskos`
+  and every other `zisk-*` crate at that release (a guest locked to 1.2.0-alpha is not built in the 1.3.1-alpha image),
+  and `guest-build` stops with `ZiskToolchainMismatch` unless the image's `cargo-zisk` is that release at the pin file's
+  commit. A pin file that names a key twice is refused with `PinFileInvalid`.
+- `vkey.json` gains `zisk` (the release) and `scheme` (a number: 1 for 1.2.0-alpha, 2 for 1.3.1-alpha). A proving-key
+  directory of another release is refused with `ProvingKeyMismatch`, naming the release the keys are of; an image whose
+  release has no pin file is refused with `ZiskReleaseUnknown`.
+
+## Veritas: one key and one pinned recursion root per ZisK release
+
+- Veritas holds a release table (`veritas::versions`, `veritas::zisk_version(scheme)`): one row per ZisK release,
+  numbered as the registry's `scheme` byte, with its wrapper key and the `rootCVadcopFinal` its proofs carry.
+  ZisK 1.3.1-alpha (scheme 2) is Open. ZisK 1.2.0-alpha (scheme 1) is Withdrawn: its key is in the library only
+  behind the `zisk-1-2-0-test-key` feature, so a production build of Veritas holds one key.
+- `verify_zisk` takes the release row. A proof whose `rootCVadcopFinal` is not the row's pinned value is rejected
+  before anything is hashed, so a poster can no longer choose the recursion root. `verify` and `trace` take the key.
+- The standalone program's instruction data is now one release byte followed by the 1,344-byte ABI. An unknown
+  release byte, or the withdrawn release, fails with `InvalidInstructionData`.
+- Fixtures for the same three blocks proven with each release are in `fixtures/zisk-releases/`, with their
+  `SHA256SUMS`. The tests check each release's proofs pass under their own row and are refused under the other, and
+  print the 1.3.1 compute units (437,919 for block 14, under the 541,225 target).
+- Transitional: `rome-zk-prover` still checks under scheme 1, so it enables the 1.2.0 key feature for now.
+  `Cargo.lock` gains one line: Veritas lists itself as a dev-dependency, to turn the 1.2.0 test key on in its own
+  tests.
+
+## Settlement: `PostRootProved` picks the key from the entry's ZisK release
+
+- `PostRootProved` finds the entry with `registry::find_zisk` and takes the release from its `scheme`. An entry
+  under a withdrawn release (scheme 1, every entry written before the release table) is refused as
+  `ZiskVersionWithdrawn` (new error 87). A proof whose `rootCVadcopFinal` is not the value pinned for the
+  entry's release is refused as `RootCNotOfVersion` (new error 88) before the layout checks and the pairing, so
+  the poster can no longer choose the recursion root. A programVK with no ZisK entry is still
+  `RegistryEntryNotFound`. Measured on real BPF, a wrong recursion root costs 13,364 to 14,864 compute units to
+  refuse and a withdrawn release 11,851 to 16,351. The spread is between test runs: it follows the bump search
+  for the program's accounts, which depends on the program id and the chain id, not on the proof.
+- `SetRegistryEntry` accepts every scheme number that names a ZisK release (1 and 2), so a chain can register a
+  ZisK 1.3.1 key.
+- `SetRegistryEntry` now holds a write to the release's status. A new entry, or a moved activation slot, under a
+  withdrawn release is refused as `ZiskVersionWithdrawn` (87), and under a closing release as `ZiskVersionClosing`
+  (new error 89). Retiring an entry that is present is always allowed, so a withdrawn release's entries can be
+  cleaned up. A ZisK scheme on any curve other than BN254 is `UnknownCurveOrScheme`. A new ZisK entry whose
+  programVK a live entry already holds under another release is refused as `VkeyUnderOtherZiskVersion` (new error
+  90), so one programVK still picks one entry.
+- `InitChainV2` on the reserved path runs every genesis registry entry through the same rules (curve and scheme,
+  release status, one programVK under two releases). Before, it wrote them unchecked.
+- Callers: `vkey register` in `rome-zk-ops` now writes scheme 2 (the open release) until it takes a release
+  option, and the batcher restart test registers its entries under it. `registry_entries_for_init` (behind
+  `rome-zk-ops register --reserved`) and the genesis registry of the `devnet_driver` example write scheme 2 as
+  well. The prover's anchor finds the key with `registry::find_zisk`, under whichever ZisK release the entry
+  names, instead of one fixed scheme number. A test in `zk-settlement` checks that the release list in
+  `rome-zk-layouts` and the one in Veritas name the same releases under the same numbers. This part changes no
+  lockfile; the one `Cargo.lock` line of these changes is the Veritas one above.
+- The prover's poster tests that send a post to a real settlement build register the gate key under 1.3.1. The
+  two that need a successful post are ignored until a real 1.3.1 batch proof exists; the tests that expect a
+  refusal run, and the gate proof (from 1.2.0) is refused for its recursion root.
+- `zk-settlement` no longer enables Veritas's 1.2.0 test key: it holds the ZisK 1.3.1 key only. The test that
+  posts a real 1.3.1 layout-1 batch proof was written first and ignored. This part changes no lockfile either.
+- That test now runs, with the real ZisK 1.3.1 proof of the dev chain's first batch, its calldata and its key
+  record (`fixtures/prover-input/txv1-dev-reset6-batch-1.zisk-1.3.1.*`, `fixtures/vkeys/tiber-200101-layout1.zisk-1.3.1.json`).
+  It checks the key record and the proof describe the same program, recursion root, scheme and layout, posts the proof
+  under a scheme-2 entry, and checks the batch is final with the proof's own state root and block hashes. The post
+  costs 468,334 to 490,834 compute units on real BPF. The figure moves with the program id and the chain id
+  (the bump search for the program's accounts takes a different number of attempts, 1,500 units each), not with
+  the proof, so it has no single value. The test asserts it stays under the prover's 700,000 limit and compares
+  the proof's public values with the independent record of the batch.
+
+## Registry: ZisK release numbers
+
+- The registry entry's `scheme` byte now names a ZisK release: `1` is ZisK 1.2.0-alpha (every entry written so far)
+  and `2` is ZisK 1.3.1-alpha. `rome-zk-layouts` exports `SCHEME_ZISK_1_2_0`, `SCHEME_ZISK_1_3_1` and the release list
+  `ZISK_RELEASES`; numbers are never reused. The old `SCHEME_PLONK` alias is gone: every caller names its ZisK
+  release. No account layout, entry size or instruction changes.
+- `registry::find_zisk` finds the one active BN254 entry for a verification-key hash under any ZisK scheme, and
+  refuses two active matches by name (`FindZiskError::TwoActiveMatches`). `PostRootProved` and the prover's
+  anchor both use it.
+
+## Bridge deposits: a posted chain, replaceable proposals, vault settlement checks
+
+- `InitDepositQueue` and `Deposit` refuse a chain whose root has never taken a posted batch
+  (`ChainNeverPosted`, new error 48). Reclaiming a chain needs that counter at 0 and it only grows, so a chain
+  that holds a queue can never be reclaimed, and the registry's inbox cannot change under a queue.
+- `Deposit` also checks that the registry names the bridge config's inbox, as `CloseDeposit` does, and takes the
+  bridge config as a last read-only account.
+- `ProposeDepositParams` replaces a pending proposal instead of refusing it (`PendingParamsExist` is no longer
+  returned; its code stays reserved). The activation slot must be between one and two challenge windows from the
+  current slot (`ActivationTooLate`, new error 49). `ActivateDepositParams` runs all the parameter bound checks
+  again on the pending set.
+- `InitVault` and `ReleaseExit` take the bridge config as a last read-only account and refuse a settlement program
+  other than the config's (`WrongSettlementProgram`).
+- `init_vault_ix`, `release_exit_ix` and `deposit_ix` in `zk-bridge-client` add the bridge config account, so
+  `rome-zk-ops` sends it without a change of its own.
+
+## Verification-key registration
+
+- `rome-zk-ops` gains `vkey register`, Rome's checked registration of a chain's verification key. It refuses by name
+  unless the chain id (`ChainIdMismatch`), the genesis (`GenesisMismatch`), the rebuilt guest's sha256
+  (`ElfMismatch`) and the recomputed programVK (`VkeyMismatch`) all match what the operator sent, then builds
+  `SetRegistryEntry` for the registry authority. It is a dry run that prints the instruction and the activation slot
+  unless `--confirm` sends it as a V1 transaction. The guest is rebuilt in the same pinned image `./rollup guest-build`
+  uses. `scripts/vkey-register.sh` wraps it.
+- `vkey register` also checks that a genesis balance is backed: the rebuild's `genesis_balance` is kept, and when it is
+  not zero, while the chain's root is still at genesis, its `exit_config` must name Rome's bridge program
+  (`--bridge-program`, default the devnet program in the rollup's program list; `BridgeNotConfigured`, `BridgeNotRome`)
+  and the chain's vault on it must exist, hold wrapped SOL in a token account the vault authority owns, with a balance of
+  at least that many lamports (`VaultMissing`, `VaultNotWrappedSol`, `VaultNotOwnedByAuthority`, `VaultUnderfunded`). The
+  balance is read from the line the pinned guest build prints (`address=… wei=… lamports=…`); a balance that is not a
+  whole number of lamports is refused (`BalanceNotWholeLamports`). Deposits still waiting in the chain's queue do not
+  count: the vault must hold the balance plus every queued deposit. An empty account at the queue's address counts as no
+  queue, so lamports sent there cannot block registration.
+- `vkey register` refuses a genesis whose alloc is not what the rollup template renders: the exit portal must hold
+  exactly the published runtime with no storage and no balance (`PortalNotCanonical`), and no other address may hold code
+  or storage (`GenesisAllocUnexpected`).
+- Once a chain's root has moved past genesis, `vkey register` needs `--anchor-guest-tag`: the operator's genesis is
+  rebuilt at that tag and must reproduce the programVK of a registered, non-retired entry, else `GenesisUnanchored`.
+  Every report prints `genesis_sha256=`. `--anchor-evm-tag` sets the node tag for that rebuild (default: `--evm-tag`).
+  `scripts/vkey-register.sh` takes the new flags.
+- `vkey register` no longer re-sends a key that is already registered: `VkeyAlreadyActive` for an active one,
+  `VkeyPending` for a pending one unless `--move-pending-activation` is given.
+- The local-validator test for `vkey register` fails when `solana-test-validator` is missing; `ROME_ZK_SKIP_LOCAL_VALIDATOR=1`
+  skips it.
+- `rome-zk-ops` gains `vkey show`, which prints a chain's registry entries and when each activates. `chain-status`
+  prints the same summary lines from the same function, so `./rollup check`'s verification-key item and `vkey show`
+  cannot disagree.
+
+## Inbox: FinalizeBatchV2 and header v3
+
+- `InboxIx::FinalizeBatchV2 { step, deposit_to }` (discriminant 11) replaces `FinalizeBatch` (6), which is now
+  refused by name. `zk-inbox-client` gains `finalize_batch_v2_ix`, which names the exit config, the cursor, the
+  queue and the two records around `deposit_to`; the settlement watcher decodes it as a finalize step.
+- On the call that completes a batch the program binds the exit config, the queue and the records by address,
+  checks the range (`from` is the cursor's `deposit_next`, `deposit_to` within the queue's count and
+  `max_per_batch`, the inclusion deadline), writes the range into a version-3 header, builds `forced_root` with
+  the shared deposit functions and advances the cursor. An empty range gives exactly the forced root and `acc`
+  `FinalizeBatch` gave. A batch with a version-2 header takes only an empty range.
+- A version-1 cursor is reallocated to the 69-byte version-2 layout on the first completing call. It must already
+  hold the rent for 69 bytes (a plain transfer first), otherwise the call is refused by name.
+- New error names for the refusals: retired instruction, wrong exit config address, wrong queue address, wrong
+  record address or owner, no deposit queue, a version-2 header with a non-empty range, a range below `from` or
+  above the queue's count or `max_per_batch`, a missed deadline and a cursor short of rent.
+- Batches take their deposits in id order. The completing call also reads the previous batch, which
+  `finalize_batch_v2_ix` names as a last account: it is refused when that account is at the wrong address or is an
+  open batch of this program, accepted when it is final or gone, and skipped for batch 0. The batcher's
+  loaded-accounts requirement counts that account too.
+- `AbandonBatch` takes the previous batch as one more read-only account and applies the same check, so a batch
+  cannot be abandoned while the batch before it is open. A gone previous batch therefore means every earlier batch
+  is final or gone, and the order rule holds by induction. `abandon_batch_ix` names the account itself; its
+  arguments are unchanged.
+
+## Inbox: deposit deadline measured at open time
+
+- `FinalizeBatchV2` measures a deposit's age at the batch's committed open time (`open_unix_ts` in its header)
+  instead of at the time of the finalizing call. Whether a batch can finalize is now settled when it opens, so a
+  batcher that is down or late can no longer turn an open batch into one that cannot be finalized, which would
+  have left the chain without a batch it could settle. The cost is that a batch can leave out a deposit that
+  became overdue only after the batch opened.
+- That verdict holds for a fixed grace of 24 hours (`DEPOSIT_GRACE_SECS`, a constant in the program). The age is
+  measured at the later of the batch's open time and 24 hours before the finalizing call, so batches opened
+  early and held open cannot keep a deposit out for as long as they like. The longest a waiting deposit can be
+  left out is its deadline plus 24 hours, and a batch held open more than 24 hours past a waiting deposit's
+  deadline can only take that deposit or be abandoned. The refusal is the existing `DepositDeadlineMissed`.
+- A batch with a version-2 header now finalizes with the empty range even when the queue holds an overdue deposit.
+  Its blocks were sealed before any queue existed.
+- The batcher applies the same rule before `OpenBatch` and does not open a batch that the program would refuse. It
+  keeps 300 s inside the deadline, because its clock and the cluster's differ and `OpenBatch` lands after the
+  check, and it uses the shorter of the active and a pending inclusion deadline. Its
+  loaded-accounts requirement for a finalize now counts the bridge accounts a finalize with deposits loads: the
+  cursor's version-2 layout, the exit config, the queue and two deposit records.
 
 ## Bridge deposits
 
@@ -163,6 +406,26 @@ bytes it did before, and the tests pin that against the old encodings.
   now depends on `alloy-eips` and `alloy-trie` with default features off. `canonical_header_rule` and
   `EMPTY_WITHDRAWALS` are unchanged, and with an empty list the new rule is exactly the old one. `BlockEnv`
   gained a `withdrawals` field later; see "Deposit groundwork".
+
+## Batcher: FinalizeBatchV2 with the stream's deposit range
+
+- `finalize_and_verify` sends `FinalizeBatchV2` with a range it works out from the batch's own posted frames: `from`
+  is the live cursor's `deposit_next` and `to` is the end `resolve_deposits_end` gives over the decoded stream. The
+  restart path goes through the same code, so a restart cannot finalize a batch with a range its stream does not
+  carry.
+- The bridge program in the instruction is read from the chain's exit config; a chain without one finalizes an
+  empty range, and a stream that takes deposits there is refused before anything is sent.
+- Before sending, the posted chunks are decoded and compared with the blocks they were cut from (the re-derive check
+  now includes `deposits_end`). After the finalize, `acc` is recomputed from the chunks and the header's range, and
+  the header's range must be the one sent.
+- Before a chain's first `FinalizeBatchV2` on a v1 cursor, the batcher tops the cursor up to the 69-byte rent minimum
+  with one plain transfer (idempotent).
+- At startup the batcher reads the cursor's `deposit_next` and the queue's per-batch limit and gives them to the log
+  source and the grouper.
+- The batcher reads the exit config and the queue the way the program does: an exit config counts only when the
+  settlement program owns it, and a queue only when the bridge program owns it. A funded empty account at either
+  address no longer stops a finalize or the startup. `AccountOps` gained `get_account_owner` for this.
+- `examples/abandon_batches.rs`: list the batch ids oldest first.
 
 ## Batcher: deposits in the stream
 

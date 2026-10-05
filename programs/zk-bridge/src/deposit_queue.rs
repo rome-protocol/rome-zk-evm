@@ -8,9 +8,14 @@
 //! Parameter bounds are fixed in this program and change only with an upgrade: a deadline between 1 and 24
 //! hours, `1 <= max_per_block <= max_per_batch <= 256`, a minimum amount of at least 1 base unit, a fee of
 //! at most 0.01 SOL, and a fee recipient that holds the rent-exempt minimum for an empty account and is
-//! neither executable nor a sysvar (checked again when a proposal activates). The
-//! chain authority changes the parameters the way it changes its exit config: a proposal with an
-//! activation slot at least one challenge window away, then a permissionless activation.
+//! neither executable nor a sysvar (all checked again when a proposal activates). The chain authority
+//! changes the parameters the way it changes its exit config: a proposal with an activation slot between
+//! one and two challenge windows away, then a permissionless activation. A new proposal replaces a pending
+//! one.
+//!
+//! A queue is created only for a chain whose root has taken a posted batch. Reclaiming a chain needs that
+//! counter at 0 and it only grows, so a chain that holds a queue is never reclaimed and its registry's inbox
+//! never changes.
 
 use crate::bridge_config;
 use crate::errors::BridgeError;
@@ -61,6 +66,17 @@ fn to_layout(p: &DepositParamsArgs) -> DepositParams {
     }
 }
 
+fn from_layout(p: &DepositParams) -> DepositParamsArgs {
+    DepositParamsArgs {
+        inclusion_deadline_secs: p.inclusion_deadline_secs,
+        max_per_batch: p.max_per_batch,
+        max_per_block: p.max_per_block,
+        min_amount: p.min_amount,
+        fee_lamports: p.fee_lamports,
+        fee_recipient: Pubkey::new_from_array(p.fee_recipient),
+    }
+}
+
 /// The program's fixed bounds on one parameter set, plus the fee recipient's rent exemption.
 pub fn check_params(p: &DepositParamsArgs, fee_recipient: &AccountInfo) -> ProgramResult {
     if p.inclusion_deadline_secs < MIN_DEADLINE_SECS {
@@ -97,20 +113,37 @@ pub fn check_fee_recipient(fee_recipient: &AccountInfo, expected: &Pubkey) -> Pr
     Ok(())
 }
 
-/// Checks `root_acc` is the chain's `["root", chain_id]` account under `settlement_program` and is owned by
-/// it. A reclaimed chain has no root, and nothing can credit or refund a deposit made there.
+/// Checks `root_acc` is the chain's `["root", chain_id]` account under `settlement_program`, is owned by
+/// it, and has taken at least one posted batch. A reclaimed chain has no root, and nothing can credit or
+/// refund a deposit made there. A root that has never taken a posted batch can still be reclaimed by
+/// anyone, so it takes no deposits; `head_pending_batch` only grows and reclaim needs it at 0, so a chain
+/// that passes this check can never be reclaimed.
 pub fn require_root(
     settlement_program: &Pubkey,
     chain_id: u64,
     root_acc: &AccountInfo,
 ) -> ProgramResult {
+    read_posted_root(settlement_program, chain_id, root_acc).map(|_| ())
+}
+
+/// [`require_root`], returning the decoded root.
+fn read_posted_root(
+    settlement_program: &Pubkey,
+    chain_id: u64,
+    root_acc: &AccountInfo,
+) -> Result<rome_zk_layouts::root::RootFields, ProgramError> {
     let (expect_root, _) = rome_zk_layouts::root::pda(settlement_program, chain_id);
     if expect_root != *root_acc.key || root_acc.owner != settlement_program {
         return Err(BridgeError::RootNotCanonical.into());
     }
     let d = root_acc.try_borrow_data()?;
     match rome_zk_layouts::root::read(&d) {
-        Ok(root) if root.chain_id == chain_id => Ok(()),
+        Ok(root) if root.chain_id == chain_id => {
+            if root.head_pending_batch == 0 {
+                return Err(BridgeError::ChainNeverPosted.into());
+            }
+            Ok(root)
+        }
         _ => Err(BridgeError::RootNotCanonical.into()),
     }
 }
@@ -138,13 +171,13 @@ pub fn load_registry(
 }
 
 /// Checks `root` is at the config's settlement program's `["root", chain_id]` PDA, owned by that program,
-/// and that `chain_authority` signed and is its authority. Returns the root's challenge window.
+/// and that `chain_authority` signed and is its authority. Returns the decoded root.
 fn require_chain_authority(
     settlement_program: &Pubkey,
     chain_id: u64,
     root_acc: &AccountInfo,
     chain_authority: &AccountInfo,
-) -> Result<u32, ProgramError> {
+) -> Result<rome_zk_layouts::root::RootFields, ProgramError> {
     let (expect_root, _) = rome_zk_layouts::root::pda(settlement_program, chain_id);
     if expect_root != *root_acc.key || root_acc.owner != settlement_program {
         return Err(BridgeError::RootNotCanonical.into());
@@ -160,7 +193,7 @@ fn require_chain_authority(
     {
         return Err(BridgeError::NotChainAuthority.into());
     }
-    Ok(root.challenge_window_slots)
+    Ok(root)
 }
 
 /// Checks `queue_acc` is the chain's queue under this program, owned by it, and decodes it.
@@ -210,12 +243,18 @@ pub fn init_deposit_queue(
     if rome_zk_layouts::chainid::is_reserved(args.chain_id) {
         return Err(BridgeError::ReservedChainId.into());
     }
-    require_chain_authority(
+    let root = require_chain_authority(
         &settlement_program,
         args.chain_id,
         root_acc,
         chain_authority,
     )?;
+    // A chain that has never posted can be reclaimed by anyone, which would strand every deposit in its
+    // vault. `head_pending_batch` only grows and reclaim needs it at 0, so once it is above 0 the chain, and
+    // with it the registry's inbox, is fixed for as long as the queue exists.
+    if root.head_pending_batch == 0 {
+        return Err(BridgeError::ChainNeverPosted.into());
+    }
 
     // The registry belongs to the canonical settlement program, and it must name the canonical inbox.
     let registry = load_registry(&settlement_program, args.chain_id, registry_acc)?;
@@ -296,7 +335,8 @@ pub fn propose_deposit_params(
         args.chain_id,
         root_acc,
         chain_authority,
-    )?;
+    )?
+    .challenge_window_slots;
     let mut fields = load_queue(program_id, &settlement_program, args.chain_id, queue_acc)?;
 
     if challenge_window == 0 {
@@ -306,10 +346,11 @@ pub fn propose_deposit_params(
     if args.activation_slot < now.saturating_add(challenge_window as u64) {
         return Err(BridgeError::ActivationTooSoon.into());
     }
-    // No cancel path: a pending proposal is applied or superseded only after it activates.
-    if fields.activation_slot != 0 {
-        return Err(BridgeError::PendingParamsExist.into());
+    if args.activation_slot > now.saturating_add(2 * challenge_window as u64) {
+        return Err(BridgeError::ActivationTooLate.into());
     }
+    // A pending proposal is replaced by this one: the chain authority can always correct a proposal that
+    // cannot activate. Every change still waits at least one full challenge window from now.
     check_params(&args.params, fee_recipient_acc)?;
 
     fields.pending = to_layout(&args.params);
@@ -346,10 +387,9 @@ pub fn activate_deposit_params(
     if Clock::get()?.slot < fields.activation_slot {
         return Err(BridgeError::ActivationNotReached.into());
     }
-    check_fee_recipient(
-        fee_recipient_acc,
-        &Pubkey::new_from_array(fields.pending.fee_recipient),
-    )?;
+    // The full bounds again, not only the fee recipient: the bounds may have changed in an upgrade since
+    // the proposal was made.
+    check_params(&from_layout(&fields.pending), fee_recipient_acc)?;
     fields.params = fields.pending;
     fields.pending = DepositParams::default();
     fields.activation_slot = 0;

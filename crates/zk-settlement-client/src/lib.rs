@@ -226,13 +226,13 @@ pub fn registry_entries_for_init(
     vec![
         RegistryEntry {
             curve: rome_zk_layouts::registry::CURVE_BN254,
-            scheme: rome_zk_layouts::registry::SCHEME_PLONK,
+            scheme: rome_zk_layouts::registry::SCHEME_ZISK_1_3_1,
             vkey_hash: layout1_vk,
             layout_id: rome_zk_layouts::registry::LAYOUT_ZISK_V1,
         },
         RegistryEntry {
             curve: rome_zk_layouts::registry::CURVE_BN254,
-            scheme: rome_zk_layouts::registry::SCHEME_PLONK,
+            scheme: rome_zk_layouts::registry::SCHEME_ZISK_1_3_1,
             vkey_hash: fallback_vk,
             layout_id: rome_zk_layouts::registry::LAYOUT_HEADER_FALLBACK,
         },
@@ -1561,7 +1561,7 @@ mod tests {
         let payer = Pubkey::new_unique();
         let entry = RegistryEntry {
             curve: rome_zk_layouts::registry::CURVE_BN254,
-            scheme: rome_zk_layouts::registry::SCHEME_PLONK,
+            scheme: rome_zk_layouts::registry::SCHEME_ZISK_1_3_1,
             vkey_hash: [0x44u8; 32],
             layout_id: rome_zk_layouts::registry::LAYOUT_ZISK_V1,
         };
@@ -1596,7 +1596,7 @@ mod tests {
         d[44] = 1; // count
         let base = rome_zk_layouts::registry::OFF_ENTRIES;
         d[base] = rome_zk_layouts::registry::CURVE_BN254;
-        d[base + 1] = rome_zk_layouts::registry::SCHEME_PLONK;
+        d[base + 1] = rome_zk_layouts::registry::SCHEME_ZISK_1_2_0;
         d[base + 2..base + 34].copy_from_slice(&[0x22u8; 32]);
         d[base + 34] = rome_zk_layouts::registry::LAYOUT_HEADER_FALLBACK;
 
@@ -1627,7 +1627,7 @@ mod tests {
         d[44] = 1; // count
         let base = rome_zk_layouts::registry::OFF_ENTRIES;
         d[base] = rome_zk_layouts::registry::CURVE_BN254;
-        d[base + 1] = rome_zk_layouts::registry::SCHEME_PLONK;
+        d[base + 1] = rome_zk_layouts::registry::SCHEME_ZISK_1_2_0;
         d[base + 2..base + 34].copy_from_slice(&[0x33u8; 32]);
         d[base + 34] = rome_zk_layouts::registry::LAYOUT_ZISK_V1;
         let aoff = rome_zk_layouts::registry::OFF_ACTIVATION;
@@ -1728,7 +1728,14 @@ mod tests {
         );
         assert_eq!(entries[0].vkey_hash, layout1);
         assert_eq!(entries[0].curve, rome_zk_layouts::registry::CURVE_BN254);
-        assert_eq!(entries[0].scheme, rome_zk_layouts::registry::SCHEME_PLONK);
+        assert_eq!(
+            entries[0].scheme,
+            rome_zk_layouts::registry::SCHEME_ZISK_1_3_1
+        );
+        assert_eq!(
+            entries[1].scheme,
+            rome_zk_layouts::registry::SCHEME_ZISK_1_3_1
+        );
         assert_eq!(
             entries[1].layout_id,
             rome_zk_layouts::registry::LAYOUT_HEADER_FALLBACK
@@ -1740,6 +1747,24 @@ mod tests {
         );
         assert_eq!(entries[2].scheme, rome_zk_layouts::registry::SCHEME_GROTH16);
         assert_eq!(entries[2].vkey_hash, [0u8; 32]);
+    }
+
+    /// A genesis registry names an open ZisK release: the program refuses a withdrawn one, so a scheme the
+    /// program would turn away must never come out of `registry_entries_for_init`.
+    #[test]
+    fn registry_entries_for_init_names_the_open_release() {
+        let entries = registry_entries_for_init([0x11u8; 32], [0x22u8; 32]);
+        for e in entries
+            .iter()
+            .filter(|e| e.scheme != rome_zk_layouts::registry::SCHEME_GROTH16)
+        {
+            assert!(rome_zk_layouts::registry::is_zisk_scheme(e.scheme));
+            assert_ne!(
+                e.scheme,
+                rome_zk_layouts::registry::SCHEME_ZISK_1_2_0,
+                "that release is withdrawn"
+            );
+        }
     }
 
     /// `decode_exit_nullifier_account` round-trips the exact bytes

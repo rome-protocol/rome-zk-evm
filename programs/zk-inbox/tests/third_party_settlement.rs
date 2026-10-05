@@ -25,7 +25,7 @@
 //! Loads the real, `cargo build-sbf`-compiled `zk_inbox.so` (`prefer_bpf`).
 
 use rome_zk_layouts::chainid::PERMISSIONLESS_BASE;
-use rome_zk_testkit::{cursor_account, root_account_with_authority};
+use rome_zk_testkit::{cursor_account_for, root_account_with_authority};
 use solana_program::pubkey::Pubkey;
 use solana_program_test::ProgramTestContext;
 use solana_sdk::{
@@ -145,7 +145,7 @@ impl World {
         if let Some(n) = with_victim_cursor_at {
             pt.add_account(
                 client::cursor_pda(&self.inbox, &self.real_settlement, VICTIM_CHAIN).0,
-                cursor_account(self.inbox, VICTIM_CHAIN, n),
+                cursor_account_for(2, self.inbox, VICTIM_CHAIN, n),
             );
         }
         pt.add_account(self.victim.pubkey(), funded_account());
@@ -558,7 +558,7 @@ async fn finalize_real_batch_one(w: &World, ctx: &mut ProgramTestContext) {
             client::chunk_body_hash(&body),
         ),
         client::seal_leaf_ix(&w.inbox, &w.real_settlement, VICTIM_CHAIN, 1, 0),
-        client::finalize_batch_ix(
+        finalize_v2(
             &w.inbox,
             &w.victim.pubkey(),
             &w.real_settlement,
@@ -716,4 +716,25 @@ async fn an_abandoned_batchs_chunk_closes_only_against_its_own_settlement_progra
     .await
     .expect("the abandoned batch's chunk closes against the real settlement program's root");
     assert!(!account_exists(&mut ctx, &real_chunk).await);
+}
+
+/// `FinalizeBatchV2` over an empty deposit range (the chain has no deposits, the cursor's `deposit_next` is 0).
+fn finalize_v2(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    settlement_program: &Pubkey,
+    chain_id: u64,
+    batch: u64,
+    step: u32,
+) -> solana_program::instruction::Instruction {
+    client::finalize_batch_v2_ix(
+        program_id,
+        authority,
+        settlement_program,
+        chain_id,
+        batch,
+        step,
+        0,
+        None,
+    )
 }

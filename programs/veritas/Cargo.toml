@@ -12,6 +12,10 @@ crate-type = ["cdylib", "lib"]
 [features]
 default = []
 no-entrypoint = []
+# The ZisK 1.2.0 key, for tests only: it lets them check that a proof from one release is refused under the
+# other release's key. The dev-dependency below switches it on for this crate's own tests; a crate that
+# depends on veritas gets only the 1.3.1 key unless it turns this feature on by name.
+zisk-1-2-0-test-key = []
 
 [dependencies]
 solana-program.workspace = true
@@ -21,6 +25,7 @@ solana-bn254.workspace = true
 workspace = true
 
 [dev-dependencies]
+veritas = { path = ".", features = ["zisk-1-2-0-test-key"] }
 solana-program-test.workspace = true
 solana-sdk.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

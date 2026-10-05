@@ -80,6 +80,11 @@ impl AccountOps for ScriptedChain {
         Ok(self.accounts.get(pubkey).cloned())
     }
 
+    async fn get_account_owner(&self, pubkey: &Pubkey) -> Result<Option<Pubkey>, ResolveError> {
+        // This fake holds no exit config or deposit queue, so the owner is never asked about those.
+        Ok(self.accounts.get(pubkey).map(|_| Pubkey::default()))
+    }
+
     async fn accounts_exist(&self, pubkeys: &[Pubkey]) -> Result<Vec<bool>, ResolveError> {
         Ok(pubkeys
             .iter()

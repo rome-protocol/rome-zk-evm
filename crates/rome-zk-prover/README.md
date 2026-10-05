@@ -62,10 +62,13 @@ start, never a silently-ignored setting. `max_prove_attempts` is read here but u
 loop; this crate's own `Prover` implementation never retries.
 
 `VkeyOfRecord::load` deserializes the vkey-of-record JSON fixture
-(`fixtures/vkeys/<chain>-layout1.json` — the one file that owns `programVK`, `rootCVadcopFinal`,
-`elf_sha256`, `chain_id` and `layout_id`; this module never invents a literal for any of them) and
-refuses, by name, any `layout_id` other than 1 or a hex field that fails to decode or is the wrong
-length (`BadHex`/`BadHexLen`). `Config::load_vkey_of_record` additionally refuses
+(`fixtures/vkeys/<chain>-layout1.zisk-<release>.json` — the one file that owns `programVK`, `rootCVadcopFinal`,
+`elf_sha256`, `chain_id`, `layout_id` and the ZisK release the guest was built and proved under; this module never
+invents a literal for any of them) and refuses, by name, any `layout_id` other than 1 or a hex field that fails to
+decode or is the wrong length (`BadHex`/`BadHexLen`), a record with no `zisk` field (`ZiskVersionMissing`), a release
+the verifier table does not know (`ZiskVersionUnknown`) or has withdrawn (`ZiskVersionWithdrawn`), a
+`rootCVadcopFinal` that is not the release's pinned recursion root (`RootCNotOfVersion`), and a `scheme` that is not
+the release's own. `Config::load_vkey_of_record` additionally refuses
 (`VkeyJsonMismatch`) a vkey json whose `chain_id` disagrees with the running config, and
 (`ElfMismatch`) an ELF file whose sha256 disagrees with the vkey json's `elf_sha256`. A registry
 rotation the operator has not yet pointed this config at is a refusal to start, not a silent proof of
@@ -80,9 +83,17 @@ pub trait Prover {
 ```
 
 `LocalCargoZisk` runs `<zisk_home>/bin/cargo-zisk prove -e <elf> -i <input> --plonk -y [-g] -o <out_file>`
-as a subprocess, spawned as the leader of its own new process group. Verified
-(`cargo-zisk` 1.2.0-alpha): `-o <path>` produces the proof at that exact file path (not a directory);
-`--plonk` runs the STARK step and the SNARK wrap in one invocation.
+as a subprocess, spawned as the leader of its own new process group, with `ZISK_HOME=<zisk_home>` in its environment so
+the binary, the proving key and the cache come from one install. Written against `cargo-zisk` 1.3.1-alpha: `-o <path>`
+produces the proof at that exact file path (not a directory); `--plonk` runs the STARK step and the SNARK wrap in one
+invocation.
+
+Release. Before every proof the `--version` line is read, and the release in it has to be the one the vkey of record
+names, or the prover refuses by name (`ZiskVersionMismatch`) before proving anything. At start-up the binary also checks
+that the install's proving key is that release's key set: the root of `provingKey/zisk/vadcop_final/vadcop_final.verkey.json`
+has to be the release's pinned recursion root (`ProvingKeyMismatch`). The local check of each finished proof, and the
+post, use the release the chain's active registry entry for the programVK names, the same release whose key the program
+checks under (`anchor` refuses an entry whose release is not the record's, `ReleaseNotOfRecord`).
 
 GPU. The GPU build of `cargo-zisk` has a runtime `-g` flag on `prove`, and without it that build proves on the CPU.
 The CPU-only build has no such flag at all. The two builds tell themselves apart in the `--version` line, `[gpu]` or
@@ -151,8 +162,10 @@ three facts the chain — never the proof — supplies. `block_roots_merkle` is 
 poster claim the proof does not bind).
 
 Tested against the first real proof of the reset chain's batch 1, committed as
-`fixtures/prover-input/txv1-dev-reset6-batch-1.{json,bin,plonk.bin}`: that real PLONK proof decodes
-to the registered vkey of record (`programVK 0xe5ea5c14…`) and its committed public values cover
+`fixtures/prover-input/txv1-dev-reset6-batch-1.{json,bin}` and its ZisK 1.3.1 proof
+`txv1-dev-reset6-batch-1.zisk-1.3.1.plonk.bin`: that real PLONK proof decodes to the registered vkey of record
+(`programVK 0x77c143cf…`), the four fields it decodes to are the ones ZisK's own export
+(`…zisk-1.3.1.calldata.json`) holds for it, and its committed public values cover
 batch 1, blocks 1..=60, matching the sidecar's own recorded parent hash, state root, and both
 commitments.
 

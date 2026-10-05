@@ -4,6 +4,10 @@
 # Exercises LocalCargoZisk on the fast-exit path: the call must still return promptly with the
 # lines the tool printed, and the helper must not survive the call.
 set -eu
+if [ "${1:-}" = "--version" ]; then
+  echo "cargo-zisk 1.3.1-alpha [cpu] (306a9c9 fake-build)"
+  exit 0
+fi
 out=""
 while [ "$#" -gt 0 ]; do
   case "$1" in

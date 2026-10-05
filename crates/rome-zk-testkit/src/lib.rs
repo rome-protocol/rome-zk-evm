@@ -122,8 +122,12 @@ pub fn cursor_account_for(
     d[c::OFF_VERSION] = version;
     d[c::OFF_CHAIN_ID..c::OFF_CHAIN_ID + 8].copy_from_slice(&chain_id.to_le_bytes());
     d[c::OFF_NEXT_BATCH..c::OFF_NEXT_BATCH + 8].copy_from_slice(&next_batch.to_le_bytes());
+    // A version-1 cursor is funded for the 69 bytes it grows to on its first completing finalize, as the
+    // batcher's one-off top-up leaves it; a test of the top-up or of the short-of-rent refusal sets
+    // `lamports` itself.
+    let rent_bytes = d.len().max(c::LEN_V2);
     Account {
-        lamports: rent_exempt(d.len()),
+        lamports: rent_exempt(rent_bytes),
         data: d,
         owner: program_id,
         executable: false,

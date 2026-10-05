@@ -2,7 +2,8 @@
 
 use crate::field::Fr;
 use crate::g1::{self, G1};
-use crate::{vk, Trace};
+use crate::vk::{self, VerifyingKey};
+use crate::Trace;
 use solana_program::keccak;
 use solana_program::program_error::ProgramError;
 
@@ -58,9 +59,9 @@ fn add_mul(acc: &G1, p: &G1, scalar: &Fr) -> Result<G1, ProgramError> {
     g1::add(acc, &g1::mul(p, &scalar.to_be_bytes())?)
 }
 
-/// Runs the whole verification and keeps every intermediate value. `proof` is 768 bytes and
+/// Runs the whole verification under `key` and keeps every intermediate value. `proof` is 768 bytes and
 /// `signal` 32. MALFORMED (section 5) is `Err(InvalidInstructionData)`.
-pub fn run(proof: &[u8], signal: &[u8]) -> Result<Trace, ProgramError> {
+pub fn run(key: &VerifyingKey, proof: &[u8], signal: &[u8]) -> Result<Trace, ProgramError> {
     if proof.len() != PROOF_LEN || signal.len() != 32 {
         return Err(malformed());
     }
@@ -91,7 +92,7 @@ pub fn run(proof: &[u8], signal: &[u8]) -> Result<Trace, ProgramError> {
     let (w_z, w_zw) = (point(proof, 7)?, point(proof, 8)?);
 
     // Section 6: the transcript.
-    let beta = challenge(&[&vk::COMMITMENTS, signal, &proof[0..192]]);
+    let beta = challenge(&[key.commitments(), signal, &proof[0..192]]);
     let beta_b = beta.to_be_bytes();
     let gamma = challenge(&[&beta_b]);
     let gamma_b = gamma.to_be_bytes();
@@ -133,13 +134,13 @@ pub fn run(proof: &[u8], signal: &[u8]) -> Result<Trace, ProgramError> {
     let coef_s3 = perm_tail.mul(&alpha).mul(&beta).neg();
     let zh_zn = z_h.mul(&z_n);
     let zh_z2n = zh_zn.mul(&z_n);
-    let mut d = vk::Q_C;
-    d = add_mul(&d, &vk::Q_M, &a_bar.mul(&b_bar))?;
-    d = add_mul(&d, &vk::Q_L, &a_bar)?;
-    d = add_mul(&d, &vk::Q_R, &b_bar)?;
-    d = add_mul(&d, &vk::Q_O, &c_bar)?;
+    let mut d = *key.q_c();
+    d = add_mul(&d, key.q_m(), &a_bar.mul(&b_bar))?;
+    d = add_mul(&d, key.q_l(), &a_bar)?;
+    d = add_mul(&d, key.q_r(), &b_bar)?;
+    d = add_mul(&d, key.q_o(), &c_bar)?;
     d = add_mul(&d, pz, &coef_z)?;
-    d = add_mul(&d, &vk::S_SIGMA_3, &coef_s3)?;
+    d = add_mul(&d, key.s_sigma_3(), &coef_s3)?;
     d = add_mul(&d, t_lo, &z_h.neg())?;
     d = add_mul(&d, t_mid, &zh_zn.neg())?;
     d = add_mul(&d, t_hi, &zh_z2n.neg())?;
@@ -153,8 +154,8 @@ pub fn run(proof: &[u8], signal: &[u8]) -> Result<Trace, ProgramError> {
     f = add_mul(&f, pa, &v)?;
     f = add_mul(&f, pb, &v2)?;
     f = add_mul(&f, pc, &v3)?;
-    f = add_mul(&f, &vk::S_SIGMA_1, &v4)?;
-    f = add_mul(&f, &vk::S_SIGMA_2, &v5)?;
+    f = add_mul(&f, key.s_sigma_1(), &v4)?;
+    f = add_mul(&f, key.s_sigma_2(), &v5)?;
 
     // Step 11.
     let e_scalar = r0

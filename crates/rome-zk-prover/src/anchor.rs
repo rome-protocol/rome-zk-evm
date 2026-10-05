@@ -17,6 +17,11 @@ pub type BatchAccount = zk_inbox_client::BatchAccount;
 pub struct Anchor {
     pub root: zk_settlement_client::RootAccount,
     pub registry: zk_settlement_client::RegistryAccount,
+    /// The ZisK release the chain's active registry entry for the vkey of record names, as the registry's
+    /// scheme byte. The prover checks its proofs locally under this release's key, the same one the program
+    /// picks from that entry. [`anchor`] refuses a snapshot whose entry names another release than the vkey
+    /// of record does, so this always equals `vkey.scheme`.
+    pub zisk_scheme: u8,
     pub chain_config: zk_settlement_client::ChainConfigAccount,
     pub cursor_next_batch: u64,
     /// `None` at the genesis sentinel (`candidate_batch == 1`, predecessor batch 0 was never a real
@@ -145,6 +150,17 @@ pub enum AnchorError {
     /// than halting.
     #[error("snapshot fetch: {0}")]
     Fetch(#[from] FetchError),
+    /// The chain's active registry entry for the vkey of record names a different ZisK release than the
+    /// record does (`record` and `registry` are scheme bytes). Proofs from the record's release would be
+    /// checked under another release's key and refused, so nothing is proved.
+    #[error(
+        "the registry's active entry for vkey 0x{program_vk} names ZisK scheme {registry}, the vkey of record's release is scheme {record}"
+    )]
+    ReleaseNotOfRecord {
+        program_vk: String,
+        record: u8,
+        registry: u8,
+    },
 }
 
 /// A [`SnapshotFetch::get_multiple_accounts`] call itself failed — transport-level, never a decoded
@@ -274,14 +290,17 @@ pub fn anchor(
     let registry = zk_settlement_client::decode_registry_account(&registry_bytes)
         .map_err(|e| AnchorError::RegistryDecode(e.to_string()))?;
 
-    let active = registry.entries.iter().any(|e| {
-        e.curve == rome_zk_layouts::registry::CURVE_BN254
-            && e.scheme == rome_zk_layouts::registry::SCHEME_PLONK
-            && e.vkey_hash == vkey.program_vk
-            && e.layout_id == rome_zk_layouts::registry::LAYOUT_ZISK_V1
-            && e.activation_slot <= slot
-            && !e.retired
-    });
+    // The same lookup the program makes: the one active BN254 entry for this programVK under any ZisK
+    // release. The entry's scheme is the release; the key is found under it, whichever release that is.
+    let (active, zisk_scheme) =
+        match rome_zk_layouts::registry::find_zisk(&registry_bytes, &vkey.program_vk, slot) {
+            Ok(Some((_, e))) => (
+                e.layout_id == rome_zk_layouts::registry::LAYOUT_ZISK_V1,
+                e.scheme,
+            ),
+            Ok(None) => (false, 0),
+            Err(e) => return Err(AnchorError::RegistryDecode(format!("{e:?}"))),
+        };
     if !active {
         let reason = if registry
             .entries
@@ -301,6 +320,16 @@ pub fn anchor(
         return Err(AnchorError::VkeyNotActive {
             program_vk: hex::encode(vkey.program_vk),
             reason,
+        });
+    }
+
+    // The registry's entry says which release's key the program checks this vkey's proofs under. A record
+    // built under another release would produce proofs the program refuses, so refuse before any proving.
+    if zisk_scheme != vkey.scheme {
+        return Err(AnchorError::ReleaseNotOfRecord {
+            program_vk: hex::encode(vkey.program_vk),
+            record: vkey.scheme,
+            registry: zisk_scheme,
         });
     }
 
@@ -398,6 +427,7 @@ pub fn anchor(
     Ok(Anchor {
         root,
         registry,
+        zisk_scheme,
         chain_config,
         global_config,
         cursor_next_batch,
@@ -630,6 +660,8 @@ mod tests {
             elf_sha256: [9u8; 32],
             chain_id: 200_101,
             layout_id: 1,
+            zisk: "1.3.1-alpha".to_string(),
+            scheme: rome_zk_layouts::registry::SCHEME_ZISK_1_3_1,
         }
     }
 
@@ -669,7 +701,7 @@ mod tests {
                     inbox_program.to_bytes(),
                     &[(
                         rome_zk_layouts::registry::CURVE_BN254,
-                        rome_zk_layouts::registry::SCHEME_PLONK,
+                        rome_zk_layouts::registry::SCHEME_ZISK_1_3_1,
                         vkey.program_vk,
                         rome_zk_layouts::registry::LAYOUT_ZISK_V1,
                         0,
@@ -850,7 +882,7 @@ mod tests {
                 f.inbox_program.to_bytes(),
                 &[(
                     rome_zk_layouts::registry::CURVE_BN254,
-                    rome_zk_layouts::registry::SCHEME_PLONK,
+                    rome_zk_layouts::registry::SCHEME_ZISK_1_3_1,
                     f.vkey.program_vk,
                     rome_zk_layouts::registry::LAYOUT_ZISK_V1,
                     rome_zk_layouts::registry::RETIRED_SLOT,
@@ -876,7 +908,7 @@ mod tests {
                 f.inbox_program.to_bytes(),
                 &[(
                     rome_zk_layouts::registry::CURVE_BN254,
-                    rome_zk_layouts::registry::SCHEME_PLONK,
+                    rome_zk_layouts::registry::SCHEME_ZISK_1_3_1,
                     f.vkey.program_vk,
                     rome_zk_layouts::registry::LAYOUT_ZISK_V1,
                     f.fetch.slot + 1, // activates one slot after this snapshot's own slot
@@ -886,6 +918,106 @@ mod tests {
         let err = f.anchor().unwrap_err();
         assert!(
             matches!(err, AnchorError::VkeyNotActive { ref reason, .. } if reason.contains("future")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn the_anchor_carries_the_release_the_registry_entry_names() {
+        let mut f = Fixture::happy_path();
+        let a = f.anchor().expect("happy path anchors");
+        assert_eq!(a.zisk_scheme, rome_zk_layouts::registry::SCHEME_ZISK_1_3_1);
+    }
+
+    #[test]
+    fn a_registry_entry_under_another_release_than_the_record_is_refused_by_name() {
+        let mut f = Fixture::happy_path();
+        put_registry_entry(
+            &mut f,
+            rome_zk_layouts::registry::SCHEME_ZISK_1_2_0,
+            rome_zk_layouts::registry::LAYOUT_ZISK_V1,
+        );
+        let err = f.anchor().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AnchorError::ReleaseNotOfRecord {
+                    record: 2,
+                    registry: 1,
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    fn put_registry_entry(f: &mut Fixture, scheme: u8, layout_id: u8) {
+        let (registry_pda, _) =
+            zk_settlement_client::registry_pda(&f.settlement_program, f.chain_id);
+        f.fetch.accounts.insert(
+            registry_pda,
+            encode_registry_v2(
+                f.chain_id,
+                f.inbox_program.to_bytes(),
+                &[(
+                    rome_zk_layouts::registry::CURVE_BN254,
+                    scheme,
+                    f.vkey.program_vk,
+                    layout_id,
+                    0,
+                )],
+            ),
+        );
+    }
+
+    /// The program takes the release from the entry, so the anchor must find the key under whichever ZisK
+    /// release the entry names, not under one fixed scheme number, and carry that release (a record built
+    /// under the same release is the one that anchors).
+    #[test]
+    fn the_key_is_found_under_every_zisk_release_the_registry_names() {
+        for release in rome_zk_layouts::registry::ZISK_RELEASES {
+            let mut f = Fixture::happy_path();
+            f.vkey.scheme = release.scheme;
+            put_registry_entry(
+                &mut f,
+                release.scheme,
+                rome_zk_layouts::registry::LAYOUT_ZISK_V1,
+            );
+            let a = f
+                .anchor()
+                .unwrap_or_else(|e| panic!("release {}: {e:?}", release.name));
+            assert_eq!(a.zisk_scheme, release.scheme, "release {}", release.name);
+        }
+    }
+
+    /// An entry whose scheme is not a ZisK release (Groth16, or a number no release has taken) does not
+    /// carry a ZisK key.
+    #[test]
+    fn an_entry_under_a_scheme_that_is_not_a_zisk_release_is_not_active() {
+        for scheme in [rome_zk_layouts::registry::SCHEME_GROTH16, 3u8, 200u8] {
+            let mut f = Fixture::happy_path();
+            put_registry_entry(&mut f, scheme, rome_zk_layouts::registry::LAYOUT_ZISK_V1);
+            let err = f.anchor().unwrap_err();
+            assert!(
+                matches!(err, AnchorError::VkeyNotActive { .. }),
+                "scheme {scheme}: {err:?}"
+            );
+        }
+    }
+
+    /// The anchor posts layout 1: a key registered under the header-only layout is not an active layout-1
+    /// key, whichever release it names.
+    #[test]
+    fn a_zisk_entry_under_the_header_layout_is_not_active_for_layout_1() {
+        let mut f = Fixture::happy_path();
+        put_registry_entry(
+            &mut f,
+            rome_zk_layouts::registry::SCHEME_ZISK_1_3_1,
+            rome_zk_layouts::registry::LAYOUT_HEADER_FALLBACK,
+        );
+        let err = f.anchor().unwrap_err();
+        assert!(
+            matches!(err, AnchorError::VkeyNotActive { .. }),
             "got {err:?}"
         );
     }
@@ -980,7 +1112,7 @@ mod tests {
                 inbox_program.to_bytes(),
                 &[(
                     rome_zk_layouts::registry::CURVE_BN254,
-                    rome_zk_layouts::registry::SCHEME_PLONK,
+                    rome_zk_layouts::registry::SCHEME_ZISK_1_3_1,
                     vkey.program_vk,
                     rome_zk_layouts::registry::LAYOUT_ZISK_V1,
                     0,

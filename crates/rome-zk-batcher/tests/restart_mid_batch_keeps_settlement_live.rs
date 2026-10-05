@@ -74,6 +74,30 @@ impl AccountOps for BanksAccountOps {
         Ok(account.map(|a| a.data))
     }
 
+    async fn get_account_owner(&self, pubkey: &Pubkey) -> Result<Option<Pubkey>, ResolveError> {
+        let account = self
+            .banks_client
+            .clone()
+            .get_account(*pubkey)
+            .await
+            .expect("BanksClient::get_account");
+        Ok(account.map(|a| a.owner))
+    }
+
+    async fn rent_shortfall(
+        &self,
+        pubkey: &Pubkey,
+        data_len: usize,
+    ) -> Result<Option<u64>, ResolveError> {
+        let account = self
+            .banks_client
+            .clone()
+            .get_account(*pubkey)
+            .await
+            .expect("BanksClient::get_account");
+        Ok(account.map(|a| rent_exempt(data_len).saturating_sub(a.lamports)))
+    }
+
     async fn accounts_exist(&self, pubkeys: &[Pubkey]) -> Result<Vec<bool>, ResolveError> {
         let mut out = Vec::with_capacity(pubkeys.len());
         for pubkey in pubkeys {
@@ -271,7 +295,7 @@ async fn register_chain(ctx: &mut ProgramTestContext, payer: &Keypair, c: &Chain
             registry_entries: vec![
                 sclient::RegistryEntry {
                     curve: reg_layout::CURVE_BN254,
-                    scheme: reg_layout::SCHEME_PLONK,
+                    scheme: reg_layout::SCHEME_ZISK_1_3_1,
                     vkey_hash: [0x11u8; 32],
                     layout_id: reg_layout::LAYOUT_HEADER_FALLBACK,
                 },
@@ -401,8 +425,16 @@ async fn post_group(
             }
         }
     }
-    let finalize =
-        zk_inbox_client::finalize_batch_ix(&inbox, &payer, &settlement, CHAIN_ID, batch, 0);
+    let finalize = zk_inbox_client::finalize_batch_v2_ix(
+        &inbox,
+        &payer,
+        &settlement,
+        CHAIN_ID,
+        batch,
+        0,
+        0,
+        None,
+    );
     sender
         .send_and_confirm(std::slice::from_ref(&finalize), tuning())
         .await
@@ -1000,13 +1032,15 @@ async fn a_restart_continues_a_finalize_that_had_started() {
     for f in &frames {
         seal(&env, &first, 1, f).await;
     }
-    let fin = zk_inbox_client::finalize_batch_ix(
+    let fin = zk_inbox_client::finalize_batch_v2_ix(
         &env.c.inbox_program,
         &env.c.authority.pubkey(),
         &env.c.settlement_program,
         CHAIN_ID,
         1,
         1,
+        0,
+        None,
     );
     first
         .send_and_confirm(std::slice::from_ref(&fin), tuning())
@@ -1026,7 +1060,7 @@ async fn a_restart_continues_a_finalize_that_had_started() {
             .all(|ix| ix.program_id != env.c.inbox_program
                 || matches!(
                     zk_inbox_client::decode_instruction(&ix.data),
-                    Ok(zk_inbox_client::InboxIx::FinalizeBatch { .. })
+                    Ok(zk_inbox_client::InboxIx::FinalizeBatchV2 { .. })
                 )),
         "only FinalizeBatch may be sent when every leaf is present"
     );
@@ -1079,4 +1113,298 @@ async fn a_gap_in_the_log_refuses_to_finish_a_zero_leaf_batch_and_sends_nothing(
         !a2.finalized && a2.leaves_present == 0,
         "batch 2 must stay open"
     );
+}
+
+// ===== A batch that takes deposits, restarted =====
+//
+// The queue, the exit config and the deposit records belong to the bridge and the settlement program, so they
+// are written as fixture accounts (as `programs/zk-inbox/tests/finalize_v2.rs` does); the inbox is the real
+// program. The restarted batcher must finish the batch with the range its own posted stream carries, because a
+// finalized batch with another range could not be proved and cannot be abandoned.
+
+use rome_zk_layouts::{
+    deposit::{self, queue_seed_hash, DepositRecord},
+    deposit_queue::{deposit_queue as dq, deposit_record as dr},
+    exit::exit_config as xc,
+};
+use solana_sdk::account::AccountSharedData;
+
+/// Like [`write_log`], but each block also credits the listed deposit indices on its first sub-block.
+fn write_log_with_deposits(dir: &Path, blocks: &[(u64, u16, &[u64])]) {
+    let sender = PrivateKeySigner::random();
+    let mut writer = LogWriter::open(dir, 10_000).unwrap();
+    let mut prev_hash = B256::ZERO;
+    for &(block, n_txs, credits) in blocks {
+        for index in 0..SUB_BLOCKS_PER_BLOCK {
+            let own: &[u64] = if index == 0 { credits } else { &[] };
+            let header = SubBlockHeader {
+                chain_id: CHAIN_ID,
+                block,
+                index,
+                timestamp_us: 1_757_000_000_000_000
+                    + (block * SUB_BLOCKS_PER_BLOCK as u64 + index as u64) * 50_000,
+                tx_root: B256::repeat_byte(index as u8),
+                receipts_root: B256::repeat_byte(index as u8 + 1),
+                gas_used: 21_000,
+                prev_hash,
+                deposits_end: own.last().map(|i| i + 1),
+            };
+            let signature = sign_header(&PrivateKeySigner::random(), &header);
+            let txs: Vec<_> = if index < n_txs {
+                vec![signed_raw_tx(
+                    &sender,
+                    CHAIN_ID,
+                    block * 1_000 + index as u64,
+                )]
+            } else {
+                vec![]
+            };
+            let withdrawals: Vec<_> = own
+                .iter()
+                .map(|&i| {
+                    rome_zk_executor_api::deposit_withdrawal(
+                        i,
+                        alloy::primitives::Address::repeat_byte(0x33),
+                        10_000 + i,
+                    )
+                })
+                .collect();
+            writer
+                .append_with_withdrawals(&header, &signature, &txs, &withdrawals)
+                .unwrap();
+            prev_hash = header.hash();
+        }
+    }
+}
+
+fn put(env: &mut Env, key: &Pubkey, account: Account) {
+    env.ctx.set_account(key, &AccountSharedData::from(account));
+}
+
+fn fixture(owner: Pubkey, data: Vec<u8>) -> Account {
+    Account {
+        lamports: rent_exempt(data.len()),
+        data,
+        owner,
+        executable: false,
+        rent_epoch: 0,
+    }
+}
+
+/// Writes the exit config naming `bridge`, a queue of `count` deposits and the deposit records, all fresh
+/// at the test clock so no inclusion deadline is in play. Returns the chain values `h_0..=h_count`.
+fn write_deposit_fixtures(env: &mut Env, bridge: Pubkey, count: u64) -> Vec<[u8; 32]> {
+    let sp = env.c.settlement_program;
+    let exit = xc::write(&xc::ExitConfigFields {
+        chain_id: CHAIN_ID,
+        exit_portal: [7; 20],
+        bridge_program: bridge.to_bytes(),
+        pending_exit_portal: [0; 20],
+        pending_bridge_program: [0; 32],
+        pending_exit_cap: 0,
+        pending_poster_bond: 0,
+        activation_slot: 0,
+        pending_mask: 0,
+    });
+    let exit_key = zk_inbox_client::exit_config_pda(&sp, CHAIN_ID).0;
+    put(env, &exit_key, fixture(sp, exit.to_vec()));
+
+    let hash = rome_zk_merkle::keccak256;
+    let records: Vec<DepositRecord> = (0..count)
+        .map(|i| DepositRecord {
+            sender: [i as u8 + 1; 32],
+            recipient: [0x33; 20],
+            amount_gwei: 10_000 + i,
+        })
+        .collect();
+    let mut chain = vec![queue_seed_hash(&hash, &sp.to_bytes(), CHAIN_ID)];
+    for k in 0..records.len() {
+        let next = deposit::chain_through(
+            &hash,
+            &sp.to_bytes(),
+            CHAIN_ID,
+            k as u64,
+            &chain[k],
+            &records[k..=k],
+        );
+        chain.push(next);
+    }
+    let mut q = vec![0u8; dq::LEN];
+    dq::write(
+        &mut q,
+        &dq::DepositQueueFields {
+            count,
+            head_hash: *chain.last().unwrap(),
+            params: dq::DepositParams {
+                inclusion_deadline_secs: 3_600,
+                max_per_batch: 10,
+                max_per_block: 10,
+                min_amount: 1,
+                fee_lamports: 0,
+                fee_recipient: [0; 32],
+            },
+            pending: dq::DepositParams::default(),
+            activation_slot: 0,
+        },
+    );
+    let queue_key = dq::pda(&bridge, &sp.to_bytes(), CHAIN_ID).0;
+    put(env, &queue_key, fixture(bridge, q));
+    for (i, r) in records.iter().enumerate() {
+        let mut d = vec![0u8; dr::LEN];
+        dr::write(
+            &mut d,
+            &dr::DepositRecordFields {
+                index: i as u64,
+                enqueue_unix_ts: CLOCK_UNIX_TS,
+                sender: r.sender,
+                recipient: r.recipient,
+                amount_gwei: r.amount_gwei,
+                hash_after: chain[i + 1],
+            },
+        );
+        let key = dr::pda(&bridge, &sp.to_bytes(), CHAIN_ID, i as u64).0;
+        put(env, &key, fixture(bridge, d));
+    }
+    chain
+}
+
+/// The header's range of batch 1 must be the one its posted stream ends at, and the cursor must have moved
+/// there.
+async fn assert_range_matches_stream(env: &Env, frames: &[Frame], from: u64, to: u64) {
+    let b = batch_acct(env, 1).await.unwrap();
+    assert!(b.finalized);
+    let range = b
+        .deposit
+        .expect("a batch opened by the current inbox has a v3 header");
+    assert_eq!((range.from, range.to), (from, to));
+    let blocks = channel::decode_stream(&channel::reassemble(frames).unwrap()).unwrap();
+    let ends = channel::resolve_deposits_end(&blocks, from).unwrap();
+    assert_eq!(
+        *ends.last().unwrap(),
+        range.to,
+        "the header's end is the stream's end"
+    );
+    pipeline::verify_acc(&b, frames).unwrap();
+    let cursor = env
+        .ctx
+        .banks_client
+        .clone()
+        .get_account(
+            zk_inbox_client::cursor_pda(&env.c.inbox_program, &env.c.settlement_program, CHAIN_ID)
+                .0,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let cursor = zk_inbox_client::decode_batch_cursor(&cursor.data).unwrap();
+    assert_eq!(cursor.deposit.expect("a v2 cursor").next, to);
+}
+
+const CREDITS: [(u64, u16, &[u64]); 3] = [(1, 20, &[]), (2, 20, &[0, 1]), (3, 20, &[2])];
+
+/// Crash after every chunk was sealed and before any finalize: the restart finishes the batch with the range
+/// the posted stream carries (deposits 0..3), growing the v1 cursor on that first V2.
+#[tokio::test]
+async fn a_restart_before_finalize_ends_with_the_posted_streams_deposit_range() {
+    let mut env = setup().await;
+    write_deposit_fixtures(&mut env, Pubkey::new_unique(), 3);
+    write_log_with_deposits(env.log_dir.path(), &CREDITS);
+    let blocks = all_blocks(&env);
+    assert_eq!(
+        blocks[2].deposits_end,
+        Some(3),
+        "the log's credits reach the stream"
+    );
+    let frames = frames_for(1, &blocks);
+    let first = BanksSender::new(env.ctx.banks_client.clone(), &env.c.authority);
+    open(&env, &first, 1, frames.len() as u32).await;
+    for f in &frames {
+        seal(&env, &first, 1, f).await;
+    }
+    let s = restarted(&env);
+    let anchor = restart(&env, &s).await.expect("recovery");
+    assert_eq!(anchor.from_block, 4);
+    assert_range_matches_stream(&env, &frames, 0, 3).await;
+    no_abandon(&env, &s);
+}
+
+/// Crash in the middle of a resumable finalize (one step done): the restart completes it with the same range.
+#[tokio::test]
+async fn a_restart_during_a_resumable_finalize_ends_with_the_posted_streams_deposit_range() {
+    let mut env = setup().await;
+    write_deposit_fixtures(&mut env, Pubkey::new_unique(), 3);
+    write_log_with_deposits(env.log_dir.path(), &CREDITS);
+    let blocks = all_blocks(&env);
+    let frames = frames_for(1, &blocks);
+    let first = BanksSender::new(env.ctx.banks_client.clone(), &env.c.authority);
+    open(&env, &first, 1, frames.len() as u32).await;
+    for f in &frames {
+        seal(&env, &first, 1, f).await;
+    }
+    // A step that does not complete reads no deposit account, so it carries no range.
+    let step = zk_inbox_client::finalize_batch_v2_ix(
+        &env.c.inbox_program,
+        &env.c.authority.pubkey(),
+        &env.c.settlement_program,
+        CHAIN_ID,
+        1,
+        1,
+        0,
+        None,
+    );
+    first
+        .send_and_confirm(std::slice::from_ref(&step), tuning())
+        .await
+        .unwrap();
+    let mid = batch_acct(&env, 1).await.unwrap();
+    assert!(!mid.finalized && mid.finalize_cursor == 1);
+    let s = restarted(&env);
+    restart(&env, &s).await.expect("recovery");
+    assert_range_matches_stream(&env, &frames, 0, 3).await;
+    no_abandon(&env, &s);
+}
+
+/// A chain whose cursor is still v1 and holds only its own 21 bytes of rent: the restart tops it up once,
+/// and the batch (with no deposits) then finalizes.
+#[tokio::test]
+async fn a_restart_tops_a_v1_cursor_up_once_before_the_first_v2() {
+    let mut env = setup().await;
+    let cursor_key =
+        zk_inbox_client::cursor_pda(&env.c.inbox_program, &env.c.settlement_program, CHAIN_ID).0;
+    let mut cursor = cursor_account(env.c.inbox_program, CHAIN_ID, 1);
+    cursor.lamports = rent_exempt(rome_zk_layouts::cursor::LEN);
+    put(&mut env, &cursor_key, cursor);
+    write_log(env.log_dir.path(), &[(1, 20), (2, 20), (3, 20)]);
+    let frames = frames_for(1, &all_blocks(&env));
+    let first = BanksSender::new(env.ctx.banks_client.clone(), &env.c.authority);
+    open(&env, &first, 1, frames.len() as u32).await;
+    for f in &frames {
+        seal(&env, &first, 1, f).await;
+    }
+    let s = restarted(&env);
+    restart(&env, &s).await.expect("recovery");
+    let transfers: Vec<_> = s
+        .sent()
+        .into_iter()
+        .filter(|ix| ix.program_id == system_program::id())
+        .collect();
+    assert_eq!(transfers.len(), 1, "one plain transfer to the cursor");
+    assert_eq!(transfers[0].accounts[1].pubkey, cursor_key);
+    let b = batch_acct(&env, 1).await.unwrap();
+    assert!(b.finalized);
+    pipeline::verify_acc(&b, &frames).unwrap();
+    let cursor = env
+        .ctx
+        .banks_client
+        .clone()
+        .get_account(cursor_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        cursor.data.len(),
+        rome_zk_layouts::cursor::LEN_V2,
+        "the cursor grew to v2"
+    );
+    assert!(cursor.lamports >= rent_exempt(rome_zk_layouts::cursor::LEN_V2));
 }

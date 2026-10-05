@@ -38,15 +38,15 @@ mod tests {
     fn gate_proof_bytes() -> Vec<u8> {
         std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../fixtures/prover-input/txv1-dev-reset6-batch-1.plonk.bin"
+            "/../../fixtures/prover-input/txv1-dev-reset6-batch-1.zisk-1.3.1.plonk.bin"
         ))
-        .expect("fixtures/prover-input/txv1-dev-reset6-batch-1.plonk.bin")
+        .expect("fixtures/prover-input/txv1-dev-reset6-batch-1.zisk-1.3.1.plonk.bin")
     }
 
     fn tiber_vkey_of_record() -> VkeyOfRecord {
         VkeyOfRecord::load(std::path::Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../fixtures/vkeys/tiber-200101-layout1.json"
+            "/../../fixtures/vkeys/tiber-200101-layout1.zisk-1.3.1.json"
         )))
         .expect("load vkey of record")
     }
@@ -60,6 +60,10 @@ mod tests {
         let checked = check_against_record(&cd, &record).expect("checks clean");
         let abi = layout1_from(&checked).expect("assemble abi");
         assert_eq!(abi.len(), zk_settlement_client::LAYOUT1_PROOF_ABI_LEN);
-        assert!(veritas::verify_zisk(&abi).expect("verify_zisk"));
+        assert!(veritas::verify_zisk(
+            veritas::zisk_version(rome_zk_layouts::registry::SCHEME_ZISK_1_3_1).unwrap(),
+            &abi
+        )
+        .expect("verify_zisk"));
     }
 }

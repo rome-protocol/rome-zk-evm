@@ -103,8 +103,15 @@ fn predecessor_last_block_and_state_root(anchor: &Anchor) -> (u64, [u8; 32]) {
 #[error("local verify failed")]
 pub struct LocalVerifyFailed;
 
+/// The ZisK release the local check verifies under: the one the chain's active registry entry for the vkey
+/// names (`scheme` is that entry's scheme byte, carried by [`Anchor::zisk_scheme`]), the same release whose key
+/// the program checks the proof under. A scheme byte Veritas has no release for is `None`.
+fn local_verify_version(scheme: u8) -> Option<&'static veritas::ZiskVersion> {
+    veritas::zisk_version(scheme)
+}
+
 /// Assembles the layout-1 ABI from `checked` and runs the real BN254 pairing on the host
-/// (`veritas::verify_zisk`) — the ONE shared pairing check. `check_against_record`
+/// (`veritas::verify_zisk`) under the key of the release `scheme` names — the ONE shared pairing check. `check_against_record`
 /// must already have run (enforced by the type: only a `RecordChecked` reaches this function), so this is
 /// purely the deeper cryptographic layer that a mere `program_vk`/`root_c` match cannot catch (e.g. a
 /// proof file whose `proof_bytes` were corrupted after the fact still decodes and still matches the
@@ -112,6 +119,7 @@ pub struct LocalVerifyFailed;
 pub fn verify_checked(
     checked: &RecordChecked,
     vkey: &VkeyOfRecord,
+    scheme: u8,
 ) -> Result<(), LocalVerifyFailed> {
     let abi = crate::abi::layout1_from(checked).map_err(|_| LocalVerifyFailed)?;
     let abi_program_vk: [u8; 32] = abi[768..800]
@@ -120,7 +128,8 @@ pub fn verify_checked(
     if abi_program_vk != vkey.program_vk {
         return Err(LocalVerifyFailed);
     }
-    match veritas::verify_zisk(&abi) {
+    let release = local_verify_version(scheme).ok_or(LocalVerifyFailed)?;
+    match veritas::verify_zisk(release, &abi) {
         Ok(true) => Ok(()),
         _ => Err(LocalVerifyFailed),
     }
@@ -175,7 +184,8 @@ pub fn build_post_ix(params: &PostParams) -> Result<Instruction, PreSendRefusal>
         });
     }
 
-    verify_checked(params.checked, params.vkey).map_err(|_| PreSendRefusal::LocalVerifyFailed)?;
+    verify_checked(params.checked, params.vkey, params.anchor.zisk_scheme)
+        .map_err(|_| PreSendRefusal::LocalVerifyFailed)?;
 
     let abi =
         crate::abi::layout1_from(params.checked).map_err(|_| PreSendRefusal::LocalVerifyFailed)?;
@@ -519,15 +529,15 @@ mod tests {
     fn gate_proof_bytes() -> Vec<u8> {
         std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../fixtures/prover-input/txv1-dev-reset6-batch-1.plonk.bin"
+            "/../../fixtures/prover-input/txv1-dev-reset6-batch-1.zisk-1.3.1.plonk.bin"
         ))
-        .expect("fixtures/prover-input/txv1-dev-reset6-batch-1.plonk.bin")
+        .expect("fixtures/prover-input/txv1-dev-reset6-batch-1.zisk-1.3.1.plonk.bin")
     }
 
     fn tiber_vkey() -> VkeyOfRecord {
         VkeyOfRecord::load(std::path::Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../fixtures/vkeys/tiber-200101-layout1.json"
+            "/../../fixtures/vkeys/tiber-200101-layout1.zisk-1.3.1.json"
         )))
         .expect("load vkey of record")
     }
@@ -591,7 +601,7 @@ mod tests {
         d[OFF_COUNT] = 1;
         let e = OFF_ENTRIES;
         d[e] = CURVE_BN254;
-        d[e + 1] = SCHEME_PLONK;
+        d[e + 1] = SCHEME_ZISK_1_3_1;
         d[e + 2..e + 34].copy_from_slice(&vkey);
         d[e + 34] = LAYOUT_ZISK_V1;
         let a = OFF_ACTIVATION;
@@ -1047,6 +1057,45 @@ mod tests {
                 name: "GasInBatchMismatch".to_string()
             }
         );
+    }
+
+    /// The rig registers the gate key under 1.3.1. The same proof with the 1.2.0 recursion root put into its
+    /// ABI must be refused by the program as a wrong recursion root (`RootCNotOfVersion`, 88) before it
+    /// reaches the pairing.
+    #[tokio::test]
+    async fn the_gate_proof_with_a_1_2_0_recursion_root_is_refused_under_a_1_3_1_entry() {
+        const ROOT_C_NOT_OF_VERSION: u32 = 88;
+        let mut rig = GateRig::start().await;
+        let vkey = tiber_vkey();
+        let pv = decode_gate_pv();
+        let fields = crate::publics::to_post_root_fields(
+            &pv,
+            crate::publics::Anchor {
+                batch: 1,
+                prev_batch: 0,
+                pre_state_root: [0u8; 32],
+            },
+        );
+        let cd = from_zisk_proof_file(&gate_proof_bytes()).expect("decode gate proof");
+        let checked = check_against_record(&cd, &vkey).expect("checks clean");
+        let mut abi = crate::abi::layout1_from(&checked).unwrap();
+        let release_1_2_0 =
+            veritas::zisk_version(rome_zk_layouts::registry::SCHEME_ZISK_1_2_0).unwrap();
+        assert_ne!(release_1_2_0.root_c, cd.root_c);
+        abi[800..832].copy_from_slice(&release_1_2_0.root_c);
+        let ix = zk_settlement_client::post_root_proved_ix(
+            &rig.settlement_program,
+            &rig.authority.pubkey(),
+            &rig.inbox_program,
+            &rig.treasury,
+            fields,
+            abi,
+            vec![],
+        );
+        let authority = rig.authority.insecure_clone();
+        let (result, _cu, _logs) = send_measuring_cu(&mut rig.ctx, &[ix], &authority, &[]).await;
+        let err = result.expect_err("a 1.2.0 recursion root must be refused under a 1.3.1 entry");
+        assert_eq!(custom_code(&err), Some(ROOT_C_NOT_OF_VERSION));
     }
 
     #[tokio::test]

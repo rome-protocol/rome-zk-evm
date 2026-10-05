@@ -1,0 +1,11 @@
+{
+  "programVK": "0x77c143cfbae4b986c642f0bed1be5ee2bb33338eee23cc5b3c20c86043cc8dc2",
+  "rootCVadcopFinal": "0xc3f12b9f8707c6a1e96df2bf6702c2ebdfbafedabeac654644a380befe091ac4",
+  "elf_sha256": "238efa4f8479d909bdeb9b254102e3bc5563d6bd7c8fd173f2474040cb4385a5",
+  "genesis_sha256": "15367d781b458217af60de3ec87e2358ecfc219494ecf46090811612693f856f",
+  "chain_id": 200101,
+  "layout_id": 1,
+  "zisk": "1.3.1-alpha",
+  "scheme": 2,
+  "source": "the stateless-validator-rome guest of the ZisK Ethereum client fork on zisk-eth-client 0.13.1 (fork commit 8d5e243), with the rome-zk-evm crates at v0.2.1 (05321e1f9c935cadae034994434b36b75c305cd4), built reproducibly by guest-build, then cargo-zisk prove --plonk -i fixtures/prover-input/txv1-dev-reset6-batch-1.bin on CPU (SNARK proof verified)"
+}

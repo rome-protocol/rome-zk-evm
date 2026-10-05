@@ -1041,6 +1041,20 @@ mod tests {
             zk_bridge_client::deposit_record_pda(&bridge(), &program(), CHAIN, 7).0
         );
         assert_eq!(ix.accounts[7].pubkey, fee);
+        // After the registry came in, the program reads thirteen accounts: root, registry and bridge config last.
+        assert_eq!(ix.accounts.len(), 13);
+        assert_eq!(
+            ix.accounts[10].pubkey,
+            zk_settlement_client::root_pda(&program(), CHAIN).0
+        );
+        assert_eq!(
+            ix.accounts[11].pubkey,
+            rome_zk_layouts::registry::pda(&program(), CHAIN).0
+        );
+        assert_eq!(
+            ix.accounts[12].pubkey,
+            zk_bridge_client::bridge_config_pda(&bridge()).0
+        );
     }
 
     #[tokio::test]

@@ -39,6 +39,11 @@ use crate::sink::{FinalizedBatch, PostRootSink};
 pub enum PipelineError {
     #[error("re-derive mismatch: {0}")]
     Rederive(String),
+    /// The deposit side of a batch: the posted stream, the chain's exit config or queue, or the range the
+    /// batch finalized with does not say what the batcher meant to send. Refused before anything is sent
+    /// whenever it can be, since a finalized batch with a wrong range cannot be proved or abandoned.
+    #[error("deposit range: {0}")]
+    Deposits(String),
     #[error("channel codec error: {0}")]
     Channel(#[from] channel::ChannelError),
     #[error("send failed: {0}")]
@@ -138,6 +143,7 @@ pub fn re_derive_and_check(blocks: &[Block], compressed: &[u8]) -> Result<(), Pi
         if source.number != decoded.number
             || source.timestamp != decoded.timestamp
             || source.gas_limit != decoded.gas_limit
+            || source.deposits_end != decoded.deposits_end
         {
             return Err(PipelineError::Rederive(format!(
                 "block {i}: header mismatch (source {source:?} vs decoded {decoded:?})"
@@ -435,6 +441,7 @@ pub struct FinalizePoll {
     pub max_polls: u32,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn finalize_and_verify<S: Sender, A: AccountOps>(
     sender: &S,
     accounts: &A,
@@ -443,6 +450,7 @@ pub async fn finalize_and_verify<S: Sender, A: AccountOps>(
     tuning: SendTuning,
     poll: FinalizePoll,
     frames: &[Frame],
+    expected_blocks: Option<&[Block]>,
 ) -> Result<zk_inbox_client::BatchAccount, PipelineError> {
     let (batch_pda, _) = zk_inbox_client::batch_pda(
         &target.program_id,
@@ -499,18 +507,46 @@ pub async fn finalize_and_verify<S: Sender, A: AccountOps>(
         }
     }
 
+    // The range this batch finalizes under, worked out once from the posted stream and the live cursor
+    // before anything is sent. The previous batch is finalized or abandoned by now, so the cursor's
+    // `deposit_next` is where this batch's range starts. Skipped for a batch that is already finalized:
+    // the cursor has moved past it, and `verify_acc` checks that batch's header range against its stream.
+    let planned = if decoded.finalized {
+        None
+    } else {
+        let planned =
+            match crate::deposits::plan_range(accounts, &target, frames, expected_blocks).await {
+                Ok(p) => p,
+                Err(e) => {
+                    metrics.batches_failed_total.inc();
+                    return Err(e);
+                }
+            };
+        // A chain's first V2 grows a v1 cursor, which needs rent the instruction has no payer for.
+        crate::deposits::top_up_v1_cursor(sender, accounts, &target, tuning).await?;
+        Some(planned)
+    };
+
     for _ in 0..poll.max_polls {
         if decoded.finalized {
+            if let Some(planned) = &planned {
+                check_header_range(&decoded, planned)?;
+            }
             metrics.batches_finalized_total.inc();
             return Ok(decoded);
         }
-        let finalize_ix = zk_inbox_client::finalize_batch_ix(
+        let planned = planned
+            .as_ref()
+            .expect("a batch not finalized at entry has a planned range");
+        let finalize_ix = zk_inbox_client::finalize_batch_v2_ix(
             &target.program_id,
             &target.payer,
             &target.settlement_program,
             target.chain_id,
             target.batch,
             0,
+            planned.to,
+            planned.bridge_program.as_ref(),
         );
         sender
             .send_and_confirm(std::slice::from_ref(&finalize_ix), tuning)
@@ -597,8 +633,31 @@ pub fn verify_presealed_leaves(
     Ok(())
 }
 
-/// Verifies a finalized batch's on-chain `acc` against `zk_inbox_client::reference_commitment` computed
-/// from the chunk bodies actually sent (the on-chain/off-chain equivalence).
+/// After a finalize this process sent: the header's range must be the one it sent.
+fn check_header_range(
+    decoded: &zk_inbox_client::BatchAccount,
+    planned: &crate::deposits::PlannedRange,
+) -> Result<(), PipelineError> {
+    match decoded.deposit {
+        Some(r) if r.from == planned.from && r.to == planned.to => Ok(()),
+        // A batch opened with a version-2 header keeps it and takes only an empty range.
+        None if planned.from == planned.to => Ok(()),
+        other => Err(PipelineError::Deposits(format!(
+            "batch {} finalized with header range {:?}, but the range sent was {}..{}",
+            decoded.batch,
+            other.map(|r| (r.from, r.to)),
+            planned.from,
+            planned.to
+        ))),
+    }
+}
+
+/// Verifies a finalized batch's on-chain `acc` against
+/// `zk_inbox_client::reference_commitment_with_deposits`, computed from the chunk bodies actually sent and the
+/// header's own deposit range (the on-chain/off-chain equivalence), and checks that the header's range is
+/// the one the posted stream carries: `to` must equal the end [`channel::resolve_deposits_end`] gives over
+/// the decoded stream from the header's `from`, and a v2 header (no range) must sit over a stream with no
+/// fifth field.
 pub fn verify_acc(
     decoded: &zk_inbox_client::BatchAccount,
     frames: &[Frame],
@@ -609,17 +668,47 @@ pub fn verify_acc(
         .iter()
         .map(|f| solana_program::keccak::hashv(&[&f.to_bytes()]).to_bytes())
         .collect();
-    let (_, _, reference_acc) = zk_inbox_client::reference_commitment(
+    let range = decoded
+        .deposit
+        .unwrap_or(rome_zk_layouts::batch::BatchDeposit {
+            from: 0,
+            to: 0,
+            hash_from: [0; 32],
+            hash_to: [0; 32],
+        });
+    let (_, _, reference_acc) = zk_inbox_client::reference_commitment_with_deposits(
         decoded.chain_id,
         decoded.batch,
         decoded.open_slot,
         &chunk_hashes,
+        &range,
     );
     if reference_acc != decoded.acc {
         return Err(PipelineError::AccMismatch {
             on_chain: decoded.acc,
             reference: reference_acc,
         });
+    }
+    let (_, blocks) = crate::deposits::decode_posted(frames)?;
+    match decoded.deposit {
+        None => {
+            if blocks.iter().any(|b| b.deposits_end.is_some()) {
+                return Err(PipelineError::Deposits(format!(
+                    "batch {} has a v2 header, which takes no deposits, over a stream that carries a \
+                     deposits_end",
+                    decoded.batch
+                )));
+            }
+        }
+        Some(r) => {
+            let to = crate::deposits::stream_deposit_to(&blocks, r.from)?;
+            if to != r.to {
+                return Err(PipelineError::Deposits(format!(
+                    "batch {}: the header's range ends at {} but its posted stream ends at {to}",
+                    decoded.batch, r.to
+                )));
+            }
+        }
     }
     Ok(reference_acc)
 }
@@ -794,6 +883,9 @@ pub struct WindowedPoster<S: Sender + 'static, A: AccountOps + 'static> {
     /// keeps advancing, so a value captured at `submit_group` time would understate the lag by construction
     /// (read at submission time, `lag_blocks` would be structurally 0 or 1).
     newest_block: Arc<AtomicU64>,
+    /// Where the next batch's deposit range starts: the end of the range of the batch opened last. `None` until
+    /// the first batch of this run is opened, when it is read from the cursor (every earlier batch is final then).
+    next_deposit: Option<u64>,
 }
 
 impl<S: Sender + 'static, A: AccountOps + 'static> WindowedPoster<S, A> {
@@ -815,7 +907,59 @@ impl<S: Sender + 'static, A: AccountOps + 'static> WindowedPoster<S, A> {
             prev_settle_gate: None,
             failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             newest_block,
+            next_deposit: None,
         }
+    }
+
+    /// Refuses, before `OpenBatch`, a batch whose range leaves out a deposit that is already overdue (see
+    /// [`crate::deposits::check_deadline_at_open`]), and moves the start of the next range on. A chain with no
+    /// bridge, or no queue, is not read further.
+    async fn check_deposit_deadline(
+        &mut self,
+        blocks: &[Block],
+        batch: u64,
+    ) -> Result<(), PipelineError> {
+        let chain_id = self.cfg.chain_id;
+        let settlement_program = self.cfg.settlement_program_id;
+        if crate::deposits::read_bridge_program(
+            self.accounts.as_ref(),
+            &settlement_program,
+            chain_id,
+        )
+        .await?
+        .is_none()
+        {
+            return Ok(());
+        }
+        let from = match self.next_deposit {
+            Some(from) => from,
+            None => crate::deposits::read_cursor(
+                self.accounts.as_ref(),
+                &self.cfg.inbox_program_id,
+                &settlement_program,
+                chain_id,
+            )
+            .await?
+            .deposit
+            .map_or(0, |d| d.next),
+        };
+        let to = crate::deposits::stream_deposit_to(blocks, from)?;
+        let open_unix_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        crate::deposits::check_deadline_at_open(
+            self.accounts.as_ref(),
+            &settlement_program,
+            chain_id,
+            batch,
+            from,
+            to,
+            open_unix_ts,
+        )
+        .await?;
+        self.next_deposit = Some(to);
+        Ok(())
     }
 
     /// Drains every batch that has *already* completed, without blocking — catches a sibling's failure
@@ -890,7 +1034,14 @@ impl<S: Sender + 'static, A: AccountOps + 'static> WindowedPoster<S, A> {
         .await?
         {
             ResolveOutcome::PostUnder(b) => b,
-            ResolveOutcome::AlreadyPosted(_) => return Ok(()),
+            ResolveOutcome::AlreadyPosted(_) => {
+                // Already posted and final: its deposits are behind the cursor, which the next range is read
+                // from whenever this poster has not been tracking it, and are carried on when it has.
+                if let Some(from) = self.next_deposit {
+                    self.next_deposit = crate::deposits::stream_deposit_to(&blocks, from).ok();
+                }
+                return Ok(());
+            }
         };
 
         // `resolve_batch_id`'s own account reads are real `.await` points — a
@@ -903,6 +1054,10 @@ impl<S: Sender + 'static, A: AccountOps + 'static> WindowedPoster<S, A> {
             self.drain_ready().await?;
             return Err(PipelineError::WindowPreviouslyFailed);
         }
+
+        // The deadline is measured at the batch's open time, so a batch that would be refused for leaving an
+        // overdue deposit out is not opened at all: opened, it could never be finalized.
+        self.check_deposit_deadline(&blocks, batch).await?;
 
         let target = BatchTarget {
             program_id: self.cfg.inbox_program_id,
@@ -1199,6 +1354,7 @@ async fn settle_one_batch<S: Sender, A: AccountOps>(
             max_polls: cfg.finalize_max_polls,
         },
         &frames,
+        Some(&blocks),
     )
     .await?;
     metrics
@@ -1777,6 +1933,14 @@ mod tests {
                 Ok(Some(self.data.clone()))
             }
 
+            async fn get_account_owner(
+                &self,
+                pubkey: &Pubkey,
+            ) -> Result<Option<Pubkey>, ResolveError> {
+                // This fake holds no exit config or deposit queue, so the owner is never asked about those.
+                Ok(self.get_account(pubkey).await?.map(|_| Pubkey::default()))
+            }
+
             async fn accounts_exist(&self, pubkeys: &[Pubkey]) -> Result<Vec<bool>, ResolveError> {
                 Ok(vec![true; pubkeys.len()])
             }
@@ -1860,7 +2024,8 @@ mod tests {
         #[tokio::test]
         async fn already_finalized_by_someone_else_passes_through_to_verify_acc() {
             let t = target();
-            let honest = frame(0, true, vec![1, 2, 3]);
+            // A real stream: the content check decodes the posted bytes.
+            let honest = frame(0, true, encode_stream(&sample_blocks()));
             let frames = vec![honest.clone()];
             let chunk_hash = solana_program::keccak::hashv(&[&honest.to_bytes()]).to_bytes();
             let (_, _, acc) =
@@ -1892,6 +2057,7 @@ mod tests {
                     max_polls: 5,
                 },
                 &frames,
+                None,
             )
             .await
             .expect(
@@ -1938,6 +2104,7 @@ mod tests {
                     max_polls: 5,
                 },
                 &tampered,
+                None,
             )
             .await
             .unwrap_err();

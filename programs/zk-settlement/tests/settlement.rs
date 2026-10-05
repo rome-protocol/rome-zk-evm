@@ -379,7 +379,7 @@ fn registry_entries() -> Vec<sclient::RegistryEntry> {
     vec![
         sclient::RegistryEntry {
             curve: reg_layout::CURVE_BN254,
-            scheme: reg_layout::SCHEME_PLONK,
+            scheme: reg_layout::SCHEME_ZISK_1_3_1,
             vkey_hash: zisk_program_vk(14),
             layout_id: reg_layout::LAYOUT_HEADER_FALLBACK,
         },
@@ -467,13 +467,23 @@ fn zisk_program_vk(block: u32) -> [u8; 32] {
         .try_into()
         .unwrap()
 }
-fn zisk_proof_abi(block: u32) -> Vec<u8> {
+/// The committed ZisK 1.2.0 proof of `block`, exactly as the fixture holds it, with the 1.2.0 recursion root.
+fn zisk_proof_abi_1_2_0(block: u32) -> Vec<u8> {
     let j = calldata_fixture(block);
     let mut d = hx(&j["proofBytes"]);
     d.extend(hx(&j["programVK"]));
     d.extend(hx(&j["rootCVadcopFinal"]));
     d.extend(hx(&j["publicValues"]));
     assert_eq!(d.len(), 768 + 32 + 32 + 512);
+    d
+}
+/// The same bytes with the ZisK 1.3.1 recursion root in place of the fixture's. The tests that register
+/// scheme-2 entries and post this blob are checking what happens around the pairing (the registry lookup,
+/// the layout bindings, the cost), and a proof from 1.2.0 never verifies under the 1.3.1 key, so the
+/// pairing refuses it exactly as it refused a made-up proof before.
+fn zisk_proof_abi(block: u32) -> Vec<u8> {
+    let mut d = zisk_proof_abi_1_2_0(block);
+    d[800..832].copy_from_slice(&root_c(ROOT_C_ZISK_1_3_1));
     d
 }
 
@@ -533,7 +543,7 @@ async fn init_chain_writes_the_exact_zkrt_layout() {
     assert_eq!(Pubkey::new_from_array(hdr.inbox_program), c.inbox_program);
     let (e0, activation0) = reg_layout::entry_at(&registry_acc.data, 0).unwrap();
     assert_eq!(e0.curve, reg_layout::CURVE_BN254);
-    assert_eq!(e0.scheme, reg_layout::SCHEME_PLONK);
+    assert_eq!(e0.scheme, reg_layout::SCHEME_ZISK_1_3_1);
     assert_eq!(e0.layout_id, reg_layout::LAYOUT_HEADER_FALLBACK);
     assert_eq!(
         activation0, 0,
@@ -707,13 +717,15 @@ async fn inbox_open_batch_and_close_pass_against_a_real_initchain_root_account()
     }
     send(
         &mut ctx,
-        &[zk_inbox_client::finalize_batch_ix(
+        &[zk_inbox_client::finalize_batch_v2_ix(
             &inbox_program,
             &c.authority.pubkey(),
             &settlement_program,
             c.chain_id,
             batch,
             0,
+            0,
+            None,
         )],
         &c.authority,
         &[],
@@ -2177,7 +2189,7 @@ fn synthetic_layout2_proof_abi(header: &[u8]) -> Vec<u8> {
     let j = calldata_fixture(14);
     let mut d = hx(&j["proofBytes"]);
     d.extend(hx(&j["programVK"]));
-    d.extend(hx(&j["rootCVadcopFinal"]));
+    d.extend_from_slice(&root_c(ROOT_C_ZISK_1_3_1));
     let mut out = [0u8; 36];
     out[0] = 0x20;
     out[1..33].copy_from_slice(&keccak::hash(header).to_bytes());
@@ -2207,7 +2219,7 @@ async fn layout2_post_over_genesis(
     let mut fields = default_init_chain_fields(&c, 16);
     fields.registry_entries = vec![sclient::RegistryEntry {
         curve: reg_layout::CURVE_BN254,
-        scheme: reg_layout::SCHEME_PLONK,
+        scheme: reg_layout::SCHEME_ZISK_1_3_1,
         vkey_hash: zisk_program_vk(14),
         layout_id: reg_layout::LAYOUT_HEADER_FALLBACK,
     }];
@@ -2423,7 +2435,7 @@ async fn post_root_proved_rejects_unregistered_vkey_cheaply_before_header_or_pro
     let mut fields = default_init_chain_fields(&c, 16);
     fields.registry_entries = vec![sclient::RegistryEntry {
         curve: reg_layout::CURVE_BN254,
-        scheme: reg_layout::SCHEME_PLONK,
+        scheme: reg_layout::SCHEME_ZISK_1_3_1,
         vkey_hash: decoy_vkey,
         layout_id: reg_layout::LAYOUT_HEADER_FALLBACK,
     }];
@@ -2485,6 +2497,585 @@ async fn post_root_proved_rejects_unregistered_vkey_cheaply_before_header_or_pro
         cu < 40_000,
         "a wrong-vkey rejection must stay cheap (before header decode + the ~442k CU pairing): got {cu} CU"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// (6b) PostRootProved: the ZisK release comes from the registry entry; the pinned recursion root is
+// checked before the pairing
+// ---------------------------------------------------------------------------------------------
+
+/// The `rootCVadcopFinal` ZisK 1.3.1-alpha's own verifier pins (`ZiskVerifier.getRootCVadcopFinal()`),
+/// written out here so a typo in the program's table cannot hide behind a test that reads the same table.
+const ROOT_C_ZISK_1_3_1: &str = "c3f12b9f8707c6a1e96df2bf6702c2ebdfbafedabeac654644a380befe091ac4";
+/// The same for ZisK 1.2.0-alpha, which is also what the committed `fixtures/s10` proofs carry.
+const ROOT_C_ZISK_1_2_0: &str = "564c2b1bcbd5932c81cfad1fa786a98372eb3d6495257c2d944544334f84382f";
+
+fn root_c(hex_str: &str) -> [u8; 32] {
+    hex::decode(hex_str).unwrap().try_into().unwrap()
+}
+
+/// The fixture proof of block 14 with `rootCVadcopFinal` (`proof_abi[800..832]`) set to `root_c`. The proof
+/// itself is a ZisK 1.2.0 proof, so it never verifies under the 1.3.1 key; these tests only ask which check
+/// refuses first.
+fn zisk_proof_abi_with_root_c(root_c: &[u8; 32]) -> Vec<u8> {
+    let mut d = zisk_proof_abi_1_2_0(14);
+    d[800..832].copy_from_slice(root_c);
+    d
+}
+
+/// A fresh reserved chain with an empty registry, one finalized inbox batch, and the means to put entries
+/// into the registry the two ways they get there: written straight into the account (what entries written
+/// before the release rules look like on chain) and through `SetRegistryEntry`.
+struct PostRig {
+    ctx: solana_program_test::ProgramTestContext,
+    settlement_program: Pubkey,
+    payer: Keypair,
+    c: Chain,
+    acc: [u8; 32],
+}
+
+impl PostRig {
+    async fn new(chain_id: u64) -> Self {
+        let settlement_program = rome_zk_testkit::fixed_settlement_program_id();
+        let payer = funded_keypair();
+        let mut pt = rome_zk_testkit::program_test(
+            &[rome_zk_testkit::ProgramSpec::upgradeable(
+                "zk_settlement",
+                settlement_program,
+            )],
+            true,
+        );
+        pt.add_account(payer.pubkey(), funded_account());
+        let mut c = default_chain(settlement_program);
+        c.chain_id = chain_id;
+        pt.add_account(c.authority.pubkey(), funded_account());
+        let acc = keccak::hashv(&[b"inbox acc release test"]).to_bytes();
+        let inbox_pda =
+            sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 1);
+        pt.add_account(
+            inbox_pda,
+            inbox_batch_account(
+                c.inbox_program,
+                c.chain_id,
+                1,
+                settlement_program,
+                c.authority.pubkey(),
+                true,
+                acc,
+            ),
+        );
+        let mut ctx = pt.start_with_context().await;
+        ensure_global_config(&mut ctx, &payer, &c).await;
+        ensure_reserved_allowed(&mut ctx, &payer, &c).await;
+        let mut fields = default_init_chain_fields(&c, 16);
+        fields.registry_entries = vec![];
+        let init_ix = sclient::init_chain_reserved_ix(
+            &settlement_program,
+            &payer.pubkey(),
+            &c.authority.pubkey(),
+            &c.registry_authority.pubkey(),
+            c.chain_id,
+            fields,
+        );
+        send(
+            &mut ctx,
+            &[init_ix],
+            &payer,
+            &[&c.authority, &c.registry_authority],
+        )
+        .await
+        .expect("InitChain should succeed");
+        PostRig {
+            ctx,
+            settlement_program,
+            payer,
+            c,
+            acc,
+        }
+    }
+
+    fn registry_key(&self) -> Pubkey {
+        sclient::registry_pda(&self.settlement_program, self.c.chain_id).0
+    }
+
+    /// Overwrites the registry's entries with `entries`, each with its activation slot, whatever the
+    /// program's rules for writing would say about them.
+    async fn plant(&mut self, entries: &[(reg_layout::RegistryEntry, u64)]) {
+        let key = self.registry_key();
+        let mut account = self
+            .ctx
+            .banks_client
+            .get_account(key)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut d = account.data.clone();
+        d.resize(reg_layout::REGISTRY_LEN_V2, 0);
+        d[reg_layout::OFF_COUNT] = entries.len() as u8;
+        for (i, (e, activation)) in entries.iter().enumerate() {
+            reg_layout::write_entry(&mut d, i, e, *activation).unwrap();
+        }
+        let rent = self.ctx.banks_client.get_rent().await.unwrap();
+        account.lamports = account.lamports.max(rent.minimum_balance(d.len()));
+        account.data = d;
+        self.ctx.set_account(&key, &account.into());
+    }
+
+    async fn register(
+        &mut self,
+        entry: sclient::RegistryEntry,
+        activation_slot: u64,
+    ) -> Result<u64, TransactionError> {
+        let ix = sclient::set_registry_entry_ix(
+            &self.settlement_program,
+            &self.c.registry_authority.pubkey(),
+            &self.payer.pubkey(),
+            self.c.chain_id,
+            entry,
+            activation_slot,
+        );
+        send(
+            &mut self.ctx,
+            &[ix],
+            &self.payer,
+            &[&self.c.registry_authority],
+        )
+        .await
+    }
+
+    async fn registry(&mut self) -> sclient::RegistryAccount {
+        let key = self.registry_key();
+        let account = self
+            .ctx
+            .banks_client
+            .get_account(key)
+            .await
+            .unwrap()
+            .unwrap();
+        sclient::decode_registry_account(&account.data).unwrap()
+    }
+
+    async fn now(&mut self) -> u64 {
+        self.ctx.banks_client.get_root_slot().await.unwrap()
+    }
+
+    /// Posts a proved root for batch 1 with `proof_abi`. The batch carries nothing that could pass a later
+    /// check (header empty, claims zero), so any refusal other than the one under test would be a
+    /// different error. A refused post leaves the chain as it was, so the same post can be tried again.
+    async fn post(&mut self, proof_abi: Vec<u8>) -> (Result<(), TransactionError>, u64) {
+        let args = sclient::PostRootFields {
+            chain_id: self.c.chain_id,
+            batch: 1,
+            prev_batch: 0,
+            pre_state_root: self.c.genesis_state_root,
+            first_block: 1,
+            last_block: 1,
+            state_root: [0u8; 32],
+            block_roots_merkle: [0u8; 32],
+            inbox_commitment: self.acc,
+            forced_outcome_commitment: rome_zk_layouts::forced_empty_root(
+                &rome_zk_merkle::keccak256,
+            ),
+            parent_hash: [0u8; 32],
+            last_block_hash: [0u8; 32],
+            gas_in_batch: 0,
+        };
+        let ix = sclient::post_root_proved_ix(
+            &self.settlement_program,
+            &self.c.authority.pubkey(),
+            &self.c.inbox_program,
+            &self.c.treasury,
+            args,
+            proof_abi,
+            vec![],
+        );
+        send_capturing_cu(&mut self.ctx, &[ix], &self.c.authority).await
+    }
+}
+
+/// Registers one entry `(curve, scheme, vkey_hash, layout 2)` on a fresh reserved chain and posts a proved
+/// root with `proof_abi`. The entry is written straight into the registry account: the tests that use this
+/// ask what `PostRootProved` does with an entry it finds, including entries `SetRegistryEntry` would no
+/// longer let anyone write.
+async fn post_proved_under_one_entry(
+    chain_id: u64,
+    curve: u8,
+    scheme: u8,
+    vkey_hash: [u8; 32],
+    proof_abi: Vec<u8>,
+) -> (Result<(), TransactionError>, u64) {
+    let mut rig = PostRig::new(chain_id).await;
+    rig.plant(&[(
+        reg_layout::RegistryEntry {
+            curve,
+            scheme,
+            vkey_hash,
+            layout_id: reg_layout::LAYOUT_HEADER_FALLBACK,
+        },
+        0,
+    )])
+    .await;
+    rig.post(proof_abi).await
+}
+
+/// A rejection that must happen before the layout checks and the ~440k CU pairing stays cheap. Same budget
+/// as the unregistered-vkey test above.
+const CHEAP_REFUSAL_CU: u64 = 40_000;
+
+/// An entry under scheme 1 is a ZisK 1.2.0 key, and 1.2.0 is withdrawn: the proof is refused under its own
+/// name, not by failing the pairing, and cheaply. The proof is the real 1.2.0 one, with its own recursion
+/// root, so only the release can be what refuses it.
+#[tokio::test]
+async fn post_root_proved_refuses_a_withdrawn_zisk_release_by_name() {
+    let (result, cu) = post_proved_under_one_entry(
+        30,
+        reg_layout::CURVE_BN254,
+        reg_layout::SCHEME_ZISK_1_2_0,
+        zisk_program_vk(14),
+        zisk_proof_abi_1_2_0(14),
+    )
+    .await;
+    let err = result.expect_err("a proof under a withdrawn release must be refused");
+    assert_eq!(
+        custom_error(&err),
+        Some(zk_settlement::errors::SettleError::ZiskVersionWithdrawn as u32)
+    );
+    eprintln!("PostRootProved (rejected: withdrawn ZisK release) consumed {cu} CU");
+    assert!(
+        cu < CHEAP_REFUSAL_CU,
+        "a withdrawn-release refusal must stay cheap: got {cu} CU"
+    );
+}
+
+/// The release is read from the entry, so a poster cannot get a withdrawn release verified by dressing the
+/// proof up as an open one: the entry says scheme 1, and the open release's pinned root changes nothing.
+#[tokio::test]
+async fn post_root_proved_withdrawn_release_is_refused_whatever_root_the_proof_carries() {
+    let (result, _cu) = post_proved_under_one_entry(
+        31,
+        reg_layout::CURVE_BN254,
+        reg_layout::SCHEME_ZISK_1_2_0,
+        zisk_program_vk(14),
+        zisk_proof_abi_with_root_c(&root_c(ROOT_C_ZISK_1_3_1)),
+    )
+    .await;
+    let err = result.expect_err("an entry under a withdrawn release must refuse every proof");
+    assert_eq!(
+        custom_error(&err),
+        Some(zk_settlement::errors::SettleError::ZiskVersionWithdrawn as u32)
+    );
+}
+
+/// A scheme number no release has (here 3, the next one to be assigned) is not a ZisK entry at all, so it
+/// matches nothing: the lookup names it `RegistryEntryNotFound`, the same as an unregistered vkey.
+#[tokio::test]
+async fn post_root_proved_an_unassigned_scheme_matches_no_entry() {
+    let (result, _cu) = post_proved_under_one_entry(
+        32,
+        reg_layout::CURVE_BN254,
+        3,
+        zisk_program_vk(14),
+        zisk_proof_abi_with_root_c(&root_c(ROOT_C_ZISK_1_3_1)),
+    )
+    .await;
+    let err = result.expect_err("an entry under an unassigned scheme must not be found");
+    assert_eq!(
+        custom_error(&err),
+        Some(zk_settlement::errors::SettleError::RegistryEntryNotFound as u32)
+    );
+}
+
+/// An open release pins its recursion root: a proof that carries another root (here the 1.2.0 root, which
+/// is what the committed real proof has) is refused as `RootCNotOfVersion`, before the pairing runs. The
+/// refusal is cheap, so the pairing cannot have run.
+#[tokio::test]
+async fn post_root_proved_refuses_another_releases_root_c_before_the_pairing() {
+    let (result, cu) = post_proved_under_one_entry(
+        33,
+        reg_layout::CURVE_BN254,
+        reg_layout::SCHEME_ZISK_1_3_1,
+        zisk_program_vk(14),
+        zisk_proof_abi_with_root_c(&root_c(ROOT_C_ZISK_1_2_0)),
+    )
+    .await;
+    let err = result.expect_err("a proof with another release's root must be refused");
+    assert_eq!(
+        custom_error(&err),
+        Some(zk_settlement::errors::SettleError::RootCNotOfVersion as u32)
+    );
+    eprintln!("PostRootProved (rejected: wrong rootC, before the pairing) consumed {cu} CU");
+    assert!(
+        cu < CHEAP_REFUSAL_CU,
+        "a wrong-rootC refusal must happen before the pairing: got {cu} CU"
+    );
+}
+
+/// The pin is exact: the pinned root with one bit flipped, and an all-zero root, are both refused before the
+/// pairing. A proof of an unconstrained recursion root is exactly what the pin exists to stop.
+#[tokio::test]
+async fn post_root_proved_refuses_a_self_chosen_root_c_before_the_pairing() {
+    let mut one_bit_off = root_c(ROOT_C_ZISK_1_3_1);
+    one_bit_off[31] ^= 0x01;
+    for (chain_id, bad_root) in [(34u64, one_bit_off), (35u64, [0u8; 32])] {
+        let (result, cu) = post_proved_under_one_entry(
+            chain_id,
+            reg_layout::CURVE_BN254,
+            reg_layout::SCHEME_ZISK_1_3_1,
+            zisk_program_vk(14),
+            zisk_proof_abi_with_root_c(&bad_root),
+        )
+        .await;
+        let err = result.expect_err("a self-chosen recursion root must be refused");
+        assert_eq!(
+            custom_error(&err),
+            Some(zk_settlement::errors::SettleError::RootCNotOfVersion as u32),
+            "root {}",
+            hex::encode(bad_root)
+        );
+        assert!(
+            cu < CHEAP_REFUSAL_CU,
+            "must be refused before the pairing: got {cu} CU"
+        );
+    }
+}
+
+/// The right root passes the pin: the proof then goes on to the layout checks, which refuse this empty
+/// header under their own names. Seeing a different error proves the root check did not refuse it.
+#[tokio::test]
+async fn post_root_proved_the_pinned_root_c_passes_the_pin_and_reaches_the_layout_checks() {
+    let (result, _cu) = post_proved_under_one_entry(
+        36,
+        reg_layout::CURVE_BN254,
+        reg_layout::SCHEME_ZISK_1_3_1,
+        zisk_program_vk(14),
+        zisk_proof_abi_with_root_c(&root_c(ROOT_C_ZISK_1_3_1)),
+    )
+    .await;
+    let err = result.expect_err("the empty header cannot satisfy the layout checks");
+    assert_ne!(
+        custom_error(&err),
+        Some(zk_settlement::errors::SettleError::RootCNotOfVersion as u32),
+        "the pinned root must not be refused as a wrong root"
+    );
+    assert_ne!(
+        custom_error(&err),
+        Some(zk_settlement::errors::SettleError::ZiskVersionWithdrawn as u32)
+    );
+}
+
+/// No entry holds the programVK, so nothing is found, whatever the proof's root: `RegistryEntryNotFound`
+/// comes first. A ZisK entry for another vkey (here a decoy), and a Groth16 entry for this vkey, both
+/// leave this proof unmatched, because the lookup is by programVK within the ZisK schemes.
+#[tokio::test]
+async fn post_root_proved_no_matching_zisk_entry_is_registry_entry_not_found() {
+    let cases: [(u64, u8, [u8; 32]); 2] = [
+        (37, reg_layout::SCHEME_ZISK_1_3_1, [0x77u8; 32]),
+        (38, reg_layout::SCHEME_GROTH16, zisk_program_vk(14)),
+    ];
+    for (chain_id, scheme, vkey) in cases {
+        let (result, cu) = post_proved_under_one_entry(
+            chain_id,
+            reg_layout::CURVE_BN254,
+            scheme,
+            vkey,
+            zisk_proof_abi_with_root_c(&root_c(ROOT_C_ZISK_1_3_1)),
+        )
+        .await;
+        let err = result.expect_err("no entry matches this programVK");
+        assert_eq!(
+            custom_error(&err),
+            Some(zk_settlement::errors::SettleError::RegistryEntryNotFound as u32),
+            "scheme {scheme}"
+        );
+        assert!(cu < CHEAP_REFUSAL_CU, "got {cu} CU");
+    }
+}
+
+/// A ZisK scheme on a curve other than BN254 is not found either: the pairing is BN254's.
+#[tokio::test]
+async fn post_root_proved_a_zisk_entry_on_another_curve_is_registry_entry_not_found() {
+    let (result, _cu) = post_proved_under_one_entry(
+        39,
+        reg_layout::CURVE_BLS12_381,
+        reg_layout::SCHEME_ZISK_1_3_1,
+        zisk_program_vk(14),
+        zisk_proof_abi_with_root_c(&root_c(ROOT_C_ZISK_1_3_1)),
+    )
+    .await;
+    let err = result.expect_err("a BLS12-381 entry cannot serve a BN254 proof");
+    assert_eq!(
+        custom_error(&err),
+        Some(zk_settlement::errors::SettleError::RegistryEntryNotFound as u32)
+    );
+}
+
+/// Acceptance: the real ZisK 1.3.1 layout-1 batch proof of the committed dev-chain batch, posted under the
+/// scheme-2 entry that its key record describes, finalizes. The proof, its calldata and the key record are
+/// the committed fixtures; nothing here is synthetic except the inbox batch account, which is built to hold
+/// the commitment the proof commits to.
+#[tokio::test]
+async fn post_root_proved_accepts_a_real_zisk_1_3_1_layout_1_batch_proof() {
+    let read_json = |rel: &str| -> serde_json::Value {
+        serde_json::from_str(
+            &std::fs::read_to_string(format!("{}/../../{rel}", env!("CARGO_MANIFEST_DIR")))
+                .unwrap_or_else(|e| panic!("{rel}: {e}")),
+        )
+        .unwrap()
+    };
+    let j = read_json("fixtures/prover-input/txv1-dev-reset6-batch-1.zisk-1.3.1.calldata.json");
+    let key = read_json("fixtures/vkeys/tiber-200101-layout1.zisk-1.3.1.json");
+    let mut proof_abi = Vec::new();
+    for field in [
+        "proofBytes",
+        "programVK",
+        "rootCVadcopFinal",
+        "publicValues",
+    ] {
+        proof_abi.extend(hx(&j[field]));
+    }
+    assert_eq!(proof_abi.len(), 768 + 32 + 32 + 512);
+    let program_vk: [u8; 32] = proof_abi[768..800].try_into().unwrap();
+    // The key record and the proof describe the same program, recursion root, scheme and layout.
+    assert_eq!(program_vk.to_vec(), hx(&key["programVK"]));
+    assert_eq!(hx(&key["rootCVadcopFinal"]), root_c(ROOT_C_ZISK_1_3_1));
+    assert_eq!(proof_abi[800..832], root_c(ROOT_C_ZISK_1_3_1));
+    assert_eq!(key["scheme"], reg_layout::SCHEME_ZISK_1_3_1);
+    assert_eq!(key["layout_id"], reg_layout::LAYOUT_ZISK_V1);
+    let pv_bytes =
+        rome_zk_layouts::public_values::unpack_zisk_outputs(&proof_abi[832..]).expect("v2 packing");
+    let pv = rome_zk_layouts::public_values::read(&pv_bytes).expect("layout-1 public values");
+    assert_eq!(key["chain_id"], pv.chain_id);
+
+    // The independent record of the same batch, captured from the chain and not from the proof. What the
+    // proof commits to must equal it, field by field; the genesis hash the chain starts from and the
+    // values the post carries come from this record, so a proof that committed to something else would be
+    // refused rather than echoed back.
+    let expected = read_json("fixtures/prover-input/txv1-dev-reset6-batch-1.json");
+    let expected_hash = |field: &str| -> [u8; 32] { hx(&expected[field]).try_into().unwrap() };
+    assert_eq!(expected["chain_id"], pv.chain_id);
+    assert_eq!(expected["first_number"], pv.first_number);
+    assert_eq!(expected["last_number"], pv.last_number);
+    assert_eq!(expected["open_unix_ts"], pv.open_unix_ts);
+    assert_eq!(expected["max_drift_secs"], pv.max_drift_secs);
+    assert_eq!(expected["gas_used"], pv.gas_used);
+    assert_eq!(expected_hash("parent_hash"), pv.parent_hash);
+    assert_eq!(expected_hash("inbox_commitment"), pv.inbox_commitment);
+    assert_eq!(
+        expected_hash("forced_outcome_commitment"),
+        pv.forced_outcome_commitment
+    );
+    assert_eq!(expected_hash("last_block_hash"), pv.last_block_hash);
+    assert_eq!(expected_hash("state_root"), pv.state_root);
+
+    let (pt, settlement_program, payer, mut c, _) = post_root_rig().await;
+    c.chain_id = expected["chain_id"].as_u64().unwrap();
+    // The proof does not commit to the state before the batch, so any genesis state root serves; the
+    // batch's parent hash is the hash of the chain's genesis block.
+    let genesis_state_root = c.genesis_state_root;
+    let mut ctx = pt.start_with_context().await;
+    let mut fields = default_init_chain_fields(&c, 16);
+    fields.block_hash = expected_hash("parent_hash");
+    fields.max_drift_secs = pv.max_drift_secs;
+    fields.registry_entries = vec![sclient::RegistryEntry {
+        curve: reg_layout::CURVE_BN254,
+        scheme: reg_layout::SCHEME_ZISK_1_3_1,
+        vkey_hash: program_vk,
+        layout_id: reg_layout::LAYOUT_ZISK_V1,
+    }];
+    ensure_global_config(&mut ctx, &payer, &c).await;
+    ensure_reserved_allowed(&mut ctx, &payer, &c).await;
+    let init_ix = sclient::init_chain_reserved_ix(
+        &settlement_program,
+        &payer.pubkey(),
+        &c.authority.pubkey(),
+        &c.registry_authority.pubkey(),
+        c.chain_id,
+        fields,
+    );
+    send(
+        &mut ctx,
+        &[init_ix],
+        &payer,
+        &[&c.authority, &c.registry_authority],
+    )
+    .await
+    .expect("InitChain should succeed");
+
+    let inbox_pda = sclient::inbox_batch_pda(&c.inbox_program, &settlement_program, c.chain_id, 1);
+    ctx.set_account(
+        &inbox_pda,
+        &inbox_batch_account_with_open_ts(
+            c.inbox_program,
+            c.chain_id,
+            1,
+            settlement_program,
+            c.authority.pubkey(),
+            true,
+            pv.inbox_commitment,
+            pv.open_unix_ts as i64,
+        )
+        .into(),
+    );
+    let args = sclient::PostRootFields {
+        chain_id: c.chain_id,
+        batch: 1,
+        prev_batch: 0,
+        pre_state_root: genesis_state_root,
+        first_block: pv.first_number,
+        last_block: pv.last_number,
+        state_root: pv.state_root,
+        block_roots_merkle: [0u8; 32],
+        inbox_commitment: pv.inbox_commitment,
+        forced_outcome_commitment: pv.forced_outcome_commitment,
+        parent_hash: pv.parent_hash,
+        last_block_hash: pv.last_block_hash,
+        gas_in_batch: pv.gas_used,
+    };
+    let ix = sclient::post_root_proved_ix(
+        &settlement_program,
+        &c.authority.pubkey(),
+        &c.inbox_program,
+        &c.treasury,
+        args,
+        proof_abi,
+        vec![],
+    );
+    let (result, cu) = send_capturing_cu(&mut ctx, &[ix], &c.authority).await;
+    eprintln!("PostRootProved (real ZisK 1.3.1 layout-1 proof) consumed {cu} CU");
+    result.expect("a real 1.3.1 layout-1 proof must finalize under a scheme-2 entry");
+    // The prover sends its post with a 700,000 compute-unit limit by default; a post that costs more
+    // than that could not be sent by the prover as configured.
+    assert!(
+        cu < 700_000,
+        "PostRootProved CU {cu} must stay under the prover's default limit of 700,000"
+    );
+
+    let (root_pda, _) = sclient::root_pda(&settlement_program, c.chain_id);
+    let root = sclient::decode_root_account(
+        &ctx.banks_client
+            .get_account(root_pda)
+            .await
+            .unwrap()
+            .unwrap()
+            .data,
+    )
+    .unwrap();
+    assert_eq!(root.head_final_batch, 1);
+    assert_eq!(root.number, pv.last_number);
+    assert_eq!(root.state_root, expected_hash("state_root"));
+    assert_eq!(root.parent_hash, expected_hash("parent_hash"));
+    assert_eq!(root.block_hash, expected_hash("last_block_hash"));
+    let (pending_pda, _) = sclient::pending_pda(&settlement_program, c.chain_id, 1);
+    let pending = sclient::decode_pending_account(
+        &ctx.banks_client
+            .get_account(pending_pda)
+            .await
+            .unwrap()
+            .unwrap()
+            .data,
+    )
+    .unwrap();
+    assert_eq!(pending.status, rome_zk_layouts::pending::STATUS_FINAL);
 }
 
 /// Thin adapter over `rome_zk_testkit::send_measuring_cu` — this file's callers want both the pass/fail
@@ -2564,7 +3155,7 @@ fn synthetic_layout1_proof_abi(
     let j = calldata_fixture(block);
     let mut d = hx(&j["proofBytes"]);
     d.extend(hx(&j["programVK"]));
-    d.extend(hx(&j["rootCVadcopFinal"]));
+    d.extend_from_slice(&root_c(ROOT_C_ZISK_1_3_1));
     let words = rome_zk_layouts::public_values::pack_zisk_outputs(pv);
     for w in words {
         d.extend_from_slice(&w.to_le_bytes());
@@ -2576,7 +3167,7 @@ fn synthetic_layout1_proof_abi(
 fn layout1_registry_entries() -> Vec<sclient::RegistryEntry> {
     vec![sclient::RegistryEntry {
         curve: reg_layout::CURVE_BN254,
-        scheme: reg_layout::SCHEME_PLONK,
+        scheme: reg_layout::SCHEME_ZISK_1_3_1,
         vkey_hash: zisk_program_vk(14),
         layout_id: reg_layout::LAYOUT_ZISK_V1,
     }]
@@ -2608,7 +3199,7 @@ fn synthetic_layout1_proof_abi_with_vkey(
     let j = calldata_fixture(block);
     let mut d = hx(&j["proofBytes"]);
     d.extend_from_slice(vkey);
-    d.extend(hx(&j["rootCVadcopFinal"]));
+    d.extend_from_slice(&root_c(ROOT_C_ZISK_1_3_1));
     let words = rome_zk_layouts::public_values::pack_zisk_outputs(pv);
     for w in words {
         d.extend_from_slice(&w.to_le_bytes());
@@ -3215,7 +3806,7 @@ async fn set_registry_entry_appends_layout1_entry_and_post_root_proved_reaches_t
     let batch_guest_vkey = batch_guest_program_vk();
     let entry = sclient::RegistryEntry {
         curve: reg_layout::CURVE_BN254,
-        scheme: reg_layout::SCHEME_PLONK,
+        scheme: reg_layout::SCHEME_ZISK_1_3_1,
         vkey_hash: batch_guest_vkey,
         layout_id: reg_layout::LAYOUT_ZISK_V1,
     };
@@ -3472,7 +4063,7 @@ async fn permissionless_chain_is_inert_until_the_registry_authority_registers_it
         c.chain_id,
         sclient::RegistryEntry {
             curve: reg_layout::CURVE_BN254,
-            scheme: reg_layout::SCHEME_PLONK,
+            scheme: reg_layout::SCHEME_ZISK_1_3_1,
             vkey_hash: batch_guest_vkey,
             layout_id: reg_layout::LAYOUT_ZISK_V1,
         },
@@ -3548,7 +4139,7 @@ async fn set_registry_entry_activation_delay_refuses_until_the_slot_then_reaches
     let batch_guest_vkey = batch_guest_program_vk();
     let entry = sclient::RegistryEntry {
         curve: reg_layout::CURVE_BN254,
-        scheme: reg_layout::SCHEME_PLONK,
+        scheme: reg_layout::SCHEME_ZISK_1_3_1,
         vkey_hash: batch_guest_vkey,
         layout_id: reg_layout::LAYOUT_ZISK_V1,
     };
@@ -3677,7 +4268,7 @@ async fn set_registry_entry_same_vkey_updates_only_the_activation_slot() {
     let vkey = batch_guest_program_vk();
     let entry = sclient::RegistryEntry {
         curve: reg_layout::CURVE_BN254,
-        scheme: reg_layout::SCHEME_PLONK,
+        scheme: reg_layout::SCHEME_ZISK_1_3_1,
         vkey_hash: vkey,
         layout_id: reg_layout::LAYOUT_ZISK_V1,
     };
@@ -3791,7 +4382,7 @@ async fn set_registry_entry_same_vkey_different_layout_is_layout_mismatch() {
             c.chain_id,
             sclient::RegistryEntry {
                 curve: reg_layout::CURVE_BN254,
-                scheme: reg_layout::SCHEME_PLONK,
+                scheme: reg_layout::SCHEME_ZISK_1_3_1,
                 vkey_hash: vkey,
                 layout_id: reg_layout::LAYOUT_ZISK_V1,
             },
@@ -3812,7 +4403,7 @@ async fn set_registry_entry_same_vkey_different_layout_is_layout_mismatch() {
             c.chain_id,
             sclient::RegistryEntry {
                 curve: reg_layout::CURVE_BN254,
-                scheme: reg_layout::SCHEME_PLONK,
+                scheme: reg_layout::SCHEME_ZISK_1_3_1,
                 vkey_hash: vkey,                               // same vkey
                 layout_id: reg_layout::LAYOUT_HEADER_FALLBACK, // different layout
             },
@@ -3852,13 +4443,13 @@ async fn init_chain_v2_refuses_a_genesis_registry_with_duplicate_vkeys() {
     fields.registry_entries = vec![
         sclient::RegistryEntry {
             curve: reg_layout::CURVE_BN254,
-            scheme: reg_layout::SCHEME_PLONK,
+            scheme: reg_layout::SCHEME_ZISK_1_3_1,
             vkey_hash: vkey_a,
             layout_id: reg_layout::LAYOUT_ZISK_V1,
         },
         sclient::RegistryEntry {
             curve: reg_layout::CURVE_BN254,
-            scheme: reg_layout::SCHEME_PLONK,
+            scheme: reg_layout::SCHEME_ZISK_1_3_1,
             vkey_hash: vkey_a,
             layout_id: reg_layout::LAYOUT_ZISK_V1,
         },
@@ -3891,13 +4482,13 @@ async fn init_chain_v2_refuses_a_genesis_registry_with_duplicate_vkeys() {
     fields2.registry_entries = vec![
         sclient::RegistryEntry {
             curve: reg_layout::CURVE_BN254,
-            scheme: reg_layout::SCHEME_PLONK,
+            scheme: reg_layout::SCHEME_ZISK_1_3_1,
             vkey_hash: vkey_a,
             layout_id: reg_layout::LAYOUT_ZISK_V1,
         },
         sclient::RegistryEntry {
             curve: reg_layout::CURVE_BN254,
-            scheme: reg_layout::SCHEME_PLONK,
+            scheme: reg_layout::SCHEME_ZISK_1_3_1,
             vkey_hash: vkey_a,
             layout_id: reg_layout::LAYOUT_HEADER_FALLBACK,
         },
@@ -3939,7 +4530,7 @@ async fn set_registry_entry_retire_never_hits_activation_in_past() {
     let vkey = batch_guest_program_vk();
     let entry = sclient::RegistryEntry {
         curve: reg_layout::CURVE_BN254,
-        scheme: reg_layout::SCHEME_PLONK,
+        scheme: reg_layout::SCHEME_ZISK_1_3_1,
         vkey_hash: vkey,
         layout_id: reg_layout::LAYOUT_ZISK_V1,
     };
@@ -4022,7 +4613,7 @@ fn raw_set_registry_entry_ix(
 fn valid_entry() -> sclient::RegistryEntry {
     sclient::RegistryEntry {
         curve: reg_layout::CURVE_BN254,
-        scheme: reg_layout::SCHEME_PLONK,
+        scheme: reg_layout::SCHEME_ZISK_1_3_1,
         vkey_hash: batch_guest_program_vk(),
         layout_id: reg_layout::LAYOUT_ZISK_V1,
     }
@@ -4183,7 +4774,7 @@ async fn set_registry_entry_guard_unknown_curve_or_scheme_is_refused() {
     );
 
     let mut bad_scheme = valid_entry();
-    bad_scheme.scheme = 2;
+    bad_scheme.scheme = 3; // the first number no release has been given
     let ix2 = raw_set_registry_entry_ix(
         settlement_program,
         c.registry_authority.pubkey(),
@@ -4375,7 +4966,7 @@ async fn set_registry_entry_refuses_a_corrupt_registry_with_a_duplicate_vkey() {
     d[reg_layout::OFF_COUNT] = 2;
     let dup_entry = reg_layout::RegistryEntry {
         curve: reg_layout::CURVE_BN254,
-        scheme: reg_layout::SCHEME_PLONK,
+        scheme: reg_layout::SCHEME_ZISK_1_3_1,
         vkey_hash: vkey,
         layout_id: reg_layout::LAYOUT_ZISK_V1,
     };
@@ -4434,7 +5025,7 @@ async fn set_registry_entry_refuses_registry_full_with_no_matching_entry_to_repl
     fields.registry_entries = vec![
         sclient::RegistryEntry {
             curve: reg_layout::CURVE_BN254,
-            scheme: reg_layout::SCHEME_PLONK,
+            scheme: reg_layout::SCHEME_ZISK_1_3_1,
             vkey_hash: [1u8; 32],
             layout_id: reg_layout::LAYOUT_HEADER_FALLBACK,
         },
@@ -4446,7 +5037,7 @@ async fn set_registry_entry_refuses_registry_full_with_no_matching_entry_to_repl
         },
         sclient::RegistryEntry {
             curve: reg_layout::CURVE_BLS12_381,
-            scheme: reg_layout::SCHEME_PLONK,
+            scheme: reg_layout::SCHEME_GROTH16,
             vkey_hash: [3u8; 32],
             layout_id: reg_layout::LAYOUT_HEADER_FALLBACK,
         },
@@ -4479,7 +5070,7 @@ async fn set_registry_entry_refuses_registry_full_with_no_matching_entry_to_repl
     let now = ctx.banks_client.get_root_slot().await.unwrap();
     let fifth_entry = sclient::RegistryEntry {
         curve: reg_layout::CURVE_BN254,
-        scheme: reg_layout::SCHEME_PLONK,
+        scheme: reg_layout::SCHEME_ZISK_1_3_1,
         vkey_hash: batch_guest_program_vk(),
         layout_id: reg_layout::LAYOUT_ZISK_V1, // a brand-new vkey — none of the 4 existing entries is retired
     };
@@ -4517,7 +5108,7 @@ async fn set_registry_entry_rejects_a_signer_that_is_not_the_registry_authority(
     let now = ctx.banks_client.get_root_slot().await.unwrap();
     let entry = sclient::RegistryEntry {
         curve: reg_layout::CURVE_BN254,
-        scheme: reg_layout::SCHEME_PLONK,
+        scheme: reg_layout::SCHEME_ZISK_1_3_1,
         vkey_hash: batch_guest_program_vk(),
         layout_id: reg_layout::LAYOUT_ZISK_V1,
     };
@@ -4558,7 +5149,7 @@ async fn set_registry_entry_rejects_an_activation_slot_before_now() {
     assert!(now >= 1_000);
     let entry = sclient::RegistryEntry {
         curve: reg_layout::CURVE_BN254,
-        scheme: reg_layout::SCHEME_PLONK,
+        scheme: reg_layout::SCHEME_ZISK_1_3_1,
         vkey_hash: batch_guest_program_vk(),
         layout_id: reg_layout::LAYOUT_ZISK_V1,
     };
@@ -4605,7 +5196,7 @@ async fn set_registry_entry_realloc_preserves_every_byte_of_the_v1_registry() {
     let now = ctx.banks_client.get_root_slot().await.unwrap();
     let entry = sclient::RegistryEntry {
         curve: reg_layout::CURVE_BN254,
-        scheme: reg_layout::SCHEME_PLONK,
+        scheme: reg_layout::SCHEME_ZISK_1_3_1,
         vkey_hash: batch_guest_program_vk(),
         layout_id: reg_layout::LAYOUT_ZISK_V1,
     };
@@ -4730,7 +5321,7 @@ async fn set_registry_entry_r1_delayed_rotation_never_touches_the_old_key_until_
             c.chain_id,
             sclient::RegistryEntry {
                 curve: reg_layout::CURVE_BN254,
-                scheme: reg_layout::SCHEME_PLONK,
+                scheme: reg_layout::SCHEME_ZISK_1_3_1,
                 vkey_hash: vkey_a,
                 layout_id: reg_layout::LAYOUT_ZISK_V1,
             },
@@ -4778,7 +5369,7 @@ async fn set_registry_entry_r1_delayed_rotation_never_touches_the_old_key_until_
             c.chain_id,
             sclient::RegistryEntry {
                 curve: reg_layout::CURVE_BN254,
-                scheme: reg_layout::SCHEME_PLONK,
+                scheme: reg_layout::SCHEME_ZISK_1_3_1,
                 vkey_hash: vkey_b,
                 layout_id: reg_layout::LAYOUT_ZISK_V1,
             },
@@ -4880,7 +5471,7 @@ async fn set_registry_entry_r1_delayed_rotation_never_touches_the_old_key_until_
             c.chain_id,
             sclient::RegistryEntry {
                 curve: reg_layout::CURVE_BN254,
-                scheme: reg_layout::SCHEME_PLONK,
+                scheme: reg_layout::SCHEME_ZISK_1_3_1,
                 vkey_hash: vkey_a,
                 layout_id: reg_layout::LAYOUT_ZISK_V1,
             },
@@ -4937,7 +5528,7 @@ async fn set_registry_entry_r1_delayed_rotation_never_touches_the_old_key_until_
             c.chain_id,
             sclient::RegistryEntry {
                 curve: reg_layout::CURVE_BN254,
-                scheme: reg_layout::SCHEME_PLONK,
+                scheme: reg_layout::SCHEME_ZISK_1_3_1,
                 vkey_hash: vkey_c,
                 layout_id: reg_layout::LAYOUT_ZISK_V1,
             },
@@ -5022,7 +5613,7 @@ async fn set_registry_entry_rev_unretire_via_same_vkey_update_is_refused() {
             c.chain_id,
             sclient::RegistryEntry {
                 curve: reg_layout::CURVE_BN254,
-                scheme: reg_layout::SCHEME_PLONK,
+                scheme: reg_layout::SCHEME_ZISK_1_3_1,
                 vkey_hash: vkey,
                 layout_id: reg_layout::LAYOUT_ZISK_V1,
             },
@@ -5043,7 +5634,7 @@ async fn set_registry_entry_rev_unretire_via_same_vkey_update_is_refused() {
             c.chain_id,
             sclient::RegistryEntry {
                 curve: reg_layout::CURVE_BN254,
-                scheme: reg_layout::SCHEME_PLONK,
+                scheme: reg_layout::SCHEME_ZISK_1_3_1,
                 vkey_hash: vkey,
                 layout_id: reg_layout::LAYOUT_ZISK_V1,
             },
@@ -5066,7 +5657,7 @@ async fn set_registry_entry_rev_unretire_via_same_vkey_update_is_refused() {
             c.chain_id,
             sclient::RegistryEntry {
                 curve: reg_layout::CURVE_BN254,
-                scheme: reg_layout::SCHEME_PLONK,
+                scheme: reg_layout::SCHEME_ZISK_1_3_1,
                 vkey_hash: vkey,
                 layout_id: reg_layout::LAYOUT_ZISK_V1,
             },
@@ -5093,7 +5684,7 @@ async fn set_registry_entry_rev_unretire_via_same_vkey_update_is_refused() {
             c.chain_id,
             sclient::RegistryEntry {
                 curve: reg_layout::CURVE_BN254,
-                scheme: reg_layout::SCHEME_PLONK,
+                scheme: reg_layout::SCHEME_ZISK_1_3_1,
                 vkey_hash: vkey,
                 layout_id: reg_layout::LAYOUT_ZISK_V1,
             },
@@ -5172,7 +5763,7 @@ async fn set_registry_entry_rev_unretire_via_same_vkey_update_is_refused() {
             c.chain_id,
             sclient::RegistryEntry {
                 curve: reg_layout::CURVE_BN254,
-                scheme: reg_layout::SCHEME_PLONK,
+                scheme: reg_layout::SCHEME_ZISK_1_3_1,
                 vkey_hash: vkey,
                 layout_id: reg_layout::LAYOUT_ZISK_V1,
             },
@@ -5218,7 +5809,7 @@ async fn set_registry_entry_retired_vkey_re_registers_once_its_slot_has_been_reu
     let vkey_c = [0xCCu8; 32];
     let l1 = |vkey_hash: [u8; 32]| sclient::RegistryEntry {
         curve: reg_layout::CURVE_BN254,
-        scheme: reg_layout::SCHEME_PLONK,
+        scheme: reg_layout::SCHEME_ZISK_1_3_1,
         vkey_hash,
         layout_id: reg_layout::LAYOUT_ZISK_V1,
     };
@@ -5226,7 +5817,7 @@ async fn set_registry_entry_retired_vkey_re_registers_once_its_slot_has_been_reu
     fields.registry_entries = vec![
         sclient::RegistryEntry {
             curve: reg_layout::CURVE_BN254,
-            scheme: reg_layout::SCHEME_PLONK,
+            scheme: reg_layout::SCHEME_ZISK_1_3_1,
             vkey_hash: [1u8; 32],
             layout_id: reg_layout::LAYOUT_HEADER_FALLBACK,
         },
@@ -5466,8 +6057,8 @@ async fn post_root_proved_layout2_still_rejects_a_multi_block_batch() {
 
 /// Runs the real `veritas` program's own entrypoint against the same real block-14 proof
 /// `PostRootProved` verifies internally — identical BPF bytecode, so this is a faithful, real-BPF CU
-/// measurement of "the expensive part" `PostRootProved` pays once header-binding is satisfied (442,210
-/// CU on SBPF v3; the earlier verifier measured 543,018 on devnet).
+/// measurement of "the expensive part" `PostRootProved` pays once header-binding is satisfied (438,000 to 442,000
+/// CU on SBPF v3 with a ZisK 1.3.1 proof; the earlier verifier measured 543,018 on devnet).
 #[tokio::test]
 async fn veritas_real_fixture_cu_is_within_budget() {
     let program_id = Pubkey::new_unique();
@@ -5482,19 +6073,39 @@ async fn veritas_real_fixture_cu_is_within_budget() {
     pt.set_compute_max_units(1_400_000);
     let mut ctx = pt.start_with_context().await;
 
+    // The standalone program takes a release byte, then the ABI. The built program holds the ZisK 1.3.1 key
+    // only (release 2), so this is the ZisK 1.3.1 proof of the same block 14.
+    let j: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(format!(
+            "{}/../../fixtures/zisk-releases/zisk-1.3.1/block14.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut data = vec![2u8];
+    for field in [
+        "proofBytes",
+        "programVK",
+        "rootCVadcopFinal",
+        "publicValues",
+    ] {
+        data.extend(hx(&j[field]));
+    }
+    assert_eq!(data.len(), 1 + 768 + 32 + 32 + 512);
     let ix = Instruction {
         program_id,
         accounts: vec![],
-        data: zisk_proof_abi(14),
+        data,
     };
     let payer = ctx.payer.insecure_clone();
     let (result, cu, _logs) =
         rome_zk_testkit::send_measuring_cu(&mut ctx, &[ix], &payer, &[]).await;
-    eprintln!("veritas::verify_zisk (real block-14 proof) consumed {cu} CU");
+    eprintln!("veritas::verify_zisk (real ZisK 1.3.1 block-14 proof) consumed {cu} CU");
     result.expect("the real fixture proof must verify");
     assert!(
         cu < 460_000,
-        "verify_zisk CU {cu} must stay under the 460k pin (442,210 measured on SBPF v3 with veritas; the earlier verifier measured 541,225)"
+        "verify_zisk CU {cu} must stay under the 460k pin (438,000 to 442,000 measured on SBPF v3 with veritas under ZisK 1.3.1; the earlier verifier measured 541,225)"
     );
 }
 
@@ -5743,13 +6354,15 @@ async fn full_flow_inbox_to_settlement_to_close() {
     }
     send(
         &mut ctx,
-        &[zk_inbox_client::finalize_batch_ix(
+        &[zk_inbox_client::finalize_batch_v2_ix(
             &inbox_program,
             &c.authority.pubkey(),
             &settlement_program,
             c.chain_id,
             batch,
             0,
+            0,
+            None,
         )],
         &c.authority,
         &[],
@@ -6750,13 +7363,15 @@ async fn open_and_finalize_one_chunk_batch(
     .await?;
     send(
         ctx,
-        &[zk_inbox_client::finalize_batch_ix(
+        &[zk_inbox_client::finalize_batch_v2_ix(
             inbox,
             &a.pubkey(),
             &c.settlement_program,
             c.chain_id,
             batch,
             0,
+            0,
+            None,
         )],
         a,
         &[],
@@ -7223,4 +7838,325 @@ async fn post_root_and_post_root_proved_refuse_a_batch_at_the_right_address_reco
         .await
         .expect_err("PostRootProved accepted a batch recording another settlement program");
     assert_eq!(custom_error(&err), Some(wrong), "PostRootProved: {err:?}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// (6c) Writing registry entries: what each ZisK release's status allows
+// ---------------------------------------------------------------------------------------------
+
+/// An entry as it was written before the release rules: a layout-1 key under scheme 1 (ZisK 1.2.0).
+fn old_release_entry(vkey_hash: [u8; 32]) -> reg_layout::RegistryEntry {
+    reg_layout::RegistryEntry {
+        curve: reg_layout::CURVE_BN254,
+        scheme: reg_layout::SCHEME_ZISK_1_2_0,
+        vkey_hash,
+        layout_id: reg_layout::LAYOUT_ZISK_V1,
+    }
+}
+
+fn open_release_entry(vkey_hash: [u8; 32]) -> sclient::RegistryEntry {
+    sclient::RegistryEntry {
+        curve: reg_layout::CURVE_BN254,
+        scheme: reg_layout::SCHEME_ZISK_1_3_1,
+        vkey_hash,
+        layout_id: reg_layout::LAYOUT_ZISK_V1,
+    }
+}
+
+fn settle_error(e: zk_settlement::errors::SettleError) -> Option<u32> {
+    Some(e as u32)
+}
+
+/// A new entry under a withdrawn release is refused by name, and nothing is written.
+#[tokio::test]
+async fn set_registry_entry_refuses_a_new_entry_under_a_withdrawn_release() {
+    let mut rig = PostRig::new(60).await;
+    let now = rig.now().await;
+    let mut entry = open_release_entry([0x31u8; 32]);
+    entry.scheme = reg_layout::SCHEME_ZISK_1_2_0;
+    let err = rig
+        .register(entry, now)
+        .await
+        .expect_err("a withdrawn release takes no new entry");
+    assert_eq!(
+        custom_error(&err),
+        settle_error(zk_settlement::errors::SettleError::ZiskVersionWithdrawn)
+    );
+    assert_eq!(rig.registry().await.count, 0);
+}
+
+/// Moving the activation slot of an entry under a withdrawn release is a write like any other, and is
+/// refused. The entry keeps the slot it had.
+#[tokio::test]
+async fn set_registry_entry_refuses_a_moved_activation_slot_under_a_withdrawn_release() {
+    let mut rig = PostRig::new(61).await;
+    let vk = [0x32u8; 32];
+    rig.plant(&[(old_release_entry(vk), 0)]).await;
+    let now = rig.now().await;
+    let mut entry = open_release_entry(vk);
+    entry.scheme = reg_layout::SCHEME_ZISK_1_2_0;
+    let err = rig
+        .register(entry, now + 500)
+        .await
+        .expect_err("a withdrawn release's entry cannot be moved");
+    assert_eq!(
+        custom_error(&err),
+        settle_error(zk_settlement::errors::SettleError::ZiskVersionWithdrawn)
+    );
+    assert_eq!(rig.registry().await.entries[0].activation_slot, 0);
+}
+
+/// Retiring an entry written under scheme 1 always works: cleanup must not depend on the release's status.
+/// Retiring it again stays a no-op success.
+#[tokio::test]
+async fn set_registry_entry_retires_a_scheme_1_entry() {
+    let mut rig = PostRig::new(62).await;
+    let vk = [0x33u8; 32];
+    rig.plant(&[(old_release_entry(vk), 0)]).await;
+    let mut entry = open_release_entry(vk);
+    entry.scheme = reg_layout::SCHEME_ZISK_1_2_0;
+    rig.register(entry, reg_layout::RETIRED_SLOT)
+        .await
+        .expect("retiring an entry under a withdrawn release must succeed");
+    let after = rig.registry().await;
+    assert_eq!(after.count, 1);
+    assert!(after.entries[0].retired);
+    assert_eq!(after.entries[0].scheme, reg_layout::SCHEME_ZISK_1_2_0);
+    rig.register(entry, reg_layout::RETIRED_SLOT)
+        .await
+        .expect("retiring a retired entry stays a no-op success");
+}
+
+/// Retiring is not a way to write: an entry that is not in the registry cannot be created under a withdrawn
+/// release by sending it with the retired slot.
+#[tokio::test]
+async fn set_registry_entry_retire_of_an_absent_entry_under_a_withdrawn_release_is_refused() {
+    let mut rig = PostRig::new(63).await;
+    let mut entry = open_release_entry([0x34u8; 32]);
+    entry.scheme = reg_layout::SCHEME_ZISK_1_2_0;
+    let err = rig
+        .register(entry, reg_layout::RETIRED_SLOT)
+        .await
+        .expect_err("nothing to retire, so this would be a write");
+    assert_eq!(
+        custom_error(&err),
+        settle_error(zk_settlement::errors::SettleError::ZiskVersionWithdrawn)
+    );
+    assert_eq!(rig.registry().await.count, 0);
+}
+
+/// A ZisK scheme on a curve other than BN254 is refused, for every ZisK scheme number: the pairing is
+/// BN254's. A Groth16 entry on BLS12-381 is unaffected.
+#[tokio::test]
+async fn set_registry_entry_refuses_a_zisk_scheme_on_another_curve() {
+    let mut rig = PostRig::new(64).await;
+    let now = rig.now().await;
+    for scheme in [reg_layout::SCHEME_ZISK_1_2_0, reg_layout::SCHEME_ZISK_1_3_1] {
+        let mut entry = open_release_entry([0x35u8; 32]);
+        entry.curve = reg_layout::CURVE_BLS12_381;
+        entry.scheme = scheme;
+        let err = rig
+            .register(entry, now)
+            .await
+            .expect_err("a ZisK key is a BN254 key");
+        assert_eq!(
+            custom_error(&err),
+            settle_error(zk_settlement::errors::SettleError::UnknownCurveOrScheme),
+            "scheme {scheme}"
+        );
+    }
+    assert_eq!(rig.registry().await.count, 0);
+    let mut groth16 = open_release_entry([0x36u8; 32]);
+    groth16.curve = reg_layout::CURVE_BLS12_381;
+    groth16.scheme = reg_layout::SCHEME_GROTH16;
+    groth16.layout_id = reg_layout::LAYOUT_HEADER_FALLBACK;
+    rig.register(groth16, now)
+        .await
+        .expect("Groth16 on BLS12-381 is still allowed");
+}
+
+/// One programVK picks one entry: a key already held, not retired, under another release cannot be registered
+/// under this one. The refusal is by name and nothing is written.
+#[tokio::test]
+async fn set_registry_entry_refuses_a_vkey_held_under_another_release() {
+    let mut rig = PostRig::new(65).await;
+    let vk = [0x37u8; 32];
+    rig.plant(&[(old_release_entry(vk), 0)]).await;
+    let now = rig.now().await;
+    let err = rig
+        .register(open_release_entry(vk), now)
+        .await
+        .expect_err("the same programVK under two releases must be refused");
+    assert_eq!(
+        custom_error(&err),
+        settle_error(zk_settlement::errors::SettleError::VkeyUnderOtherZiskVersion)
+    );
+    assert_eq!(rig.registry().await.count, 1);
+}
+
+/// A held entry that has a future start slot still holds its key. Retiring the other release's entry frees
+/// the key, and then the registration goes through.
+#[tokio::test]
+async fn set_registry_entry_accepts_the_vkey_once_the_other_releases_entry_is_retired() {
+    let mut rig = PostRig::new(66).await;
+    let vk = [0x38u8; 32];
+    let now = rig.now().await;
+    rig.plant(&[(old_release_entry(vk), now + 10_000)]).await;
+    let err = rig
+        .register(open_release_entry(vk), now)
+        .await
+        .expect_err("a not-yet-active entry still holds its key");
+    assert_eq!(
+        custom_error(&err),
+        settle_error(zk_settlement::errors::SettleError::VkeyUnderOtherZiskVersion)
+    );
+    let mut old = open_release_entry(vk);
+    old.scheme = reg_layout::SCHEME_ZISK_1_2_0;
+    rig.register(old, reg_layout::RETIRED_SLOT).await.unwrap();
+    rig.register(open_release_entry(vk), now)
+        .await
+        .expect("the key is free once the other release's entry is retired");
+    let after = rig.registry().await;
+    assert_eq!(after.count, 2);
+    assert!(after.entries[0].retired);
+    assert_eq!(after.entries[1].scheme, reg_layout::SCHEME_ZISK_1_3_1);
+}
+
+/// A genesis entry under a withdrawn release is refused on the reserved path, by name, before the chain is
+/// created.
+#[tokio::test]
+async fn init_chain_v2_refuses_a_genesis_entry_under_a_withdrawn_release() {
+    let (pt, settlement_program, payer, mut c, _) = post_root_rig().await;
+    c.chain_id = 67;
+    let mut ctx = pt.start_with_context().await;
+    let mut fields = default_init_chain_fields(&c, 16);
+    fields.registry_entries = vec![sclient::RegistryEntry {
+        scheme: reg_layout::SCHEME_ZISK_1_2_0,
+        ..open_release_entry(zisk_program_vk(14))
+    }];
+    let err = init_chain_expecting_refusal(&mut ctx, &payer, &c, fields).await;
+    assert_eq!(
+        custom_error(&err),
+        settle_error(zk_settlement::errors::SettleError::ZiskVersionWithdrawn)
+    );
+    let (root, _) = zk_settlement::root_pda(&settlement_program, c.chain_id);
+    assert!(ctx.banks_client.get_account(root).await.unwrap().is_none());
+}
+
+/// A genesis entry the program would not accept through `SetRegistryEntry` is refused at genesis too: an
+/// unassigned scheme number, a ZisK scheme on BLS12-381 and an unknown curve.
+#[tokio::test]
+async fn init_chain_v2_refuses_a_genesis_entry_with_an_unknown_curve_or_scheme() {
+    let (pt, _settlement_program, payer, mut c, _) = post_root_rig().await;
+    c.chain_id = 68;
+    let mut ctx = pt.start_with_context().await;
+    let vk = zisk_program_vk(14);
+    let bad: [(u8, u8); 3] = [
+        (reg_layout::CURVE_BN254, 3),
+        (reg_layout::CURVE_BLS12_381, reg_layout::SCHEME_ZISK_1_3_1),
+        (2, reg_layout::SCHEME_GROTH16),
+    ];
+    for (curve, scheme) in bad {
+        let mut fields = default_init_chain_fields(&c, 16);
+        fields.registry_entries = vec![sclient::RegistryEntry {
+            curve,
+            scheme,
+            ..open_release_entry(vk)
+        }];
+        let err = init_chain_expecting_refusal(&mut ctx, &payer, &c, fields).await;
+        assert_eq!(
+            custom_error(&err),
+            settle_error(zk_settlement::errors::SettleError::UnknownCurveOrScheme),
+            "curve {curve} scheme {scheme}"
+        );
+    }
+}
+
+/// Sends a reserved-path `InitChainV2` that must be refused and returns the error. Bootstraps the global
+/// config and the allowlist marker first, like `init_chain`.
+async fn init_chain_expecting_refusal(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    payer: &Keypair,
+    c: &Chain,
+    fields: sclient::InitChainFields,
+) -> TransactionError {
+    ensure_global_config(ctx, payer, c).await;
+    ensure_reserved_allowed(ctx, payer, c).await;
+    let ix = sclient::init_chain_reserved_ix(
+        &c.settlement_program,
+        &payer.pubkey(),
+        &c.authority.pubkey(),
+        &c.registry_authority.pubkey(),
+        c.chain_id,
+        fields,
+    );
+    send(ctx, &[ix], payer, &[&c.authority, &c.registry_authority])
+        .await
+        .expect_err("this genesis registry must be refused")
+}
+
+/// The move from one release to the next, end to end on one chain. The chain starts with an entry written
+/// under scheme 1. Rome registers a scheme-2 key with a start slot ahead of now; the old entry is not
+/// touched. The old entry is refused by name, the new one is not found until its slot, and from its slot
+/// the new entry reaches the recursion-root check. Retiring the old entry afterwards leaves it unfound.
+/// (The 1.2.0 wrapper key exists only behind veritas's test feature, and the table marks the release
+/// withdrawn either way, so the old entry never verifies a proof here; the two releases' real proofs are
+/// checked against each other's keys in veritas's own tests.)
+#[tokio::test]
+async fn release_rotation_drill_old_entry_withdrawn_new_entry_active_from_its_slot() {
+    let mut rig = PostRig::new(69).await;
+    let old_vk = zisk_program_vk(14);
+    let new_vk = [0x41u8; 32];
+    rig.plant(&[(old_release_entry(old_vk), 0)]).await;
+    let now = rig.now().await;
+    let start = now + 200;
+    rig.register(open_release_entry(new_vk), start)
+        .await
+        .expect("registering the open release's key must succeed");
+    let registry = rig.registry().await;
+    assert_eq!(registry.count, 2);
+    assert_eq!(registry.entries[0].scheme, reg_layout::SCHEME_ZISK_1_2_0);
+    assert_eq!(
+        registry.entries[0].activation_slot, 0,
+        "the old entry is untouched"
+    );
+    assert_eq!(registry.entries[1].activation_slot, start);
+
+    let old_proof = zisk_proof_abi_1_2_0(14);
+    let mut new_proof = zisk_proof_abi_with_root_c(&root_c(ROOT_C_ZISK_1_3_1));
+    new_proof[768..800].copy_from_slice(&new_vk);
+
+    let (old_result, _) = rig.post(old_proof.clone()).await;
+    assert_eq!(
+        custom_error(&old_result.expect_err("1.2.0 is withdrawn")),
+        settle_error(zk_settlement::errors::SettleError::ZiskVersionWithdrawn)
+    );
+    let (early, _) = rig.post(new_proof.clone()).await;
+    assert_eq!(
+        custom_error(&early.expect_err("the new entry is not active yet")),
+        settle_error(zk_settlement::errors::SettleError::RegistryEntryNotFound)
+    );
+
+    rig.ctx.warp_to_slot(start + 2).unwrap();
+    let (late, _) = rig.post(new_proof.clone()).await;
+    let late_err = late.expect_err("the empty header cannot satisfy the layout checks");
+    assert_ne!(
+        custom_error(&late_err),
+        settle_error(zk_settlement::errors::SettleError::RegistryEntryNotFound)
+    );
+    assert_ne!(
+        custom_error(&late_err),
+        settle_error(zk_settlement::errors::SettleError::RootCNotOfVersion)
+    );
+
+    let mut old_entry = open_release_entry(old_vk);
+    old_entry.scheme = reg_layout::SCHEME_ZISK_1_2_0;
+    rig.register(old_entry, reg_layout::RETIRED_SLOT)
+        .await
+        .expect("the old entry retires once the new release has taken over");
+    let (retired, _) = rig.post(old_proof.clone()).await;
+    assert_eq!(
+        custom_error(&retired.expect_err("a retired entry is not found")),
+        settle_error(zk_settlement::errors::SettleError::RegistryEntryNotFound)
+    );
 }

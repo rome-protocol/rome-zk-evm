@@ -3,6 +3,10 @@
 # `cargo-zisk prove --plonk` writes, then writes a stand-in proof file at the `-o` path and
 # exits 0. Never invokes any real ZisK toolchain.
 set -eu
+if [ "${1:-}" = "--version" ]; then
+  echo "cargo-zisk 1.3.1-alpha [cpu] (306a9c9 fake-build)"
+  exit 0
+fi
 out=""
 while [ "$#" -gt 0 ]; do
   case "$1" in

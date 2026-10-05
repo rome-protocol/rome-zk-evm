@@ -138,7 +138,8 @@ pub struct Config {
 }
 
 /// The vkey-of-record fixture (`fixtures/vkeys/<chain>-layout1.json`): `programVK`,
-/// `rootCVadcopFinal`, `elf_sha256`, `chain_id`, `layout_id`.
+/// `rootCVadcopFinal`, `elf_sha256`, `chain_id`, `layout_id`, and the ZisK release the guest was built and
+/// proved under (`zisk`, with the registry's scheme byte for it in `scheme`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VkeyOfRecord {
     pub program_vk: [u8; 32],
@@ -146,6 +147,12 @@ pub struct VkeyOfRecord {
     pub elf_sha256: [u8; 32],
     pub chain_id: u64,
     pub layout_id: u8,
+    /// The ZisK release's name as ZisK tags it, e.g. `1.3.1-alpha`. Always a release the verifier table knows
+    /// and has not withdrawn.
+    pub zisk: String,
+    /// The registry's scheme byte for [`Self::zisk`]: the value the chain's registry entry for this
+    /// programVK has to carry.
+    pub scheme: u8,
 }
 
 #[derive(Debug, Deserialize)]
@@ -157,6 +164,12 @@ struct VkeyJson {
     elf_sha256: String,
     chain_id: u64,
     layout_id: u8,
+    /// Required: a record that does not name its ZisK release is refused (`ZiskVersionMissing`).
+    #[serde(default)]
+    zisk: Option<String>,
+    /// Optional; when present it has to be the release's own scheme byte.
+    #[serde(default)]
+    scheme: Option<u8>,
 }
 
 /// Every refusal is by name — never a silently-accepted mismatch.
@@ -205,6 +218,25 @@ pub enum VkeyError {
         #[source]
         source: std::io::Error,
     },
+    /// The record has no `zisk` field, so the release its proofs come from is not named.
+    #[error("ZiskVersionMissing: {path} does not name its ZisK release (the `zisk` field)")]
+    ZiskVersionMissing { path: PathBuf },
+    /// The record names a release the verifier table has no row for.
+    #[error(
+        "ZiskVersionUnknown: {path} names ZisK release \"{zisk}\", which this build does not know"
+    )]
+    ZiskVersionUnknown { path: PathBuf, zisk: String },
+    /// The record names a release that is withdrawn: the verifier no longer accepts its proofs.
+    #[error("ZiskVersionWithdrawn: {path} names ZisK release \"{zisk}\", which is withdrawn")]
+    ZiskVersionWithdrawn { path: PathBuf, zisk: String },
+    /// The record's `rootCVadcopFinal` is not the recursion root its release is pinned to.
+    #[error("RootCNotOfVersion: {path} has rootCVadcopFinal {got}, but release {zisk} is pinned to {expected}")]
+    RootCNotOfVersion {
+        path: PathBuf,
+        zisk: String,
+        expected: String,
+        got: String,
+    },
 }
 
 fn hex32(path: &Path, field: &'static str, s: &str) -> Result<[u8; 32], VkeyError> {
@@ -240,12 +272,56 @@ impl VkeyOfRecord {
                 j.layout_id
             )));
         }
+        let program_vk = hex32(path, "programVK", &j.program_vk)?;
+        let root_c = hex32(path, "rootCVadcopFinal", &j.root_c_vadcop_final)?;
+        let elf_sha256 = hex32(path, "elf_sha256", &j.elf_sha256)?;
+
+        // The release the record names has to be one the verifier table knows and has not withdrawn, the
+        // record's recursion root has to be that release's pinned root, and a `scheme` written in the
+        // record has to be that release's scheme byte. This ties the file to the same table settlement uses.
+        let zisk = j.zisk.ok_or_else(|| VkeyError::ZiskVersionMissing {
+            path: path.to_path_buf(),
+        })?;
+        let release = veritas::versions::ZISK_VERSIONS
+            .iter()
+            .find(|v| v.name == zisk)
+            .ok_or_else(|| VkeyError::ZiskVersionUnknown {
+                path: path.to_path_buf(),
+                zisk: zisk.clone(),
+            })?;
+        if release.status == veritas::Status::Withdrawn {
+            return Err(VkeyError::ZiskVersionWithdrawn {
+                path: path.to_path_buf(),
+                zisk,
+            });
+        }
+        if root_c != release.root_c {
+            return Err(VkeyError::RootCNotOfVersion {
+                path: path.to_path_buf(),
+                zisk,
+                expected: format!("0x{}", hex::encode(release.root_c)),
+                got: format!("0x{}", hex::encode(root_c)),
+            });
+        }
+        if let Some(scheme) = j.scheme {
+            if scheme != release.scheme {
+                return Err(VkeyError::VkeyJsonMismatch(format!(
+                    "{}: scheme {} is not release {}'s scheme {}",
+                    path.display(),
+                    scheme,
+                    zisk,
+                    release.scheme
+                )));
+            }
+        }
         Ok(VkeyOfRecord {
-            program_vk: hex32(path, "programVK", &j.program_vk)?,
-            root_c: hex32(path, "rootCVadcopFinal", &j.root_c_vadcop_final)?,
-            elf_sha256: hex32(path, "elf_sha256", &j.elf_sha256)?,
+            program_vk,
+            root_c,
+            elf_sha256,
             chain_id: j.chain_id,
             layout_id: j.layout_id,
+            zisk,
+            scheme: release.scheme,
         })
     }
 }
@@ -341,7 +417,7 @@ mod tests {
     fn repo_vkey_path() -> PathBuf {
         PathBuf::from(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../fixtures/vkeys/tiber-200101-layout1.json"
+            "/../../fixtures/vkeys/tiber-200101-layout1.zisk-1.3.1.json"
         ))
     }
 
@@ -388,7 +464,91 @@ mod tests {
         assert_eq!(vkey.layout_id, 1);
         assert_eq!(
             hex::encode(vkey.program_vk),
-            "e5ea5c144f19aba3e8a72f897dcb565c1b18bc335b54fd93e06b06689c53cb03"
+            "77c143cfbae4b986c642f0bed1be5ee2bb33338eee23cc5b3c20c86043cc8dc2"
+        );
+        assert_eq!(vkey.zisk, "1.3.1-alpha");
+        assert_eq!(vkey.scheme, 2);
+    }
+
+    /// The 1.3.1 record with one field replaced (or removed with `None`), written to a temp file.
+    fn record_with(field: &str, value: Option<serde_json::Value>) -> tempfile::NamedTempFile {
+        let mut j: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(repo_vkey_path()).unwrap()).unwrap();
+        match value {
+            Some(v) => j[field] = v,
+            None => {
+                j.as_object_mut().unwrap().remove(field);
+            }
+        }
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(f, "{j}").unwrap();
+        f
+    }
+
+    #[test]
+    fn a_record_without_a_zisk_release_is_refused_by_name() {
+        let f = record_with("zisk", None);
+        let err = VkeyOfRecord::load(f.path()).unwrap_err();
+        assert!(
+            matches!(err, VkeyError::ZiskVersionMissing { .. }),
+            "expected ZiskVersionMissing, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn the_1_2_0_record_of_the_same_chain_is_refused_as_withdrawn() {
+        let err = VkeyOfRecord::load(&PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/vkeys/tiber-200101-layout1.json"
+        )))
+        .unwrap_err();
+        assert!(
+            matches!(err, VkeyError::ZiskVersionWithdrawn { .. }),
+            "expected ZiskVersionWithdrawn, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_zisk_release_is_refused_by_name() {
+        let f = record_with("zisk", Some("9.9.9-alpha".into()));
+        let err = VkeyOfRecord::load(f.path()).unwrap_err();
+        assert!(
+            matches!(err, VkeyError::ZiskVersionUnknown { ref zisk, .. } if zisk == "9.9.9-alpha"),
+            "expected ZiskVersionUnknown, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_withdrawn_zisk_release_is_refused_by_name() {
+        let f = record_with("zisk", Some("1.2.0-alpha".into()));
+        let err = VkeyOfRecord::load(f.path()).unwrap_err();
+        assert!(
+            matches!(err, VkeyError::ZiskVersionWithdrawn { .. }),
+            "expected ZiskVersionWithdrawn, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_root_c_that_is_not_the_releases_pinned_root_is_refused_by_name() {
+        // The 1.2.0 recursion root, under a record that says 1.3.1.
+        let f = record_with(
+            "rootCVadcopFinal",
+            Some("0x564c2b1bcbd5932c81cfad1fa786a98372eb3d6495257c2d944544334f84382f".into()),
+        );
+        let err = VkeyOfRecord::load(f.path()).unwrap_err();
+        assert!(
+            matches!(err, VkeyError::RootCNotOfVersion { .. }),
+            "expected RootCNotOfVersion, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_scheme_that_is_not_the_releases_scheme_is_refused_by_name() {
+        let f = record_with("scheme", Some(1.into()));
+        let err = VkeyOfRecord::load(f.path()).unwrap_err();
+        assert!(
+            matches!(err, VkeyError::VkeyJsonMismatch(ref m) if m.contains("scheme")),
+            "expected VkeyJsonMismatch naming scheme, got {err:?}"
         );
     }
 
@@ -492,9 +652,9 @@ mod tests {
         let mut vkey_file = tempfile::NamedTempFile::new().unwrap();
         write!(
             vkey_file,
-            r#"{{"programVK":"0x{}","rootCVadcopFinal":"0x{}","elf_sha256":"0x{}","chain_id":7,"layout_id":1}}"#,
+            r#"{{"programVK":"0x{}","rootCVadcopFinal":"0x{}","elf_sha256":"0x{}","chain_id":7,"layout_id":1,"zisk":"1.3.1-alpha"}}"#,
             "44".repeat(32),
-            "55".repeat(32),
+            hex::encode(veritas::zisk_version(rome_zk_layouts::registry::SCHEME_ZISK_1_3_1).unwrap().root_c),
             hex::encode(got),
         )
         .unwrap();

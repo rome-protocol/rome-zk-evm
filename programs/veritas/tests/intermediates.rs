@@ -14,7 +14,7 @@ fn pt(p: &(&str, &str)) -> [u8; 64] {
 #[test]
 fn challenges_and_pairing_points_match_for_all_four_proofs() {
     for (i, f) in all_fixtures().iter().enumerate() {
-        let t = trace(&f.proof, &f.signal).expect("well-formed");
+        let t = trace(&veritas::vk::ZISK_1_2_0, &f.proof, &f.signal).expect("well-formed");
         let c = &CHALLENGES[i];
         assert_eq!(t.beta, hex32(c.beta), "{} beta", f.name);
         assert_eq!(t.gamma, hex32(c.gamma), "{} gamma", f.name);
@@ -31,7 +31,7 @@ fn challenges_and_pairing_points_match_for_all_four_proofs() {
 #[test]
 fn block14_steps_5_to_12() {
     let f = &all_fixtures()[0];
-    let t = trace(&f.proof, &f.signal).unwrap();
+    let t = trace(&veritas::vk::ZISK_1_2_0, &f.proof, &f.signal).unwrap();
     assert_eq!(t.z_n, hex32(B14_ZN), "z^n");
     assert_eq!(t.z_h, hex32(B14_ZH), "Z_H");
     assert_eq!(t.l1, hex32(B14_L1), "L_1");

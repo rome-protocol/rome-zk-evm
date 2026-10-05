@@ -2,7 +2,7 @@
 
 Proves `rome-zk-prover-input`'s `wire::RomePublicInput`/`RomeWitnessInput` encode byte-for-byte
 compatibly with the guest's own `guest_rome::input::{RomePublicInput,
-RomeWitnessInput}` (wire v3; `rome-protocol/zisk-eth-client`, branch `deposits-guest`,
+RomeWitnessInput}` (wire v3; `rome-protocol/zisk-eth-client`, branch `public-main`,
 `crates/clients/rome/guest/src/input.rs`) — in both directions. This is the correctness gap
 `rome-zk-prover-input/README.md`'s "Open questions" named as missing.
 
@@ -29,7 +29,7 @@ exercised by this proof, so the test binary links on a native host.
 root:
 
 ```sh
-git clone --branch deposits-guest https://github.com/rome-protocol/zisk-eth-client <repo-root>/.fork
+git clone --branch public-main https://github.com/rome-protocol/zisk-eth-client <repo-root>/.fork
 cd <repo-root>/.fork
 git submodule update --init third_party/ziskethone
 ```

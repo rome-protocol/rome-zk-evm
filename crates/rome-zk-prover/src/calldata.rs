@@ -1,7 +1,8 @@
 //! Rust port of the earlier Python decoder `zisk_calldata.py` (lines 20–44): decodes a ZisK `Proof` file
 //! (bincode 2, standard varint config, `Plonk` variant) into the four ABI fields
 //! `programs/veritas` and `zk-settlement-client::layout1_proof_abi` consume, plus the
-//! derived PLONK public signal.
+//! derived PLONK public signal. Checked against the files and the exported calldata of ZisK 1.2.0-alpha
+//! and 1.3.1-alpha: the file layout is the same in both releases.
 //!
 //! The wire format is hand-rolled bincode 2 (the same thing the Python decoder hand-rolls — no
 //! `bincode` crate dependency here, matching it byte for byte):
@@ -20,6 +21,11 @@
 //! program_vk: vec<u64>                // 4 words
 //! hash_mode: varint
 //! ```
+//!
+//! `programVK` is read from the words the proof itself commits to (`publics_full`, after the vadcop_final
+//! flag), the same source ZisK 1.3.1's own `export-solidity-calldata` uses, and never from the file's outer
+//! `program_vk` copy. A file whose outer copy differs from the committed words is refused
+//! (`ProgramVkRelabelled`) instead of decoded.
 //!
 //! `programVK`/`rootCVadcopFinal` serialize each `u64` word big-endian (4 words -> 32 bytes);
 //! `publics_full[4..]` (the 64 public-output words) serialize little-endian (64 words -> 512
@@ -57,10 +63,6 @@ pub enum CalldataError {
     /// The `Proof` enum's discriminant was not 1 (`Plonk`).
     #[error("not a Plonk proof (variant {0})")]
     NotPlonk(u64),
-    /// `publics_full[..4]` (the packaged public-output vkey word) did not match the proof's own
-    /// `program_vk` field — the two are meant to be the same value, doubly encoded.
-    #[error("publics_full[..4] does not match program_vk")]
-    ProgramVkMismatch,
     /// Any other shape violation the wire format itself rules out (wrong `proof_bytes` length,
     /// an unexpected `publics_full`/`rootc`/`program_vk` word count).
     #[error("malformed proof file: {0}")]
@@ -78,6 +80,11 @@ pub enum CalldataError {
     /// `rootCVadcopFinal`.
     #[error("root_c {got} is not the vkey of record's rootCVadcopFinal {expected}")]
     RootCNotOfRecord { got: String, expected: String },
+    /// The file's outer `program_vk` copy differs from the programVK the proof commits to
+    /// (`publics_full[..4]`). The committed words are the ones that count, so a file that carries another
+    /// value in its outer copy has been relabelled and is refused rather than decoded.
+    #[error("the file's outer program_vk differs from the programVK the proof commits to")]
+    ProgramVkRelabelled,
 }
 
 /// A [`Calldata`] whose `program_vk`/`root_c` have been checked against a [`crate::config::VkeyOfRecord`]
@@ -273,11 +280,12 @@ pub fn from_zisk_proof_file(bytes: &[u8]) -> Result<Calldata, CalldataError> {
     if program_vk.len() != 4 {
         return Err(CalldataError::Malformed("program_vk must be 4 words"));
     }
+    // The committed words are the programVK; the outer copy must agree with them.
     if publics_full[..4] != program_vk[..] {
-        return Err(CalldataError::ProgramVkMismatch);
+        return Err(CalldataError::ProgramVkRelabelled);
     }
 
-    let program_vk_bytes = words_be32(&program_vk);
+    let program_vk_bytes = words_be32(&publics_full[..4]);
     let root_c_bytes = words_be32(&rootc);
     let publics_512 = words_le(&publics_full[4..]);
     let public_signal = zisk_public_signal(&program_vk_bytes, &publics_512, &root_c_bytes);
@@ -501,7 +509,8 @@ mod tests {
     }
 
     #[test]
-    fn block14_abi_verifies_on_the_host() {
+    fn a_1_2_0_proof_is_refused_under_the_1_3_1_release() {
+        // The 1.2.0 block proof carries the 1.2.0 recursion root, which the 1.3.1 release does not accept.
         let cd = from_zisk_proof_file(&fixture_bytes()).expect("decode");
         let abi = zk_settlement_client::layout1_proof_abi(
             &cd.proof_bytes_768,
@@ -510,7 +519,8 @@ mod tests {
             &cd.publics_512,
         )
         .expect("assemble abi");
-        assert!(veritas::verify_zisk(&abi).expect("verify_zisk"));
+        let release = veritas::zisk_version(rome_zk_layouts::registry::SCHEME_ZISK_1_3_1).unwrap();
+        assert!(!veritas::verify_zisk(release, &abi).expect("verify_zisk"));
     }
 
     #[test]
@@ -544,7 +554,7 @@ mod tests {
     }
 
     #[test]
-    fn program_vk_mismatch_is_refused_by_name() {
+    fn a_1_2_0_file_with_a_relabelled_outer_program_vk_is_refused() {
         // Flip a byte inside the trailing `program_vk` vec<u64> (the last 4 words = last 32
         // bytes before hash_mode's one trailing varint byte) without touching `publics_full`'s
         // own copy of the same value earlier in the file — the two must then disagree.
@@ -553,23 +563,23 @@ mod tests {
         b[n - 2] ^= 0xff;
         assert_eq!(
             from_zisk_proof_file(&b).unwrap_err(),
-            CalldataError::ProgramVkMismatch
+            CalldataError::ProgramVkRelabelled
         );
     }
 
     fn gate_proof_calldata() -> Calldata {
         let bytes = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../fixtures/prover-input/txv1-dev-reset6-batch-1.plonk.bin"
+            "/../../fixtures/prover-input/txv1-dev-reset6-batch-1.zisk-1.3.1.plonk.bin"
         ))
-        .expect("fixtures/prover-input/txv1-dev-reset6-batch-1.plonk.bin");
+        .expect("the 1.3.1 batch proof");
         from_zisk_proof_file(&bytes).expect("decode gate proof")
     }
 
     fn tiber_vkey_of_record() -> crate::config::VkeyOfRecord {
         crate::config::VkeyOfRecord::load(std::path::Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../fixtures/vkeys/tiber-200101-layout1.json"
+            "/../../fixtures/vkeys/tiber-200101-layout1.zisk-1.3.1.json"
         )))
         .expect("load vkey of record")
     }
@@ -600,6 +610,120 @@ mod tests {
         let mut cd = gate_proof_calldata();
         cd.root_c[0] ^= 0xff;
         let record = tiber_vkey_of_record();
+        let err = check_against_record(&cd, &record).unwrap_err();
+        assert!(
+            matches!(err, CalldataError::RootCNotOfRecord { .. }),
+            "expected RootCNotOfRecord, got {err:?}"
+        );
+    }
+
+    fn batch_1_3_1_bytes() -> Vec<u8> {
+        std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/prover-input/txv1-dev-reset6-batch-1.zisk-1.3.1.plonk.bin"
+        ))
+        .expect("the 1.3.1 batch proof")
+    }
+
+    /// The four fields ZisK 1.3.1's own `export-solidity-calldata` wrote for the same proof file.
+    fn batch_1_3_1_export() -> serde_json::Value {
+        let s = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/prover-input/txv1-dev-reset6-batch-1.zisk-1.3.1.calldata.json"
+        ))
+        .expect("the 1.3.1 calldata export");
+        serde_json::from_str(&s).unwrap()
+    }
+
+    #[test]
+    fn the_1_3_1_batch_proof_decodes_byte_for_byte_against_zisks_own_export() {
+        let cd = from_zisk_proof_file(&batch_1_3_1_bytes()).expect("decode");
+        let j = batch_1_3_1_export();
+        assert_eq!(cd.program_vk.to_vec(), h(&j, "programVK"));
+        assert_eq!(cd.root_c.to_vec(), h(&j, "rootCVadcopFinal"));
+        assert_eq!(cd.publics_512.to_vec(), h(&j, "publicValues"));
+        assert_eq!(cd.proof_bytes_768.to_vec(), h(&j, "proofBytes"));
+    }
+
+    #[test]
+    fn the_1_3_1_batch_proof_verifies_under_the_1_3_1_release() {
+        let cd = from_zisk_proof_file(&batch_1_3_1_bytes()).expect("decode");
+        let abi = zk_settlement_client::layout1_proof_abi(
+            &cd.proof_bytes_768,
+            &cd.program_vk,
+            &cd.root_c,
+            &cd.publics_512,
+        )
+        .expect("assemble abi");
+        let release = veritas::zisk_version(rome_zk_layouts::registry::SCHEME_ZISK_1_3_1).unwrap();
+        assert!(veritas::verify_zisk(release, &abi).expect("verify_zisk"));
+    }
+
+    #[test]
+    fn a_1_3_1_file_with_a_relabelled_outer_program_vk_is_refused() {
+        // The outer `program_vk` is the last field before nothing but `hash_mode`'s one byte. Changing
+        // it leaves the committed words alone, so only the relabelling check can catch it.
+        let mut b = batch_1_3_1_bytes();
+        let n = b.len();
+        b[n - 2] ^= 0xff;
+        assert_eq!(
+            from_zisk_proof_file(&b).unwrap_err(),
+            CalldataError::ProgramVkRelabelled
+        );
+    }
+
+    #[test]
+    fn the_1_3_1_programvk_is_taken_from_the_committed_words() {
+        // Both copies carry the same value in the real file, so the decoded programVK is the one
+        // ZisK exported; changing only the outer copy cannot move it (the file is refused instead).
+        let cd = from_zisk_proof_file(&batch_1_3_1_bytes()).expect("decode");
+        assert_eq!(
+            cd.program_vk.to_vec(),
+            h(&batch_1_3_1_export(), "programVK")
+        );
+        assert_ne!(
+            cd.program_vk,
+            h_32(&fixture_json(), "programVK"),
+            "the 1.3.1 guest has its own programVK, not the 1.2.0 block's"
+        );
+    }
+
+    fn h_32(v: &serde_json::Value, key: &str) -> [u8; 32] {
+        h(v, key).try_into().unwrap()
+    }
+
+    /// The 1.2.0 key record of the same chain, rebuilt by hand: the file has no `zisk` field and is no
+    /// longer loadable, but the proof checks must still refuse what it names.
+    fn the_1_2_0_record() -> crate::config::VkeyOfRecord {
+        let j: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../fixtures/vkeys/tiber-200101-layout1.json"
+            ))
+            .expect("the 1.2.0 key record"),
+        )
+        .unwrap();
+        let mut r = tiber_vkey_of_record();
+        r.program_vk = h_32(&j, "programVK");
+        r.root_c = h_32(&j, "rootCVadcopFinal");
+        r
+    }
+
+    #[test]
+    fn the_1_3_1_batch_proof_is_refused_against_the_1_2_0_record() {
+        let cd = gate_proof_calldata();
+        let err = check_against_record(&cd, &the_1_2_0_record()).unwrap_err();
+        assert!(
+            matches!(err, CalldataError::ProgramVkNotOfRecord { .. }),
+            "expected ProgramVkNotOfRecord, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn the_1_3_1_programvk_under_the_1_2_0_recursion_root_is_refused() {
+        let cd = gate_proof_calldata();
+        let mut record = tiber_vkey_of_record();
+        record.root_c = the_1_2_0_record().root_c;
         let err = check_against_record(&cd, &record).unwrap_err();
         assert!(
             matches!(err, CalldataError::RootCNotOfRecord { .. }),

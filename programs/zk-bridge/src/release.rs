@@ -22,6 +22,7 @@
 //! `mint_amount = amount / 10^(18 - mint_decimals)` — integer division truncates, so any sub-unit
 //! remainder (dust) is never transferred and simply stays in the vault's SPL balance.
 
+use crate::bridge_config;
 use crate::errors::BridgeError;
 use crate::instruction::ReleaseExitArgs;
 use crate::state::{vault_authority_pda, vault_config, vault_token_pda};
@@ -47,7 +48,7 @@ fn decimal_scale(mint_decimals: u8) -> Result<u128, ProgramError> {
 /// accounts: `[vault_config (read-only), exit_config (read-only), exit_record (writable), exit_consumer
 /// (read-only — this program's own `["exit_consumer", chain_id]` PDA), settlement_program (read-only,
 /// executable), payer_refund (writable), vault_token (writable), vault_authority (read-only),
-/// recipient_ata (writable), token_program]`.
+/// recipient_ata (writable), token_program, bridge_config (read-only)]`.
 pub fn release_exit(
     program_id: &Pubkey,
     it: &mut std::slice::Iter<AccountInfo>,
@@ -63,6 +64,7 @@ pub fn release_exit(
     let vault_authority_acc = next_account_info(it)?;
     let recipient_ata_acc = next_account_info(it)?;
     let token_program_acc = next_account_info(it)?;
+    let config_acc = next_account_info(it)?;
 
     // --- (1) our own accounts: owner first (cheapest refusal), THEN read the data (the
     // vault_config PDA is keyed by [settlement_program, chain_id] — settlement_program is only known
@@ -83,6 +85,12 @@ pub fn release_exit(
         crate::state::vault_config_pda(program_id, &cfg.settlement_program, args.chain_id);
     if expect_vault_config != *vault_config_acc.key {
         return Err(ProgramError::InvalidSeeds);
+    }
+    // The vault's settlement program is the bridge config's, so the `exit_consumer` signature below only
+    // ever goes to the canonical settlement program.
+    let config = bridge_config::load(program_id, config_acc)?;
+    if cfg.settlement_program.to_bytes() != config.settlement_program {
+        return Err(BridgeError::WrongSettlementProgram.into());
     }
     if *token_program_acc.key != crate::token::TOKEN_PROGRAM_ID {
         return Err(ProgramError::IncorrectProgramId);

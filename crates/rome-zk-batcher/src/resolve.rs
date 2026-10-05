@@ -101,6 +101,30 @@ pub trait AccountOps: Send + Sync {
         pubkey: &Pubkey,
     ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>, ResolveError>> + Send;
 
+    /// The program that owns the account at `pubkey`, or `None` when no account exists there. The batcher asks
+    /// this for the two accounts a batch's deposit range depends on, because the program counts each of them
+    /// as absent unless the right program owns it: anyone can fund an empty, system-owned account at either
+    /// address, and that must not change what the batcher sends.
+    fn get_account_owner(
+        &self,
+        pubkey: &Pubkey,
+    ) -> impl std::future::Future<Output = Result<Option<Pubkey>, ResolveError>> + Send;
+
+    /// How many lamports the account at `pubkey` is short of the rent-exempt minimum for `data_len` bytes of
+    /// data (0 when it holds enough), or `None` when no account exists there. The batcher asks this for the
+    /// cursor before its first `FinalizeBatchV2`, to top it up to the minimum for the 69-byte account.
+    ///
+    /// Default implementation: no shortfall. A backend with no balance read (this crate's own test fakes)
+    /// never triggers a top-up; [`RpcClient`](solana_client::nonblocking::rpc_client::RpcClient)'s impl below
+    /// reads the real balance and the cluster's rent minimum.
+    fn rent_shortfall(
+        &self,
+        _pubkey: &Pubkey,
+        _data_len: usize,
+    ) -> impl std::future::Future<Output = Result<Option<u64>, ResolveError>> + Send {
+        async move { Ok(Some(0)) }
+    }
+
     /// One entry per input pubkey, in order — `true` iff some account exists there. Chunking to the RPC
     /// node's own `getMultipleAccounts` cap is this trait impl's job, not the caller's.
     fn accounts_exist(
@@ -143,6 +167,39 @@ impl AccountOps for solana_client::nonblocking::rpc_client::RpcClient {
                 source: Box::new(e),
             })?;
         Ok(resp.value.map(|a| a.data))
+    }
+
+    async fn get_account_owner(&self, pubkey: &Pubkey) -> Result<Option<Pubkey>, ResolveError> {
+        let resp = Self::get_account_with_commitment(self, pubkey, self.commitment())
+            .await
+            .map_err(|e| ResolveError::AccountRead {
+                pubkey: *pubkey,
+                message: rome_zk_solana_sender::describe_rpc_error(&e),
+                source: Box::new(e),
+            })?;
+        Ok(resp.value.map(|a| a.owner))
+    }
+
+    async fn rent_shortfall(
+        &self,
+        pubkey: &Pubkey,
+        data_len: usize,
+    ) -> Result<Option<u64>, ResolveError> {
+        let read_err = |e: solana_client::client_error::ClientError| ResolveError::AccountRead {
+            pubkey: *pubkey,
+            message: rome_zk_solana_sender::describe_rpc_error(&e),
+            source: Box::new(e),
+        };
+        let resp = Self::get_account_with_commitment(self, pubkey, self.commitment())
+            .await
+            .map_err(read_err)?;
+        let Some(account) = resp.value else {
+            return Ok(None);
+        };
+        let minimum = Self::get_minimum_balance_for_rent_exemption(self, data_len)
+            .await
+            .map_err(read_err)?;
+        Ok(Some(minimum.saturating_sub(account.lamports)))
     }
 
     async fn accounts_exist(&self, pubkeys: &[Pubkey]) -> Result<Vec<bool>, ResolveError> {
@@ -533,6 +590,11 @@ mod tests {
             Ok(st.accounts.get(pubkey).cloned())
         }
 
+        async fn get_account_owner(&self, pubkey: &Pubkey) -> Result<Option<Pubkey>, ResolveError> {
+            // This fake holds no exit config or deposit queue, so the owner is never asked about those.
+            Ok(self.get_account(pubkey).await?.map(|_| Pubkey::default()))
+        }
+
         async fn accounts_exist(&self, pubkeys: &[Pubkey]) -> Result<Vec<bool>, ResolveError> {
             let st = self.0.lock().unwrap();
             for p in pubkeys {
@@ -818,7 +880,16 @@ mod tests {
     #[tokio::test]
     async fn a_rerun_over_an_already_posted_prev_batch_resolves_to_already_posted_not_a_new_id() {
         let chain = FakeChain::default();
-        let compressed = b"same content every time";
+        // A real stream: the content check decodes the posted bytes.
+        let compressed = &channel::encode_stream(&[channel::Block {
+            number: 0,
+            timestamp: 1,
+            gas_limit: 100,
+            txs: vec![alloy_primitives::Bytes::from_static(
+                b"same content every time",
+            )],
+            deposits_end: None,
+        }]);
         let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
         chain.set_account(cursor_pda, cursor_bytes(CHAIN_ID, 1));
         let (batch0, _) = zk_inbox_client::batch_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID, 0);
@@ -928,6 +999,11 @@ mod tests {
         async fn get_account(&self, _pubkey: &Pubkey) -> Result<Option<Vec<u8>>, ResolveError> {
             Ok(None)
         }
+        async fn get_account_owner(&self, pubkey: &Pubkey) -> Result<Option<Pubkey>, ResolveError> {
+            // This fake holds no exit config or deposit queue, so the owner is never asked about those.
+            Ok(self.get_account(pubkey).await?.map(|_| Pubkey::default()))
+        }
+
         async fn accounts_exist(&self, pubkeys: &[Pubkey]) -> Result<Vec<bool>, ResolveError> {
             Ok(vec![false; pubkeys.len()])
         }

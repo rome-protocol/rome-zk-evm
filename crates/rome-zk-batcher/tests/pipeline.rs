@@ -179,13 +179,15 @@ async fn full_pipeline_three_block_batch_finalizes_and_acc_matches_reference() {
     );
 
     // --- FinalizeBatch ---
-    let finalize_ix = zk_inbox_client::finalize_batch_ix(
+    let finalize_ix = zk_inbox_client::finalize_batch_v2_ix(
         &program_id,
         &payer.pubkey(),
         &settlement_program,
         chain_id,
         batch_id,
         0,
+        0,
+        None,
     );
     let cu = send(&mut ctx, &[finalize_ix], &payer)
         .await

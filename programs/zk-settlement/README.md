@@ -50,6 +50,28 @@ system.
 - **Every account this program creates is safe against pre-funding griefing**, through the same
   create-or-adopt helper the inbox program uses (see
   [`rome-zk-pda`](../../crates/rome-zk-pda)).
+- **A registry entry's `scheme` names the ZisK release a proof is checked under.** `PostRootProved` looks the
+  proof's programVK up among the BN254 entries under a ZisK scheme (`registry::find_zisk`), and the matching
+  entry's scheme picks the release row in Veritas. The proof never names its release, so a poster cannot choose
+  the key. A release that is withdrawn is refused as `ZiskVersionWithdrawn` (87), which is what every entry
+  written before the release table (scheme 1, ZisK 1.2.0-alpha) now gets. The proof's `rootCVadcopFinal`
+  (`proof_abi[800..832]`) must equal the value pinned for that release, or it is refused as
+  `RootCNotOfVersion` (88). Both refusals come before the layout checks and the pairing, so they are cheap:
+  13,364 to 14,864 compute units for a wrong recursion root and 11,851 to 16,351 for a withdrawn release (measured
+  on real BPF; the range is a spread between test runs, not a property of the proof: the program derives its
+  accounts with a bump search, and the number of attempts depends on the program id and the chain id). A
+  programVK with no entry is still `RegistryEntryNotFound`. A real ZisK 1.3.1 layout-1 batch proof, posted under
+  a scheme-2 entry, finalizes in 468,334 to 490,834 compute units (measured on real BPF). The figure is not
+  fixed: the same proof posted under different program ids and chain ids costs different amounts, and the
+  differences are multiples of 1,500, the cost of one more bump attempt. It stays well under the prover's
+  700,000 limit.
+- **What may be written to a chain's registry depends on the release.** `SetRegistryEntry` (and every genesis
+  entry of `InitChainV2` on the reserved path) refuses an unknown scheme number and a ZisK scheme on a curve other
+  than BN254 (`UnknownCurveOrScheme`). A new entry or a moved activation slot is refused under a withdrawn release
+  (`ZiskVersionWithdrawn`, 87) and under a closing one (`ZiskVersionClosing`, 89). Retiring an entry that is
+  present is always allowed, whatever the release's status. A new ZisK entry may not take a programVK that a
+  live entry already holds under another release (`VkeyUnderOtherZiskVersion`, 90), so one programVK can never
+  pick between releases: retire the other release's entry first.
 - **A registry entry's `layout_id` selects what a proof is bound to.** Layout 2 (the header fallback)
   binds a single block's header fields only. It binds neither the chain id nor the inbox commitment, so `SetRegistryEntry` refuses it on a permissionless chain (`HeaderFallbackNotAllowed`); only reserved chains may register it. Layout 1 binds a whole batch range's public values —
   `chain_id`, first/last block, the guest's own drift-bound inputs (`open_unix_ts`, `max_drift_secs`),

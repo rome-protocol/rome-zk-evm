@@ -2,7 +2,16 @@
 mod common;
 use common::*;
 use solana_program::hash::hashv;
-use veritas::{verify, verify_zisk, zisk_public_signal};
+use veritas::vk::ZISK_1_2_0;
+use veritas::{zisk_public_signal, zisk_version};
+
+/// The fixtures here are ZisK 1.2.0 proofs, checked under the 1.2.0 key the test feature provides.
+fn verify_zisk(abi: &[u8]) -> Result<bool, solana_program::program_error::ProgramError> {
+    veritas::verify_zisk(zisk_version(1).unwrap(), abi)
+}
+fn verify(input: &[u8]) -> Result<bool, solana_program::program_error::ProgramError> {
+    veritas::verify(&ZISK_1_2_0, input)
+}
 
 #[test]
 fn proof_files_decode_with_nothing_left_over() {
@@ -65,16 +74,7 @@ fn verifying_key_constants_equal_the_proof_files() {
         "prover-input/txv1-dev-reset6-batch-1.plonk.bin",
     ] {
         let pf = decode_proof_file(&std::fs::read(fixture_path(rel)).unwrap());
-        let ours = [
-            veritas::vk::Q_M,
-            veritas::vk::Q_L,
-            veritas::vk::Q_R,
-            veritas::vk::Q_O,
-            veritas::vk::Q_C,
-            veritas::vk::S_SIGMA_1,
-            veritas::vk::S_SIGMA_2,
-            veritas::vk::S_SIGMA_3,
-        ];
+        let ours = ZISK_1_2_0.commitments().chunks(64);
         for (c, want) in pf.commitments.iter().zip(ours) {
             assert_eq!(&dec_to_w(&c[0])[..], &want[..32], "{rel} x");
             assert_eq!(&dec_to_w(&c[1])[..], &want[32..], "{rel} y");
@@ -87,7 +87,7 @@ fn verifying_key_constants_equal_the_proof_files() {
         assert_eq!(&dec_to_w(&pf.x2[1][0])[..], &x[96..128], "y0");
         assert_eq!(&dec_to_w(&pf.x2[1][1])[..], &x[64..96], "y1");
         assert_eq!(dec_to_w(&pf.omega), veritas::vk::OMEGA);
-        assert_eq!(veritas::vk::COMMITMENTS.len(), 512);
+        assert_eq!(ZISK_1_2_0.commitments().len(), 512);
     }
 }
 

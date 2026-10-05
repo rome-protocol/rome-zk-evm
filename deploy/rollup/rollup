@@ -17,11 +17,14 @@
 #   ./rollup refund-deposit             give the registration deposit back to the chain authority
 #   ./rollup exit-config propose|activate|show   change or read the chain's exit configuration
 #   ./rollup vault init|fund|show       the chain's bridge vault
+#   ./rollup deposit-queue init|propose|activate|show   create, change or read the chain's deposit queue
+#   ./rollup deposit --amount N --recipient 0x.. --keypair FILE   deposit into the chain (the depositor's own key)
+#   ./rollup close-deposit --index N    give a credited deposit record's rent back to its depositor
 #   ./rollup release-exit --message-hash 0x...   release a proved exit from the vault
 #   ./rollup migrate --registry-keypair FILE --max-drift-secs N   bring an older chain forward (registry authority)
 #
 # Commands that send a Solana transaction (register, refund-deposit, exit-config propose and activate, vault init and
-# fund, release-exit, migrate) are a dry run unless you pass --confirm: they read the chain, print the transaction and
+# fund, deposit-queue init, propose and activate, deposit, close-deposit, release-exit, migrate) are a dry run unless you pass --confirm: they read the chain, print the transaction and
 # send nothing. --offline is a dry run with no network at all.
 #
 # Where things live (each can be overridden by an environment variable of the same name):
@@ -270,6 +273,17 @@ cmd_init() {
   STAGE="$(mktemp -d)"
   trap 'rm -rf "$STAGE"' EXIT
   rz_render_sequencer_config "$example" "$STAGE/sequencer-config.toml" "${pairs[@]}" || exit 1
+  # The sequencer reads the chain's deposit queue from Solana through the same RPC the batcher uses. The section is safe
+  # to have before the queue exists: until ./rollup deposit-queue init runs, the sequencer finds no queue and seals as it
+  # would without the section (tests in the sequencer crate hold this).
+  [[ "$SOLANA_RPC_URL" != *[\"\\]* ]] || die SolanaRpcUrlInvalid "SOLANA_RPC_URL in $ENV_FILE contains a quote or backslash; it is written into the sequencer's [deposits] section"
+  {
+    echo
+    echo "[deposits]"
+    echo "solana_rpc_url = \"$SOLANA_RPC_URL\""
+    echo "settlement_program = \"$SETTLEMENT_ID\""
+    echo "poll_interval_ms = 1000"
+  } >> "$STAGE/sequencer-config.toml"
 
   local gas_limit gas_hex blocks_per_batch
   gas_limit="$(rz_profile_gas_limit "$STAGE/sequencer-config.toml")" || die ProfileInvalid "sub_block_gas_limit and sub_blocks_per_block must be set in [profile]"
@@ -507,12 +521,14 @@ cmd_up() {
 
 # ------------------------------------------------------------------------------------------------------ guest-build
 # The guest embeds your genesis, so every chain has its own ELF. The build runs in the guest-build image
-# (deploy/rollup/guest-build), which holds ZisK 1.2.0-alpha and clones the public sources of the node tag and the guest
-# tag; the image is built here the first time. The output is rendered/guest/<elf sha256>.elf and rendered/guest/vkey.json:
+# (deploy/rollup/guest-build), which holds one ZisK release (ZISK_RELEASE in .env, 1.3.1-alpha by default; its pins are in
+# guest-build/zisk/<release>.env) and clones the public sources of the node tag and the guest tag; the image is built here
+# the first time and its name carries the release, so two releases never share an image. The output is rendered/guest/<elf sha256>.elf and rendered/guest/vkey.json:
 # point ELF_DIR at the directory and VKEY_JSON at the file. The programVK needs the ZisK proving keys (ZISK_HOME) and about
 # 36 GB of memory; without them vkey.json is written without it and the command says so.
-GUEST_BUILD_EVM_TAG_DEFAULT=v0.2.2
-GUEST_BUILD_GUEST_TAG_DEFAULT=v0.2.0
+GUEST_BUILD_EVM_TAG_DEFAULT=v0.3.0
+GUEST_BUILD_GUEST_TAG_DEFAULT=v0.3.0
+GUEST_BUILD_ZISK_RELEASE_DEFAULT=1.3.1-alpha
 cmd_guest_build() {
   local skip_vk=0 a
   for a in "$@"; do
@@ -541,6 +557,15 @@ print(sum(1 for v in a.values() if n(v)>0))' "$OUT/genesis.json" 2>/dev/null)" |
   [[ "$funded" -le 1 ]] || die GenesisFundedAccountLimit "$OUT/genesis.json gives $funded accounts a non-zero balance; at most one is allowed (the one balance must be locked in your chain's vault)"
   [[ "$OUT" != *,* ]] || die OutputDirInvalid "$OUT has a comma in it, which a bind mount cannot take"
 
+  # The release comes before anything else is built or mounted: its pin file names the toolchain tag the image needs, and the
+  # keys that are mounted must be this release's.
+  local release pins toolchain_tag
+  release="$(cfg ZISK_RELEASE "$GUEST_BUILD_ZISK_RELEASE_DEFAULT")"
+  pins="$ROLLUP_DIR/guest-build/zisk/$release.env"
+  [[ "$release" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ && -f "$pins" ]] || die ZiskReleaseUnknown "ZISK_RELEASE '$release' has no pin file in $ROLLUP_DIR/guest-build/zisk/ (known releases: $(cd "$ROLLUP_DIR/guest-build/zisk" 2>/dev/null && ls *.env 2>/dev/null | sed 's/\.env$//' | tr '\n' ' '))"
+  toolchain_tag="$(sed -n 's/^ZISK_TOOLCHAIN_TAG=//p' "$pins" | head -n 1)"
+  [[ -n "$toolchain_tag" ]] || die PinFileInvalid "$pins has no ZISK_TOOLCHAIN_TAG"
+
   local zisk_home keys=() keyargs=()
   zisk_home="$(cfg ZISK_HOME)"
   if (( skip_vk )); then
@@ -548,7 +573,7 @@ print(sum(1 for v in a.values() if n(v)>0))' "$OUT/genesis.json" 2>/dev/null)" |
   elif [[ -z "$zisk_home" ]]; then
     echo "guest-build: ZISK_HOME is not set in $ENV_FILE, so the programVK is not computed and vkey.json will have none (set it to the directory holding the ZisK proving keys to get it)" >&2
   elif [[ ! -d "$(abs "$zisk_home")/provingKey" ]]; then
-    die ProvingKeyDirMissing "$(abs "$zisk_home")/provingKey does not exist (ZISK_HOME in $ENV_FILE must hold the ZisK 1.2.0-alpha proving keys; or pass --skip-program-vk)"
+    die ProvingKeyDirMissing "$(abs "$zisk_home")/provingKey does not exist (ZISK_HOME in $ENV_FILE must hold the ZisK $release proving keys; or pass --skip-program-vk)"
   else
     zisk_home="$(abs "$zisk_home")"
     [[ "$zisk_home" != *,* ]] || die KeyPathInvalid "$zisk_home has a comma in it, which a bind mount cannot take"
@@ -559,9 +584,10 @@ print(sum(1 for v in a.values() if n(v)>0))' "$OUT/genesis.json" 2>/dev/null)" |
   local evm_tag guest_tag image
   evm_tag="$(cfg ROME_ZK_TAG "$GUEST_BUILD_EVM_TAG_DEFAULT")"
   guest_tag="$(cfg ROME_ZK_GUEST_TAG "$GUEST_BUILD_GUEST_TAG_DEFAULT")"
-  image="rome-zk-guest-build:$evm_tag-$guest_tag"
-  echo "guest-build: building the image $image (ZisK 1.2.0-alpha, rome-zk-evm $evm_tag, rome-zk-guest $guest_tag); the first build takes several minutes" >&2
+  image="rome-zk-guest-build:$release-$evm_tag-$guest_tag"
+  echo "guest-build: building the image $image (ZisK $release, rome-zk-evm $evm_tag, rome-zk-guest $guest_tag); the first build takes several minutes" >&2
   docker build --platform linux/amd64 -t "$image" \
+    --build-arg "ZISK_RELEASE=$release" --build-arg "ZISK_TOOLCHAIN_TAG=$toolchain_tag" \
     --build-arg "ROME_ZK_EVM_TAG=$evm_tag" --build-arg "ROME_ZK_GUEST_TAG=$guest_tag" \
     "$ROLLUP_DIR/guest-build" >&2 || die GuestBuildImageFailed "docker build of $image failed"
 
@@ -718,6 +744,110 @@ cmd_vault() {
       ops vault show --settlement "$SETTLEMENT_ID" --bridge "$BRIDGE_ID" --chain-id "$CHAIN_ID" ;;
     *) die UnknownSubcommand "'$sub' (usage: rollup vault init|fund|show)" ;;
   esac
+}
+
+# The sequencer's blocks per batch, from what init rendered: deposit-queue init and propose check the per-block cap against it.
+need_blocks_per_batch() {
+  BLOCKS_PER_BATCH_CFG="$(rz_env_get "$OUT/compose.env" BLOCKS_PER_BATCH)"; BLOCKS_PER_BATCH_CFG="${BLOCKS_PER_BATCH_CFG//_/}"
+  [[ "$BLOCKS_PER_BATCH_CFG" =~ ^[1-9][0-9]*$ ]] || die NotInitialised "$OUT/compose.env has no valid BLOCKS_PER_BATCH (run ./rollup init again)"
+}
+# take_param_flag FLAG VALUE -> returns 0 and adds the flag to PFLAGS when FLAG is one of the deposit parameters that
+# `deposit-queue init` and `deposit-queue propose` share (the caller then shifts two); returns 1 for any other flag.
+PFLAGS=()
+take_param_flag() {
+  local v
+  case "$1" in
+    --deadline-secs|--max-per-batch|--max-per-block|--min-amount|--fee-lamports)
+      v="$(flag_value "$1" "${2:-}")" || exit 1; only_numbers "$1" "$v"; PFLAGS+=("$1" "$v") ;;
+    --fee-recipient)
+      v="$(flag_value "$1" "${2:-}")" || exit 1
+      [[ "$v" =~ ^[1-9A-HJ-NP-Za-km-z]{32,44}$ ]] || die FlagValueInvalid "$1 must be a Solana address (base58, 32 to 44 characters; got '$v')"
+      PFLAGS+=("$1" "$v") ;;
+    *) return 1 ;;
+  esac
+}
+PARAM_FLAGS_USAGE="[--deadline-secs N] [--max-per-batch N] [--max-per-block N] [--min-amount N] [--fee-lamports N] [--fee-recipient ADDRESS]"
+
+cmd_deposit_queue() {
+  local sub="${1:-}"; [[ $# -eq 0 ]] || shift
+  case "$sub" in
+    init)
+      parse_mode "$@"; set -- "${REST[@]+"${REST[@]}"}"
+      PFLAGS=()
+      while [[ $# -gt 0 ]]; do
+        if take_param_flag "$1" "${2:-}"; then shift 2; else die UnknownArgument "'$1' (usage: rollup deposit-queue init $PARAM_FLAGS_USAGE [--confirm]; --blocks-per-batch is read from the rendered config)"; fi
+      done
+      ops_context; need_bridge; need_blocks_per_batch
+      mount_key payer "$PAYER"
+      # The chain authority is the payer key: the registration made it the authority.
+      ops deposit-queue init --authority-keypair "$REPLY" --settlement "$SETTLEMENT_ID" --bridge "$BRIDGE_ID" --chain-id "$CHAIN_ID" ${PFLAGS[@]+"${PFLAGS[@]}"} --blocks-per-batch "$BLOCKS_PER_BATCH_CFG" ${MODE[@]+"${MODE[@]}"} ;;
+    propose)
+      parse_mode "$@"; set -- "${REST[@]+"${REST[@]}"}"
+      PFLAGS=()
+      local slot="" delay="" v
+      while [[ $# -gt 0 ]]; do
+        if take_param_flag "$1" "${2:-}"; then shift 2; continue; fi
+        case "$1" in
+          --activation-slot) slot="$(flag_value "$1" "${2:-}")" || exit 1; only_numbers "$1" "$slot"; shift 2 ;;
+          --activation-delay-slots) delay="$(flag_value "$1" "${2:-}")" || exit 1; only_numbers "$1" "$delay"; shift 2 ;;
+          *) die UnknownArgument "'$1' (usage: rollup deposit-queue propose $PARAM_FLAGS_USAGE [--activation-slot N | --activation-delay-slots N] [--confirm])" ;;
+        esac
+      done
+      (( ${#PFLAGS[@]} > 0 )) || die NothingProposed "name at least one of --deadline-secs, --max-per-batch, --max-per-block, --min-amount, --fee-lamports, --fee-recipient"
+      [[ -z "$slot" || -z "$delay" ]] || die ActivationConflict "give --activation-slot or --activation-delay-slots, not both"
+      [[ -z "$slot" ]] || PFLAGS+=(--activation-slot "$slot")
+      [[ -z "$delay" ]] || PFLAGS+=(--activation-delay-slots "$delay")
+      ops_context; need_bridge; need_blocks_per_batch
+      mount_key payer "$PAYER"
+      ops deposit-queue propose --authority-keypair "$REPLY" --settlement "$SETTLEMENT_ID" --bridge "$BRIDGE_ID" --chain-id "$CHAIN_ID" "${PFLAGS[@]}" --blocks-per-batch "$BLOCKS_PER_BATCH_CFG" ${MODE[@]+"${MODE[@]}"} ;;
+    activate)
+      parse_mode "$@"
+      [[ ${#REST[@]} -eq 0 ]] || die UnknownArgument "'${REST[0]}' (usage: rollup deposit-queue activate [--confirm])"
+      ops_context; need_bridge
+      mount_key payer "$PAYER"
+      ops deposit-queue activate --payer-keypair "$REPLY" --settlement "$SETTLEMENT_ID" --bridge "$BRIDGE_ID" --chain-id "$CHAIN_ID" ${MODE[@]+"${MODE[@]}"} ;;
+    show)
+      [[ $# -eq 0 ]] || die UnknownArgument "'$1' (usage: rollup deposit-queue show)"
+      ops_context; need_bridge
+      ops deposit-queue show --settlement "$SETTLEMENT_ID" --bridge "$BRIDGE_ID" --chain-id "$CHAIN_ID" ;;
+    *) die UnknownSubcommand "'$sub' (usage: rollup deposit-queue init|propose|activate|show)" ;;
+  esac
+}
+
+# A deposit is made by the depositor, not the chain authority, so the key is the depositor's own: --keypair FILE.
+cmd_deposit() {
+  parse_mode "$@"; set -- "${REST[@]+"${REST[@]}"}"
+  local amount="" recipient="" keypair="" wrap=() v
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --amount) amount="$(flag_value "$1" "${2:-}")" || exit 1; only_numbers "$1" "$amount"; shift 2 ;;
+      --recipient) recipient="$(flag_value "$1" "${2:-}")" || exit 1; hex_bytes "$1" "$recipient" 20; shift 2 ;;
+      --keypair) v="$(flag_value "$1" "${2:-}")" || exit 1; keypair="$(abs "$v")"; shift 2 ;;
+      --wrap-sol) wrap=(--wrap-sol); shift ;;
+      *) die UnknownArgument "'$1' (usage: rollup deposit --amount RAW_TOKEN_UNITS --recipient 0x.. --keypair FILE [--wrap-sol] [--confirm])" ;;
+    esac
+  done
+  [[ -n "$amount" ]] || die AmountMissing "give --amount N, in the vault mint's raw token units (lamports for wrapped SOL)"
+  [[ -n "$recipient" ]] || die RecipientMissing "give --recipient 0x followed by 40 hex characters: the address credited on the chain"
+  [[ -n "$keypair" ]] || die KeypairMissing "give --keypair FILE: the depositor's own Solana key, which signs and pays (it is not the chain authority's key unless you are that depositor)"
+  ops_context; need_bridge
+  mount_key depositor "$keypair"
+  ops deposit --settlement "$SETTLEMENT_ID" --bridge "$BRIDGE_ID" --chain-id "$CHAIN_ID" --amount "$amount" --recipient "$recipient" ${wrap[@]+"${wrap[@]}"} --keypair "$REPLY" ${MODE[@]+"${MODE[@]}"}
+}
+
+cmd_close_deposit() {
+  parse_mode "$@"; set -- "${REST[@]+"${REST[@]}"}"
+  local index=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --index) index="$(flag_value "$1" "${2:-}")" || exit 1; only_numbers "$1" "$index"; shift 2 ;;
+      *) die UnknownArgument "'$1' (usage: rollup close-deposit --index N [--confirm])" ;;
+    esac
+  done
+  [[ -n "$index" ]] || die IndexMissing "give --index N: the deposit record to close (its rent goes back to the depositor once its batch is final)"
+  ops_context; need_bridge
+  mount_key payer "$PAYER"
+  ops close-deposit --settlement "$SETTLEMENT_ID" --bridge "$BRIDGE_ID" --chain-id "$CHAIN_ID" --index "$index" --payer-keypair "$REPLY" ${MODE[@]+"${MODE[@]}"}
 }
 
 cmd_release_exit() {
@@ -929,7 +1059,9 @@ cmd_check() {
   # Inbox batches: next_batch - 1 batches are on Solana, and a batch holds at most blocks_per_batch blocks. A sequencer
   # that is two batches' worth of blocks ahead of what the posted batches could hold has an unposted tail, whatever the
   # batcher's own gauges say.
-  if (( cursor_ok )) && [[ -n "$bn2" ]]; then
+  local bpb_ok=0; [[ "$bpb" =~ ^[1-9][0-9]*$ ]] && bpb_ok=1
+  if (( ! bpb_ok )); then fail "inbox batches" "BlocksPerBatchUnreadable: $env has no valid BLOCKS_PER_BATCH (got '${bpb}'); run ./rollup init again"
+  elif (( cursor_ok )) && [[ -n "$bn2" ]]; then
     local posted=$(( next_batch - 1 )) unposted=$(( bn2 - (next_batch - 1) * bpb ))
     if (( unposted >= 2 * bpb )); then
       if (( posted == 0 )); then fail "inbox batches" "NoBatchPosted: nothing is on Solana and the sequencer is at block $((bn2)), $((2 * bpb)) or more blocks ahead"
@@ -1012,11 +1144,188 @@ cmd_check() {
     pass "exit config" "$(grep -E 'no exit config|exit_portal \(current\)|bridge_program \(current\)|pending_mask|activation_slot' <<<"$ec" | sed 's/^ *//; s/  */ /g' | paste -sd ';' - | sed 's/;/; /g')"
   else fail "exit config" "ExitConfigUnreadable: ${ec_why:-rome-zk-ops exit-config show failed}"; fi
 
+  # Deposits. One read of the queue and one of the registry, then each item judges what it needs. An item that cannot be
+  # judged yet says why; one that is wrong names the fix.
+  local dq="" dq_ok=0 dq_why="" vk="" vk_ok=0 vk_why="" queue_exists=0 dq_skip=""
+  dqv() { sed -n "s/^$1=//p" <<<"$dq" | head -1; }
+  if [[ -z "$BRIDGE_ID" ]]; then dq_skip="needs programs.zk-bridge in $PROGRAMS, which has none"
+  elif OPS_IMAGE="$(node_image)"; then
+    ops_reset
+    if dq="$(ops deposit-queue show --settlement "$SETTLEMENT_ID" --bridge "$BRIDGE_ID" --chain-id "$chain_id" 2>&1)"; then dq_ok=1; [[ "$(dqv queue_exists)" != true ]] || queue_exists=1; else dq_why="$(tail -1 <<<"$dq")"; fi
+    ops_reset
+    if vk="$(ops vkey show --settlement "$SETTLEMENT_ID" --chain-id "$chain_id" 2>&1)"; then vk_ok=1; else vk_why="$(tail -1 <<<"$vk")"; fi
+  else dq_why="ImageTagNotSet: neither ROME_ZK_IMAGE nor ROME_ZK_TAG is set in $env"; vk_why="$dq_why"; fi
+  # dq_gate ITEM -> 0 when the queue was read; otherwise prints the skip or the failure for ITEM and returns 1.
+  dq_gate() {
+    if [[ -n "$dq_skip" ]]; then skip "$1" "$dq_skip"; return 1; fi
+    if (( ! dq_ok )); then fail "$1" "DepositQueueUnreadable: ${dq_why:-rome-zk-ops deposit-queue show failed}"; return 1; fi
+    return 0
+  }
+
+  # The registry's active key can verify a deposit-capable guest: it equals the programVK of the vkey.json guest-build wrote
+  # from a guest at v0.2.0 or later. The key is needed before the queue exists, because an old guest cannot prove the
+  # blocks that credit deposits.
+  if dq_gate "deposit-capable key"; then
+    if (( queue_exists )); then skip "deposit-capable key" "the deposit queue exists already, so the key had to be deposit-capable before it was made"
+    elif (( ! vk_ok )); then fail "deposit-capable key" "VkeyShowUnreadable: ${vk_why:-rome-zk-ops vkey show failed}"
+    else
+      local vkj pvk gtag
+      vkj="$(rz_env_get "$env" VKEY_JSON)"; [[ -n "$vkj" ]] || vkj="$OUT/guest/vkey.json"
+      if [[ ! -f "$vkj" ]]; then skip "deposit-capable key" "no vkey.json at $vkj (./rollup guest-build writes it)"
+      else
+        pvk="$(jq -r '.programVK // empty' "$vkj" 2>/dev/null | tr 'A-F' 'a-f')"
+        gtag="$(jq -r '.source // empty' "$vkj" 2>/dev/null | sed -n 's/.*rome-zk-guest \(v[0-9][0-9.]*\).*/\1/p')"
+        if [[ ! "$pvk" =~ ^0x[0-9a-f]{64}$ ]]; then skip "deposit-capable key" "$vkj has no programVK (./rollup guest-build needs the ZisK proving keys to compute it)"
+        elif [[ "$gtag" =~ ^v([0-9]+)\.([0-9]+)(\.([0-9]+))?$ ]] && (( BASH_REMATCH[1] * 1000000 + BASH_REMATCH[2] * 1000 + ${BASH_REMATCH[4]:-0} < 2000 )); then
+          fail "deposit-capable key" "GuestNotDepositCapable: $vkj was built from rome-zk-guest $gtag, and deposits need v0.2.0 or later (set ROME_ZK_GUEST_TAG in $ENV_FILE, run ./rollup guest-build again, and have Rome register the new key)"
+        elif grep -qiE "^vkey_entry_[0-9]+=state=active layout=1 .* vkey=$pvk( |\$)" <<<"$vk"; then
+          if [[ -n "$gtag" ]]; then pass "deposit-capable key" "the active key is $pvk, from guest $gtag"
+          else warn "deposit-capable key" "the active key is $pvk, but $vkj records no guest tag, so this cannot tell whether the guest is v0.2.0 or later (./rollup guest-build writes the tag)"; fi
+        elif grep -qiE "^vkey_entry_[0-9]+=state=pending layout=1 .* vkey=$pvk( |\$)" <<<"$vk"; then
+          fail "deposit-capable key" "DepositKeyNotActive: the registry holds $pvk, but it is still pending; make the deposit queue only after it is active (./rollup check again after its activation slot)"
+        else
+          fail "deposit-capable key" "DepositKeyNotRegistered: no active registry key equals the programVK $pvk in $vkj; have Rome register it (rome-zk-ops vkey register) and wait for it to activate before ./rollup deposit-queue init"
+        fi
+      fi
+    fi
+  fi
+
+  # The caps: one batch holds blocks_per_batch blocks and each may take max_per_block deposits, so their product must fit
+  # what one batch may take, for the live parameters and for a pending proposal.
+  if dq_gate "deposit caps"; then
+    if (( ! queue_exists )); then skip "deposit caps" "no deposit queue yet (./rollup deposit-queue init checks these before it makes one)"
+    elif [[ ! "$bpb" =~ ^[1-9][0-9]*$ ]]; then
+      fail "deposit caps" "BlocksPerBatchUnreadable: $env has no valid BLOCKS_PER_BATCH (got '${bpb}'); run ./rollup init again"
+    else
+      local capmsg="" which pre perblock perbatch
+      for which in live pending; do
+        pre=""; [[ "$which" == pending ]] && { [[ "$(dqv pending)" == true ]] || continue; pre="pending_"; }
+        perblock="$(dqv "${pre}max_per_block")"; perbatch="$(dqv "${pre}max_per_batch")"
+        [[ "$perblock" =~ ^[0-9]+$ && "$perbatch" =~ ^[0-9]+$ ]] || { capmsg="CapsUnreadable: no ${pre}max_per_block and ${pre}max_per_batch in the deposit-queue output"; break; }
+        if (( perblock * bpb > perbatch )); then
+          capmsg="DepositCapsExceedBatch: ${which} max_per_block $perblock x blocks_per_batch $bpb = $((perblock * bpb)) is more than max_per_batch $perbatch; $( (( perbatch >= bpb )) && echo "run ./rollup deposit-queue propose --max-per-block $((perbatch / bpb))" || echo "blocks_per_batch alone is more than max_per_batch: raise max_per_batch with ./rollup deposit-queue propose --max-per-batch N, or lower blocks_per_batch in chain.toml for a new chain")"
+          break
+        fi
+      done
+      if [[ -z "$capmsg" ]]; then pass "deposit caps" "max_per_block $(dqv max_per_block) x blocks_per_batch $bpb = $(( $(dqv max_per_block) * bpb )), within max_per_batch $(dqv max_per_batch)"
+      else fail "deposit caps" "$capmsg"; fi
+    fi
+  fi
+
+  # The genesis: at most one balance, and the vault holds it.
+  local gb gcount glamports
+  gb="$(python3 - "$OUT/genesis.json" <<'PY' 2>/dev/null
+import json, sys
+a = json.load(open(sys.argv[1])).get("alloc") or {}
+def n(v):
+    v = v.get("balance", "0") if isinstance(v, dict) else "0"
+    return int(v, 16) if isinstance(v, str) and v.lower().startswith("0x") else int(v)
+bal = [n(v) for v in a.values() if n(v) > 0]
+if len(bal) == 1 and bal[0] % 10**9 != 0:
+    print(len(bal), "notwhole")
+else:
+    print(len(bal), bal[0] // 10**9 if bal else 0)
+PY
+)" || gb=""
+  gcount="${gb%% *}"; glamports="${gb#* }"
+  if [[ ! "$gcount" =~ ^[0-9]+$ ]]; then fail "genesis balance" "GenesisUnreadable: $OUT/genesis.json has no alloc this check can read (run ./rollup init again)"
+  elif (( gcount > 1 )); then fail "genesis balance" "GenesisFundedAccountLimit: $OUT/genesis.json gives $gcount accounts a balance, and at most one is allowed (a chain that holds deposits must be backed one for one); the genesis cannot change once registered, so start the chain again from a genesis with one"
+  elif (( gcount == 0 )); then pass "genesis balance" "the genesis has no balances, so the vault has nothing to back"
+  elif [[ "$glamports" == notwhole ]]; then fail "genesis balance" "GenesisBalanceNotWholeLamports: the one balance in $OUT/genesis.json is not a whole number of lamports (it must be lamports x 1000000000 wei)"
+  elif [[ -n "$dq_skip" ]]; then skip "genesis balance" "$dq_skip"
+  elif [[ -z "${OPS_IMAGE:-}" ]]; then fail "genesis balance" "VaultUnreadable: ${dq_why:-no node image}"
+  elif (( ! dq_ok )); then fail "genesis balance" "DepositQueueUnreadable: ${dq_why:-rome-zk-ops deposit-queue show failed} (whether the deposit queue exists decides what a missing piece means here)"
+  else
+    # A chain that has not set up deposits has no vault yet, and that is not a fault: a missing or short vault is a
+    # failure only once the deposit queue exists. The vault is judged against the genesis balance until the chain has a
+    # final batch: an exit needs one, so before it nothing can have taken from the vault, and deposits only add to it.
+    # After that exits move it, so its balance is only reported.
+    local vs vbal hfb; hfb="$(csv head_final_batch)"
+    vault_problem() { if (( queue_exists )); then fail "genesis balance" "$1"; else warn "genesis balance" "$1; this is only a warning until the deposit queue exists"; fi; }
+    ops_reset
+    if vs="$(ops vault show --settlement "$SETTLEMENT_ID" --bridge "$BRIDGE_ID" --chain-id "$chain_id" 2>&1)"; then
+      vbal="$(sed -n 's/.*vault_token .* balance \([0-9][0-9]*\) (raw units.*/\1/p' <<<"$vs" | head -1)"
+      if grep -q 'not initialized' <<<"$vs"; then vault_problem "VaultMissing: the genesis gives one account $glamports lamports but the chain has no vault (./rollup vault init --confirm, then ./rollup vault fund --amount $glamports --confirm)"
+      elif [[ ! "$vbal" =~ ^[0-9]+$ ]]; then fail "genesis balance" "VaultUnreadable: no token balance in the vault output (is the vault's token account there?)"
+      elif [[ "$hfb" != 0 ]]; then pass "genesis balance" "the genesis gave one account $glamports lamports; the vault holds $vbal now (the vault is judged against the genesis balance only until the chain has a final batch, since an exit needs one)"
+      elif (( vbal >= glamports )); then pass "genesis balance" "one balance of $glamports lamports, and the vault holds $vbal"
+      else vault_problem "VaultBelowGenesis: the genesis gives one account $glamports lamports and the vault holds $vbal (./rollup vault fund --amount $((glamports - vbal)) --confirm)"; fi
+    else fail "genesis balance" "VaultUnreadable: $(tail -1 <<<"$vs")"; fi
+  fi
+
+  # The exit config names the bridge in the programs file: deposits and exits both go through it.
+  if [[ -n "$dq_skip" ]]; then skip "exit config bridge" "$dq_skip"
+  elif (( ! ec_ok )); then skip "exit config bridge" "needs the exit config, which could not be read (see exit config above)"
+  else
+    # Before the deposit queue exists a chain need not have an exit config, so a missing one is skipped with the reason;
+    # a config that names a different bridge is wrong either way.
+    local ecb; ecb="$(sed -n 's/^ *bridge_program (current) *//p' <<<"$ec" | head -1 | tr -d ' ')"
+    if grep -q 'no exit config' <<<"$ec"; then
+      if (( queue_exists )); then fail "exit config bridge" "ExitConfigMissing: the chain has no exit config, so it names no bridge (./rollup exit-config propose, then activate, with the bridge $BRIDGE_ID)"
+      elif (( dq_ok )); then skip "exit config bridge" "the chain has no exit config and no deposit queue yet; deposits need an exit config that names the bridge $BRIDGE_ID (./rollup exit-config propose, then activate)"
+      else fail "exit config bridge" "DepositQueueUnreadable: ${dq_why:-rome-zk-ops deposit-queue show failed} (whether the deposit queue exists decides what a missing piece means here)"; fi
+    elif [[ "$ecb" == "$BRIDGE_ID" ]]; then pass "exit config bridge" "the exit config names the bridge $BRIDGE_ID from $PROGRAMS"
+    elif [[ -z "$ecb" || "$ecb" == 11111111111111111111111111111111 ]]; then
+      if (( queue_exists )); then fail "exit config bridge" "ExitConfigNamesNoBridge: the exit config has no bridge program (./rollup exit-config propose with the bridge $BRIDGE_ID, then activate)"
+      elif (( dq_ok )); then skip "exit config bridge" "the exit config names no bridge and there is no deposit queue yet; deposits need one that names $BRIDGE_ID (./rollup exit-config propose, then activate)"
+      else fail "exit config bridge" "DepositQueueUnreadable: ${dq_why:-rome-zk-ops deposit-queue show failed} (whether the deposit queue exists decides what a missing piece means here)"; fi
+    else fail "exit config bridge" "ExitConfigBridgeMismatch: the exit config names $ecb, and $PROGRAMS names $BRIDGE_ID (./rollup exit-config propose with $BRIDGE_ID, then activate)"; fi
+  fi
+
+  # A queue and the sequencer's [deposits] section go together: a queue nobody reads is deposits that never arrive.
+  if dq_gate "deposits section"; then
+    if (( ! queue_exists )); then skip "deposits section" "no deposit queue yet"
+    elif grep -qE '^\[deposits\]' "$OUT/sequencer-config.toml" 2>/dev/null; then pass "deposits section" "the deposit queue exists and $OUT/sequencer-config.toml has [deposits]"
+    else fail "deposits section" "DepositsSectionMissing: the deposit queue exists but $OUT/sequencer-config.toml has no [deposits] section, so the sequencer never credits a deposit (run ./rollup init, then ./rollup up sequencer)"; fi
+  fi
+
+  # The batch cursor: the first batch finalized after the upgrade turns it into the deposit-aware format.
+  local cur="" curv=""
+  if (( have_pdas )) && [[ -n "${cursor_pda:-}" ]]; then
+    cur="$(curl -sS --max-time 10 -X POST -H 'content-type: application/json' --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getAccountInfo\",\"params\":[\"$cursor_pda\",{\"encoding\":\"base64\",\"commitment\":\"confirmed\"}]}" "$SOLANA_RPC_URL" 2>/dev/null | jq -r '.result.value.data[0] // empty' 2>/dev/null)"
+    [[ -z "$cur" ]] || curv="$(python3 -c 'import base64,sys
+d=base64.b64decode(sys.argv[1]); print(d[4] if len(d)>4 else "")' "$cur" 2>/dev/null)"
+  fi
+  if (( ! have_pdas )); then skip "deposit cursor" "needs pdas.env (run ./rollup register --confirm)"
+  elif [[ -z "$curv" ]]; then fail "deposit cursor" "CursorUnreadable: could not read the batch cursor $cursor_pda from $SOLANA_RPC_URL"
+  elif [[ "$curv" == 2 ]]; then pass "deposit cursor" "the batch cursor is in the deposit-aware format (version 2)"
+  elif needs batcher && [[ "$(metric "$METRICS_BATCHER" rome_zk_batcher_batches_finalized_total)" =~ ^[1-9][0-9]*$ ]]; then
+    fail "deposit cursor" "CursorNotV2: the batcher has finalized batches but the batch cursor is still version $curv; the batcher is on a release from before deposits (set ROME_ZK_TAG in $ENV_FILE to a release that has them, run ./rollup up)"
+  else skip "deposit cursor" "the batch cursor is version $curv; it becomes version 2 with the first batch finalized after the upgrade, and the batcher has not finalized one yet"; fi
+
+  # The oldest waiting deposit against the deadline: past half it is named, past three quarters it fails.
+  if dq_gate "oldest deposit"; then
+    if (( ! queue_exists )); then skip "oldest deposit" "no deposit queue yet"
+    elif [[ -n "$(dqv oldest_waiting_age_secs)" ]]; then
+      local age dl pdl; age="$(dqv oldest_waiting_age_secs)"; dl="$(dqv oldest_waiting_deadline_secs)"
+      # A proposal that is waiting to activate may shorten the deadline: judge against the stricter of the two.
+      if [[ "$(dqv pending)" == true ]]; then
+        pdl="$(dqv pending_inclusion_deadline_secs)"
+        if [[ ! "$pdl" =~ ^[1-9][0-9]*$ ]]; then dl="unreadable pending deadline '$pdl'"
+        elif [[ "$dl" =~ ^[1-9][0-9]*$ ]] && (( pdl < dl )); then dl="$pdl"; fi
+      fi
+      if [[ ! "$age" =~ ^[0-9]+$ || ! "$dl" =~ ^[1-9][0-9]*$ ]]; then fail "oldest deposit" "DepositAgeUnreadable: age '$age', deadline '$dl'"
+      elif (( age * 4 > dl * 3 )); then fail "oldest deposit" "DepositNearDeadline: deposit $(dqv oldest_waiting_index) has waited ${age}s of its ${dl}s deadline (more than three quarters); the sequencer is not crediting deposits (./rollup logs sequencer; is [deposits] in its config and is the queue's cursor moving?)"
+      elif (( age * 2 > dl )); then warn "oldest deposit" "deposit $(dqv oldest_waiting_index) has waited ${age}s of its ${dl}s deadline (more than half)"
+      else pass "oldest deposit" "deposit $(dqv oldest_waiting_index) has waited ${age}s of its ${dl}s deadline"; fi
+    elif [[ "$(dqv oldest_waiting)" == none ]]; then pass "oldest deposit" "no deposit is waiting"
+    elif [[ "$(dqv oldest_waiting)" == unreadable ]]; then fail "oldest deposit" "DepositRecordUnreadable: the oldest waiting deposit's record could not be read"
+    else skip "oldest deposit" "the batch cursor is not in the deposit-aware format yet (see deposit cursor)"; fi
+  fi
+
+  # The backlog: deposits in the queue that no batch has taken yet.
+  if dq_gate "deposit backlog"; then
+    if (( ! queue_exists )); then skip "deposit backlog" "no deposit queue yet"
+    elif [[ "$(dqv backlog)" =~ ^[0-9]+$ ]]; then pass "deposit backlog" "$(dqv backlog) waiting (queue count $(dqv count), next to take $(dqv deposit_next))"
+    else skip "deposit backlog" "the batch cursor is not in the deposit-aware format yet (see deposit cursor)"; fi
+  fi
+
   # Derive lag: the verifier node trails the sequencer by the batch still open and the one being posted. A gap of two
   # batches' worth of blocks that is not closing is a derive that has stopped.
   if needs sequencer reth-verifier derive; then
     if [[ -z "$ver2" ]]; then fail "derive lag" "VerifierUnreachable: no answer from $VERIFIER_RPC"
     elif [[ -z "$bn2" ]]; then skip "derive lag" "needs the sequencer's head, which could not be read"
+    elif (( ! bpb_ok )); then skip "derive lag" "needs a valid BLOCKS_PER_BATCH in $env (see deposit caps)"
     else
       local gap=$(( bn2 - ver2 )) limit=$(( 2 * bpb ))
       if (( gap < limit )) || { [[ -n "$ver1" ]] && (( ver2 > ver1 )); }; then
@@ -1059,6 +1368,9 @@ case "$cmd" in
   refund-deposit) cmd_refund_deposit "$@" ;;
   exit-config) cmd_exit_config "$@" ;;
   vault) cmd_vault "$@" ;;
+  deposit-queue) cmd_deposit_queue "$@" ;;
+  deposit) cmd_deposit "$@" ;;
+  close-deposit) cmd_close_deposit "$@" ;;
   release-exit) cmd_release_exit "$@" ;;
   migrate) cmd_migrate "$@" ;;
   -h|--help|help|"") usage ;;

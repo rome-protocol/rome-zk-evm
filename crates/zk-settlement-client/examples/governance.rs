@@ -65,7 +65,7 @@
 //!
 //!   cargo run -p zk-settlement-client --features devnet-driver --example governance -- \
 //!     set-registry-entry --settlement <PROGRAM_ID> --chain-id 200101 \
-//!     --curve 0 --scheme 1 --layout-id 1 \
+//!     --curve 0 --scheme 2 --layout-id 1 \
 //!     --vkey-hash 44916015a37f85417e8e5c5bd4c8a56498821d3380b3d90874df471a8d12ca91 \
 //!     --activation-slot now \
 //!     --registry-keypair /path/to/registry_authority.json --payer-keypair /path/to/payer.json [--rpc-url URL]
@@ -75,7 +75,7 @@
 //!   # from a slot number to the literal word "retire".
 //!   cargo run -p zk-settlement-client --features devnet-driver --example governance -- \
 //!     set-registry-entry --settlement <PROGRAM_ID> --chain-id 200101 \
-//!     --curve 0 --scheme 1 --layout-id 1 \
+//!     --curve 0 --scheme 2 --layout-id 1 \
 //!     --vkey-hash 44916015a37f85417e8e5c5bd4c8a56498821d3380b3d90874df471a8d12ca91 \
 //!     --activation-slot retire \
 //!     --registry-keypair /path/to/registry_authority.json --payer-keypair /path/to/payer.json [--rpc-url URL]

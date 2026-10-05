@@ -69,10 +69,9 @@ pub enum InboxIx {
     },
     /// accounts: [batch pda (writable), chunk pda (read-only)] — permissionless.
     SealLeaf { idx: u32 },
-    /// accounts: [batch pda (writable), authority (signer, read-only)] — authority-gated:
-    /// the signer must be the batch's stored `authority` (the value `OpenBatch` wrote), or a
-    /// third party could finalize a later batch id ahead of the real poster's own, stranding it (the
-    /// batch pda stays at account index 0, unchanged for every existing reader). `step` = 0 means "all
+    /// RETIRED, refused by name (`BatchError::RetiredInstruction`): the discriminant still decodes so
+    /// recorded history stays readable, and `FinalizeBatchV2` (11) replaces it. Its old shape was
+    /// accounts: [batch pda (writable), authority (signer, read-only)] with `step` = 0 meaning "all
     /// remaining".
     FinalizeBatch { step: u32 },
     /// accounts: [authority (signer, writable), batch pda (writable), root pda (read-only), cursor pda
@@ -80,9 +79,10 @@ pub enum InboxIx {
     /// the batch's `deposit_to` when that is higher; a v1 cursor or a v2 batch is left alone, since
     /// nothing was credited. A missing or wrong cursor is refused.
     CloseBatch,
-    /// accounts: [authority (signer, writable), batch pda (writable)] — authority-only, only while
-    /// `finalized == 0` (a finalized batch can only leave via `CloseBatch`, which requires the covering
-    /// root to be final); returns rent for a batch id that was opened but never posted.
+    /// accounts: [authority (signer, writable), batch pda (writable), previous batch (read-only)] —
+    /// authority-only, only while `finalized == 0` (a finalized batch can only leave via `CloseBatch`, which
+    /// requires the covering root to be final); returns rent for a batch id that was opened but never posted.
+    /// The previous batch must be final or absent (the system program stands in for batch 0).
     AbandonBatch,
     // --- growth + cursor, appended so the nine discriminants above never move ---
     /// accounts: [payer (signer, writable), batch pda (writable), system_program (read-only)] —
@@ -109,6 +109,35 @@ pub enum InboxIx {
         next_batch: u64,
         settlement_program: Pubkey,
     },
+    // --- deposits, appended so the eleven discriminants above never move ---
+    /// accounts: [batch pda (writable), authority (signer, read-only), cursor pda (writable),
+    /// exit_config (read-only), deposit_queue (read-only), record(deposit_to - 1) (read-only),
+    /// record(deposit_to) (read-only)] — authority-gated like the retired `FinalizeBatch`: the signer must
+    /// be the batch's stored `authority`. `step` = 0 means "all remaining". The five accounts after the
+    /// authority are read only on the call that completes the batch (an earlier step of a resumable
+    /// finalize reads none of them).
+    ///
+    /// On the completing call: the `exit_config` must sit at its PDA under the batch's settlement program
+    /// and the queue at its PDA under `exit_config.bridge_program`, each refused by name otherwise (an
+    /// account at the exact address that the settlement program or the bridge does not own counts as
+    /// absent). With no exit config, a zero bridge program or no queue the range must be empty.
+    /// Otherwise: `from` is the cursor's `deposit_next`; `from <= deposit_to <= queue.count`;
+    /// `deposit_to - from <= max_per_batch`; the deadline holds, with a deposit's age measured at the batch's
+    /// `open_unix_ts` and not at the time of the call, but never earlier than `DEPOSIT_GRACE_SECS` (24 hours)
+    /// before the call; `h_to` is `record(deposit_to - 1)`'s
+    /// `hash_after` (the cursor's hash for an empty range). The range goes into the header (v3), the batch's
+    /// `forced_root` is built from it by the shared deposit functions (the empty constant for an empty
+    /// range), and the cursor moves to `deposit_to`. A v1 cursor is reallocated to 69 bytes on this call
+    /// and must already hold the rent for that, since the instruction has no payer. A batch with a v2
+    /// header, opened before the upgrade, takes only an empty range and is never held to the deadline. The record accounts the client cannot
+    /// name (`deposit_to == from`, or no queue) are never read; it passes any account there.
+    /// The completing call also takes one more read-only account after `record(deposit_to)`: the previous
+    /// batch, at `batch_pda(settlement_program, chain_id, batch - 1)`. A wrong address is refused as
+    /// `WrongPreviousBatchAddress`, and a previous batch this program owns that is not finalized as
+    /// `PreviousBatchNotFinalized`, so deposit ranges are taken in batch order. An absent previous batch
+    /// (abandoned, or closed after it went final) is accepted, and batch 0 skips the check. It applies to
+    /// an empty range as well.
+    FinalizeBatchV2 { step: u32, deposit_to: u64 },
 }
 
 /// Errors specific to the chunk lane (mapped to `ProgramError::Custom`, own namespace from
@@ -368,7 +397,12 @@ pub fn process_instruction(
             &settlement_program,
         ),
         InboxIx::SealLeaf { idx } => batch::seal_leaf(program_id, accounts, idx),
-        InboxIx::FinalizeBatch { step } => batch::finalize_batch(program_id, accounts, step),
+        // Refused before any account is read: the old body wrote the constant forced_root and so ignored the
+        // deposit queue.
+        InboxIx::FinalizeBatch { .. } => Err(batch::BatchError::RetiredInstruction.into()),
+        InboxIx::FinalizeBatchV2 { step, deposit_to } => {
+            batch::finalize_batch_v2(program_id, accounts, step, deposit_to)
+        }
         InboxIx::CloseBatch => batch::close_batch(program_id, accounts),
         InboxIx::AbandonBatch => batch::abandon_batch(program_id, accounts),
         InboxIx::GrowBatch { chain_id, batch } => {
@@ -449,6 +483,13 @@ mod tests {
                     chain_id: 0,
                     next_batch: 0,
                     settlement_program: Pubkey::default(),
+                },
+            ),
+            (
+                11,
+                InboxIx::FinalizeBatchV2 {
+                    step: 0,
+                    deposit_to: 0,
                 },
             ),
         ];

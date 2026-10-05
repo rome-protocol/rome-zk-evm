@@ -265,10 +265,12 @@ fn main() -> anyhow::Result<()> {
 
     let cfg = rome_zk_prover::config::Config::load(&args.config)?;
     let vkey = cfg.load_vkey_of_record()?;
-    // gpu = true: stop here, by name, when cargo-zisk is not the GPU build, before any state is touched. A dry run
-    // never proves, so it does not need the GPU build.
-    if cfg.gpu && !args.dry_run {
-        rome_zk_prover::prover::require_gpu_build(&cfg.zisk_home)?;
+    // Stop here, by name, when the install is not the release the vkey of record names (binary, then proving key),
+    // or, with gpu = true, not the GPU build, before any state is touched. A dry run never proves, so it needs none
+    // of this.
+    if !args.dry_run {
+        rome_zk_prover::prover::require_install(&cfg.zisk_home, &vkey.zisk, cfg.gpu)?;
+        rome_zk_prover::prover::require_proving_key(&cfg.zisk_home, &vkey.zisk, &vkey.root_c)?;
     }
     let settlement_program = Pubkey::from_str(&cfg.settlement_program_id)?;
     let inbox_program = Pubkey::from_str(&cfg.inbox_program_id)?;
@@ -281,6 +283,7 @@ fn main() -> anyhow::Result<()> {
         v1_payer.pubkey()
     });
 
+    let zisk_release = vkey.zisk.clone();
     let run_cfg = run_config(&cfg, vkey, settlement_program, inbox_program, authority);
     let metrics = Metrics::new();
 
@@ -324,6 +327,7 @@ fn main() -> anyhow::Result<()> {
 
     let prover = LocalCargoZisk {
         zisk_home: cfg.zisk_home.clone(),
+        zisk: zisk_release,
         gpu: cfg.gpu,
         timeout: Duration::from_secs(cfg.prove_timeout_secs),
     };

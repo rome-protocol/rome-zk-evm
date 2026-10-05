@@ -8,8 +8,11 @@
 
 use rome_zk_layouts::batch::{
     account_len_for, header_len, leaves_offset_for, VERSION as BATCH_VERSION,
+    VERSION_V3 as BATCH_VERSION_V3,
 };
-use rome_zk_testkit::{cursor_account, prefund_pda, rent_exempt, root_account_with_authority};
+use rome_zk_testkit::{
+    cursor_account, cursor_account_for, prefund_pda, rent_exempt, root_account_with_authority,
+};
 use solana_program::{keccak, pubkey::Pubkey};
 use solana_sdk::{
     account::{Account, AccountSharedData},
@@ -431,7 +434,7 @@ async fn open_batch_succeeds_even_when_an_attacker_prefunds_its_pda() {
     assert_eq!(acct.owner, program_id);
     assert_eq!(
         acct.data.len(),
-        account_len_for(BATCH_VERSION, expected_count).unwrap(),
+        account_len_for(BATCH_VERSION_V3, expected_count).unwrap(),
         "adopted account must be sized exactly as a freshly-created one would be"
     );
     assert!(
@@ -923,7 +926,7 @@ async fn grow_batch_rejects_a_batch_account_owned_by_a_foreign_program() {
 // 2. GrowBatch
 // ---------------------------------------------------------------------------------------------
 
-/// `account_len(313) = 10,258 > MAX_PERMITTED_DATA_INCREASE (10,240)` — the exact case that failed on
+/// `account_len(313) = 10,338 > MAX_PERMITTED_DATA_INCREASE (10,240)` — the exact case that failed on
 /// devnet before `GrowBatch`: `OpenBatch` alone creates the account capped at 10,240 bytes; one `GrowBatch`
 /// finishes it, and the batch then finalizes normally.
 #[tokio::test]
@@ -945,7 +948,7 @@ async fn open_batch_313_leaves_opens_capped_then_grows_and_finalizes() {
     );
     pt.add_account(
         client::cursor_pda(&program_id, &settlement_program, chain_id).0,
-        cursor_account(program_id, chain_id, batch),
+        cursor_account_for(2, program_id, chain_id, batch),
     );
     pt.add_account(authority.pubkey(), funded_account());
     // Pre-seed 313 sealed chunk accounts (not the batch account itself — see the module doc: only the
@@ -987,7 +990,7 @@ async fn open_batch_313_leaves_opens_capped_then_grows_and_finalizes() {
     eprintln!("OpenBatch(313 leaves, capped) consumed {open_cu} CU");
 
     let (batch_pda, _) = client::batch_pda(&program_id, &settlement_program, chain_id, batch);
-    let target = account_len_for(BATCH_VERSION, n).unwrap();
+    let target = account_len_for(BATCH_VERSION_V3, n).unwrap();
     let capped_len = ctx
         .banks_client
         .get_account(batch_pda)
@@ -1054,7 +1057,7 @@ async fn open_batch_313_leaves_opens_capped_then_grows_and_finalizes() {
         .await
         .unwrap_or_else(|e| panic!("SealLeaf({idx}) failed: {e:?}"));
     }
-    let finalize_ix = client::finalize_batch_ix(
+    let finalize_ix = finalize_v2(
         &program_id,
         &authority.pubkey(),
         &settlement_program,
@@ -1126,7 +1129,7 @@ async fn grow_batch_at_full_size_is_a_no_op() {
         .unwrap()
         .data
         .len();
-    assert_eq!(len_before, account_len_for(BATCH_VERSION, n).unwrap());
+    assert_eq!(len_before, account_len_for(BATCH_VERSION_V3, n).unwrap());
     let lamports_before = ctx
         .banks_client
         .get_account(batch_pda)
@@ -1203,7 +1206,7 @@ async fn grow_batch_by_a_random_payer_succeeds_and_cannot_exceed_account_len() {
     send(&mut ctx, &[open_ix], &authority, &[]).await.unwrap();
 
     let (batch_pda, _) = client::batch_pda(&program_id, &settlement_program, chain_id, batch);
-    let target = account_len_for(BATCH_VERSION, n).unwrap();
+    let target = account_len_for(BATCH_VERSION_V3, n).unwrap();
     assert!(target > client::MAX_PERMITTED_DATA_INCREASE);
 
     let random_payer_lamports_before = ctx
@@ -1311,7 +1314,7 @@ async fn chunk_open_and_finalize_batch_reject_before_the_batch_is_fully_grown() 
     );
     pt.add_account(
         client::cursor_pda(&program_id, &settlement_program, chain_id).0,
-        cursor_account(program_id, chain_id, batch),
+        cursor_account_for(2, program_id, chain_id, batch),
     );
     pt.add_account(authority.pubkey(), funded_account());
     let mut ctx = pt.start_with_context().await;
@@ -1342,7 +1345,7 @@ async fn chunk_open_and_finalize_batch_reject_before_the_batch_is_fully_grown() 
         .expect_err("chunk Open must refuse before the batch is fully grown");
     assert!(format!("{err:?}").contains(INBOX_ERR_BATCH_NOT_GROWN));
 
-    let finalize_ix = client::finalize_batch_ix(
+    let finalize_ix = finalize_v2(
         &program_id,
         &authority.pubkey(),
         &settlement_program,
@@ -1380,7 +1383,7 @@ async fn open_and_grow_batch_900_leaves_in_one_transaction_finalizes_within_cu_b
     );
     pt.add_account(
         client::cursor_pda(&program_id, &settlement_program, chain_id).0,
-        cursor_account(program_id, chain_id, batch),
+        cursor_account_for(2, program_id, chain_id, batch),
     );
     pt.add_account(authority.pubkey(), funded_account());
     let mut ctx = pt.start_with_context().await;
@@ -1397,7 +1400,7 @@ async fn open_and_grow_batch_900_leaves_in_one_transaction_finalizes_within_cu_b
     assert_eq!(
         ixs.len(),
         3,
-        "account_len(900) = 29,123: OpenBatch (-> 10,240) + two GrowBatch (-> 20,480 -> 29,123)"
+        "account_len(900) = 29,203: OpenBatch (-> 10,240) + two GrowBatch (-> 20,480 -> 29,203)"
     );
     let (total_cu, log_messages) = send(&mut ctx, &ixs, &authority, &[])
         .await
@@ -1414,7 +1417,7 @@ async fn open_and_grow_batch_900_leaves_in_one_transaction_finalizes_within_cu_b
     );
 
     let (batch_pda, _) = client::batch_pda(&program_id, &settlement_program, chain_id, batch);
-    let target = account_len_for(BATCH_VERSION, n).unwrap();
+    let target = account_len_for(BATCH_VERSION_V3, n).unwrap();
     let account = ctx
         .banks_client
         .get_account(batch_pda)
@@ -1435,8 +1438,8 @@ async fn open_and_grow_batch_900_leaves_in_one_transaction_finalizes_within_cu_b
     let bodies: Vec<[u8; 4]> = (0..n).map(|i| i.to_le_bytes()).collect();
     let chunk_hashes: Vec<[u8; 32]> = bodies.iter().map(|b| chunk_body_hash(b)).collect();
     let mut data = account.data.clone();
-    let bitmap_off = header_len(BATCH_VERSION).unwrap();
-    let leaves_off = leaves_offset_for(BATCH_VERSION, n).unwrap();
+    let bitmap_off = header_len(BATCH_VERSION_V3).unwrap();
+    let leaves_off = leaves_offset_for(BATCH_VERSION_V3, n).unwrap();
     for i in 0..n as usize {
         data[bitmap_off + i / 8] |= 1 << (i % 8);
         let slot = leaves_off + 32 * i;
@@ -1450,7 +1453,7 @@ async fn open_and_grow_batch_900_leaves_in_one_transaction_finalizes_within_cu_b
     ctx.set_account(&batch_pda, &AccountSharedData::from(new_account));
 
     // --- FinalizeBatch ---
-    let finalize_ix = client::finalize_batch_ix(
+    let finalize_ix = finalize_v2(
         &program_id,
         &authority.pubkey(),
         &settlement_program,
@@ -1478,4 +1481,25 @@ async fn open_and_grow_batch_900_leaves_in_one_transaction_finalizes_within_cu_b
     let (_, _, expected_acc) =
         client::reference_commitment(chain_id, batch, decoded.open_slot, &chunk_hashes);
     assert_eq!(decoded.acc, expected_acc);
+}
+
+/// `FinalizeBatchV2` over an empty deposit range (the chain has no deposits, the cursor's `deposit_next` is 0).
+fn finalize_v2(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    settlement_program: &Pubkey,
+    chain_id: u64,
+    batch: u64,
+    step: u32,
+) -> solana_program::instruction::Instruction {
+    client::finalize_batch_v2_ix(
+        program_id,
+        authority,
+        settlement_program,
+        chain_id,
+        batch,
+        step,
+        0,
+        None,
+    )
 }

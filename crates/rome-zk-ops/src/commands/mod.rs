@@ -2,14 +2,19 @@
 //! named [`OpsError`], and never prints: the caller prints.
 
 pub mod bridge;
+pub mod bridge_config;
 pub mod chain_id;
 pub mod chain_status;
+pub mod deposit_queue;
 pub mod exit_config;
 pub mod init_cursor;
 pub mod migrate;
 pub mod pdas;
 pub mod refund_deposit;
 pub mod register;
+pub mod vkey;
+#[cfg(test)]
+mod vkey_local;
 
 use crate::chain::Chain;
 use crate::error::{Mode, OpsError, Report};

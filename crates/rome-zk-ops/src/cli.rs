@@ -3,13 +3,17 @@
 
 use crate::chain::{Chain, OfflineChain, RpcChain};
 use crate::commands::{
-    bridge, chain_id, chain_status, exit_config, init_cursor, migrate, pdas, refund_deposit,
+    bridge, bridge_config, chain_id, chain_status, deposit_queue, exit_config, init_cursor,
+    migrate, pdas, refund_deposit,
     register::{self, RegisterRequest},
+    vkey::{self, RegisterVkeyRequest},
 };
 use crate::error::{Mode, OpsError, Report};
 use crate::keys;
+use crate::rebuild::DockerRebuilder;
 use clap::{Args, Parser, Subcommand};
 use solana_program::pubkey::Pubkey;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub const DEFAULT_RPC_URL: &str = "https://api.devnet.solana.com";
@@ -62,6 +66,281 @@ pub enum Command {
     ReleaseExit(ReleaseExitArgs),
     /// Deposit into a chain: lock tokens in the bridge vault and queue a credit to an address on the chain.
     Deposit(DepositArgs),
+    /// Register (registry authority) or show a chain's verification key.
+    #[command(subcommand)]
+    Vkey(VkeyCommand),
+    /// Create, change, activate or show a chain's deposit queue.
+    #[command(subcommand)]
+    DepositQueue(DepositQueueCommand),
+    /// Give a credited deposit record's rent back to its depositor.
+    CloseDeposit(CloseDepositArgs),
+    /// Write (once per bridge deployment) or show the bridge's config.
+    #[command(subcommand)]
+    BridgeConfig(BridgeConfigCommand),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DepositQueueCommand {
+    /// Create the queue (chain authority). Defaults are the standard values; a chain must have posted a root first.
+    Init(DepositQueueInitArgs),
+    /// Record new parameters with an activation slot (chain authority). Replaces a pending proposal.
+    Propose(DepositQueueProposeArgs),
+    /// Make the pending parameters live once their slot has passed. Anyone may.
+    Activate(DepositQueueActivateArgs),
+    /// Print the queue's parameters, count, cursor position and the oldest waiting deposit.
+    Show(DepositQueueShowArgs),
+}
+
+/// The parameter flags shared by `deposit-queue init` and `deposit-queue propose`.
+#[derive(Args, Debug, Clone)]
+pub struct DepositParamFlags {
+    /// Seconds a deposit may wait before it must be included: 3600 to 86400. Default 43200 (12 hours).
+    #[arg(long)]
+    pub deadline_secs: Option<u32>,
+    /// Deposits one batch may take: at most 256. Default 256.
+    #[arg(long)]
+    pub max_per_batch: Option<u16>,
+    /// Deposits one block may take. Default 4.
+    #[arg(long)]
+    pub max_per_block: Option<u16>,
+    /// The smallest deposit, in the vault's raw units. Default 1000000 (0.001 SOL).
+    #[arg(long)]
+    pub min_amount: Option<u64>,
+    /// The fee a deposit pays, in lamports: at most 10000000. Default 100000 (0.0001 SOL).
+    #[arg(long)]
+    pub fee_lamports: Option<u64>,
+    /// Who receives the fee. Default: the signing key (init) or the queue's current recipient (propose).
+    #[arg(long)]
+    pub fee_recipient: Option<Pubkey>,
+    /// The sequencer's blocks per batch. When given, max_per_block x blocks_per_batch must fit max_per_batch.
+    #[arg(long)]
+    pub blocks_per_batch: Option<u32>,
+}
+
+impl From<DepositParamFlags> for deposit_queue::ParamFlags {
+    fn from(f: DepositParamFlags) -> Self {
+        Self {
+            deadline_secs: f.deadline_secs,
+            max_per_batch: f.max_per_batch,
+            max_per_block: f.max_per_block,
+            min_amount: f.min_amount,
+            fee_lamports: f.fee_lamports,
+            fee_recipient: f.fee_recipient,
+            blocks_per_batch: f.blocks_per_batch,
+        }
+    }
+}
+
+#[derive(Args, Debug)]
+pub struct DepositQueueInitArgs {
+    /// The chain authority's keypair file (also the fee payer); it must equal the settlement root's authority.
+    #[arg(long)]
+    pub authority_keypair: PathBuf,
+    #[arg(long)]
+    pub settlement: Pubkey,
+    #[arg(long)]
+    pub bridge: Pubkey,
+    #[arg(long)]
+    pub chain_id: u64,
+    #[command(flatten)]
+    pub params: DepositParamFlags,
+}
+
+#[derive(Args, Debug)]
+pub struct DepositQueueProposeArgs {
+    /// The chain authority's keypair file (also the fee payer).
+    #[arg(long)]
+    pub authority_keypair: PathBuf,
+    #[arg(long)]
+    pub settlement: Pubkey,
+    #[arg(long)]
+    pub bridge: Pubkey,
+    #[arg(long)]
+    pub chain_id: u64,
+    /// The slot the parameters take effect: between one and two challenge windows from now.
+    #[arg(long)]
+    pub activation_slot: Option<u64>,
+    /// Slots after the current slot. Without either flag: one challenge window plus a small margin.
+    #[arg(long)]
+    pub activation_delay_slots: Option<u64>,
+    #[command(flatten)]
+    pub params: DepositParamFlags,
+}
+
+#[derive(Args, Debug)]
+pub struct DepositQueueActivateArgs {
+    #[arg(long)]
+    pub settlement: Pubkey,
+    #[arg(long)]
+    pub bridge: Pubkey,
+    #[arg(long)]
+    pub chain_id: u64,
+    #[arg(long)]
+    pub payer_keypair: PathBuf,
+}
+
+#[derive(Args, Debug)]
+pub struct DepositQueueShowArgs {
+    #[arg(long)]
+    pub settlement: Pubkey,
+    #[arg(long)]
+    pub bridge: Pubkey,
+    #[arg(long)]
+    pub chain_id: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct CloseDepositArgs {
+    #[arg(long)]
+    pub settlement: Pubkey,
+    #[arg(long)]
+    pub bridge: Pubkey,
+    #[arg(long)]
+    pub chain_id: u64,
+    /// The deposit record's index.
+    #[arg(long)]
+    pub index: u64,
+    /// The fee payer's keypair file. The rent goes to the record's depositor, whoever pays.
+    #[arg(long)]
+    pub payer_keypair: PathBuf,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BridgeConfigCommand {
+    /// Write the config, once per bridge deployment, with the bridge program's upgrade authority.
+    Init(BridgeConfigInitArgs),
+    /// Print the settlement and inbox programs the bridge is bound to.
+    Show(BridgeConfigShowArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct BridgeConfigInitArgs {
+    /// The bridge program's upgrade authority keypair file (also the fee payer).
+    #[arg(long)]
+    pub authority_keypair: PathBuf,
+    #[arg(long)]
+    pub bridge: Pubkey,
+    #[arg(long)]
+    pub settlement: Pubkey,
+    #[arg(long)]
+    pub inbox: Pubkey,
+}
+
+#[derive(Args, Debug)]
+pub struct BridgeConfigShowArgs {
+    #[arg(long)]
+    pub bridge: Pubkey,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum VkeyCommand {
+    /// Check an operator's request by rebuilding the guest, then register the key. A dry run unless --confirm.
+    Register(Box<VkeyRegisterArgs>),
+    /// Print a chain's registry entries and when each activates.
+    Show(VkeyShowArgs),
+    /// Retire every registry entry, on every chain, that is still live under one ZisK release. A dry run lists them.
+    RetireVersion(VkeyRetireVersionArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct VkeyRegisterArgs {
+    #[arg(long)]
+    pub settlement: Pubkey,
+    /// The chain's id, as the operator sent it.
+    #[arg(long)]
+    pub chain_id: u64,
+    /// The operator's genesis.json.
+    #[arg(long)]
+    pub genesis: PathBuf,
+    /// The rome-zk-guest tag the operator built with.
+    #[arg(long)]
+    pub guest_tag: String,
+    /// The ZisK release the key is for, by name (for example 1.3.1-alpha). The guest is rebuilt in that release's image,
+    /// and the entry is written with that release's scheme. A release that takes no new entry is refused.
+    #[arg(long)]
+    pub zisk: String,
+    /// The rome-zk-evm tag the guest-build image clones (the node's tag).
+    #[arg(long, default_value = "v0.3.0")]
+    pub evm_tag: String,
+    /// The ZisK release the anchor key was built with; the --zisk above when not given. A chain moving to a new release
+    /// anchors on a key of the release it is leaving.
+    #[arg(long)]
+    pub anchor_zisk: Option<String>,
+    /// The rome-zk-evm tag for the anchor rebuild; the --evm-tag above when not given. An anchor key built on another
+    /// node tag can only be reproduced on that tag.
+    #[arg(long)]
+    pub anchor_evm_tag: Option<String>,
+    /// Rome's bridge program: the chain's exit_config must name it for a backed balance to count. Defaults to the
+    /// devnet program in the rollup's program list.
+    #[arg(long)]
+    pub bridge_program: Option<Pubkey>,
+    /// The ELF's sha256 the operator sent, 32 bytes of hex.
+    #[arg(long, value_parser = parse_hex32)]
+    pub elf_sha256: [u8; 32],
+    /// The programVK the operator sent, 32 bytes of hex.
+    #[arg(long, value_parser = parse_hex32)]
+    pub program_vk: [u8; 32],
+    /// The genesis file's sha256 the operator states, when they sent one.
+    #[arg(long, value_parser = parse_hex32)]
+    pub genesis_sha256: Option<[u8; 32]>,
+    /// The proving key directory of the --zisk release (the one that holds zisk/vadcop_final). Needed: the programVK is
+    /// recomputed from the rebuild, never taken from the operator. The image refuses a directory of another release.
+    #[arg(long)]
+    pub proving_key_dir: Option<PathBuf>,
+    /// The proving key directory of the --anchor-zisk release, when that is another release than --zisk. Each release
+    /// has its own keys and the image refuses another release's, so the anchor rebuild mounts this one. Needed
+    /// when the chain's root has moved past genesis and --anchor-zisk names another release; refused otherwise.
+    #[arg(long)]
+    pub anchor_proving_key_dir: Option<PathBuf>,
+    /// The directory with the guest-build image's Dockerfile (deploy/rollup/guest-build).
+    #[arg(long, default_value = "deploy/rollup/guest-build")]
+    pub guest_build_dir: PathBuf,
+    /// The docker command, with a prefix if it needs one (for example "sudo docker").
+    #[arg(long, default_value = "docker")]
+    pub docker: String,
+    /// The registry authority's keypair file.
+    #[arg(long)]
+    pub registry_keypair: PathBuf,
+    /// The fee payer's keypair file.
+    #[arg(long)]
+    pub payer_keypair: PathBuf,
+    /// The slot the key becomes usable from. Give this or --activation-delay-slots.
+    #[arg(long)]
+    pub activation_slot: Option<u64>,
+    /// Slots after the current slot. Give this or --activation-slot.
+    #[arg(long)]
+    pub activation_delay_slots: Option<u64>,
+    /// A guest tag that already has a registered key for this chain. Needed once the chain's root has moved past
+    /// genesis: the operator's genesis is rebuilt at this tag and must reproduce a registered, non-retired programVK.
+    #[arg(long)]
+    pub anchor_guest_tag: Option<String>,
+    /// Allow the key to be sent again when it is registered and still pending, which moves its activation slot.
+    #[arg(long)]
+    pub move_pending_activation: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct VkeyShowArgs {
+    #[arg(long)]
+    pub settlement: Pubkey,
+    #[arg(long)]
+    pub chain_id: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct VkeyRetireVersionArgs {
+    #[arg(long)]
+    pub settlement: Pubkey,
+    /// The ZisK release whose entries are retired, by name (for example 1.2.0-alpha). Any release the registry names can
+    /// be retired, whatever its status. Retiring is final.
+    #[arg(long)]
+    pub zisk: String,
+    /// The registry authority's keypair file.
+    #[arg(long)]
+    pub registry_keypair: PathBuf,
+    /// The fee payer's keypair file.
+    #[arg(long)]
+    pub payer_keypair: PathBuf,
 }
 
 #[derive(Subcommand, Debug)]
@@ -335,8 +614,43 @@ fn parse_hex32(s: &str) -> Result<[u8; 32], String> {
 }
 
 /// Runs one parsed command over `chain`. Separate from [`run`] so tests can hand it a fake chain.
+/// The proving key directory of each release a `vkey register` can rebuild: `--proving-key-dir` is the --zisk release's,
+/// `--anchor-proving-key-dir` the --anchor-zisk release's when that is another one. An anchor directory with no other
+/// anchor release is refused, because the image would be given keys of the wrong release.
+pub(crate) fn proving_key_dirs(
+    zisk: &str,
+    keys: PathBuf,
+    anchor_zisk: Option<&str>,
+    anchor_keys: Option<PathBuf>,
+) -> Result<BTreeMap<String, PathBuf>, OpsError> {
+    let mut dirs = BTreeMap::from([(zisk.to_string(), keys)]);
+    match (anchor_zisk.filter(|a| *a != zisk), anchor_keys) {
+        (Some(anchor), Some(dir)) => {
+            dirs.insert(anchor.to_string(), dir);
+        }
+        (None, Some(_)) => {
+            return Err(OpsError::usage(
+                "AnchorProvingKeyDirUnused",
+                "--anchor-proving-key-dir is for an --anchor-zisk that names another release than --zisk; the anchor of the same release uses --proving-key-dir",
+            ))
+        }
+        (_, None) => {}
+    }
+    Ok(dirs)
+}
+
 pub async fn execute<C: Chain>(
     chain: &C,
+    command: Command,
+    mode: Mode,
+) -> Result<Report, OpsError> {
+    execute_with(chain, &vkey::NoScan, command, mode).await
+}
+
+/// [`execute`] with the way to list the registry accounts, which `vkey retire-version` needs and nothing else does.
+pub async fn execute_with<C: Chain, S: vkey::RegistryScan>(
+    chain: &C,
+    scan: &S,
     command: Command,
     mode: Mode,
 ) -> Result<Report, OpsError> {
@@ -491,6 +805,151 @@ pub async fn execute<C: Chain>(
             )
             .await
         }
+        Command::Vkey(VkeyCommand::Show(a)) => vkey::show(chain, &a.settlement, a.chain_id).await,
+        Command::Vkey(VkeyCommand::RetireVersion(a)) => {
+            vkey::retire_version(
+                chain,
+                scan,
+                vkey::RetireVersionRequest {
+                    settlement: a.settlement,
+                    zisk: a.zisk,
+                    registry_keypair: a.registry_keypair,
+                    payer_keypair: a.payer_keypair,
+                },
+                mode,
+            )
+            .await
+        }
+        Command::Vkey(VkeyCommand::Register(a)) => {
+            let a = *a;
+            // The programVK is recomputed from the rebuild; without the proving keys it cannot be, so the build
+            // (minutes long) is not started.
+            let Some(keys_dir) = a.proving_key_dir else {
+                return Err(OpsError::usage(
+                    "ProgramVkNotComputed",
+                    "--proving-key-dir is needed: the programVK is recomputed from the rebuild, never taken from the operator",
+                ));
+            };
+            let proving_key_dirs = proving_key_dirs(
+                &a.zisk,
+                keys_dir,
+                a.anchor_zisk.as_deref(),
+                a.anchor_proving_key_dir,
+            )?;
+            let rebuilder = DockerRebuilder {
+                docker: a.docker.split_whitespace().map(str::to_string).collect(),
+                context: a.guest_build_dir,
+                proving_key_dirs,
+            };
+            vkey::register(
+                chain,
+                &rebuilder,
+                RegisterVkeyRequest {
+                    settlement: a.settlement,
+                    chain_id: a.chain_id,
+                    genesis: a.genesis,
+                    guest_tag: a.guest_tag,
+                    zisk: a.zisk,
+                    evm_tag: a.evm_tag,
+                    anchor_evm_tag: a.anchor_evm_tag,
+                    anchor_zisk: a.anchor_zisk,
+                    bridge_program: a
+                        .bridge_program
+                        .unwrap_or_else(vkey::default_bridge_program),
+                    elf_sha256: a.elf_sha256,
+                    program_vk: a.program_vk,
+                    genesis_sha256: a.genesis_sha256,
+                    registry_keypair: a.registry_keypair,
+                    payer_keypair: a.payer_keypair,
+                    activation_slot: a.activation_slot,
+                    activation_delay_slots: a.activation_delay_slots,
+                    anchor_guest_tag: a.anchor_guest_tag,
+                    move_pending_activation: a.move_pending_activation,
+                },
+                mode,
+            )
+            .await
+        }
+        Command::DepositQueue(DepositQueueCommand::Init(a)) => {
+            deposit_queue::init(
+                chain,
+                deposit_queue::InitRequest {
+                    settlement: a.settlement,
+                    bridge: a.bridge,
+                    chain_id: a.chain_id,
+                    authority_keypair: a.authority_keypair,
+                    flags: a.params.into(),
+                },
+                mode,
+            )
+            .await
+        }
+        Command::DepositQueue(DepositQueueCommand::Propose(a)) => {
+            deposit_queue::propose(
+                chain,
+                deposit_queue::ProposeRequest {
+                    settlement: a.settlement,
+                    bridge: a.bridge,
+                    chain_id: a.chain_id,
+                    authority_keypair: a.authority_keypair,
+                    flags: a.params.into(),
+                    activation_slot: a.activation_slot,
+                    activation_delay_slots: a.activation_delay_slots,
+                },
+                mode,
+            )
+            .await
+        }
+        Command::DepositQueue(DepositQueueCommand::Activate(a)) => {
+            deposit_queue::activate(
+                chain,
+                deposit_queue::ActivateRequest {
+                    settlement: a.settlement,
+                    bridge: a.bridge,
+                    chain_id: a.chain_id,
+                    payer_keypair: a.payer_keypair,
+                },
+                mode,
+            )
+            .await
+        }
+        Command::DepositQueue(DepositQueueCommand::Show(a)) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            deposit_queue::show(chain, &a.settlement, &a.bridge, a.chain_id, now).await
+        }
+        Command::CloseDeposit(a) => {
+            deposit_queue::close_deposit(
+                chain,
+                deposit_queue::CloseDepositRequest {
+                    settlement: a.settlement,
+                    bridge: a.bridge,
+                    chain_id: a.chain_id,
+                    index: a.index,
+                    payer_keypair: a.payer_keypair,
+                },
+                mode,
+            )
+            .await
+        }
+        Command::BridgeConfig(BridgeConfigCommand::Init(a)) => {
+            bridge_config::init(
+                chain,
+                bridge_config::InitRequest {
+                    bridge: a.bridge,
+                    settlement: a.settlement,
+                    inbox: a.inbox,
+                    authority_keypair: a.authority_keypair,
+                },
+                mode,
+            )
+            .await
+        }
+        Command::BridgeConfig(BridgeConfigCommand::Show(a)) => {
+            bridge_config::show(chain, &a.bridge).await
+        }
         Command::Deposit(a) => {
             bridge::deposit(
                 chain,
@@ -586,7 +1045,10 @@ pub async fn run(args: Vec<String>) -> i32 {
     let result = if cli.offline {
         execute(&OfflineChain, cli.command, mode).await
     } else {
-        execute(&RpcChain::new(cli.rpc_url), cli.command, mode).await
+        let scan = vkey::RpcScan {
+            url: cli.rpc_url.clone(),
+        };
+        execute_with(&RpcChain::new(cli.rpc_url), &scan, cli.command, mode).await
     };
     match result {
         Ok(report) => {
@@ -865,6 +1327,90 @@ mod tests {
     }
 
     #[test]
+    fn the_deposit_queue_subcommands_parse() {
+        let base = [
+            "--settlement",
+            SETTLEMENT,
+            "--bridge",
+            SETTLEMENT,
+            "--chain-id",
+            "5",
+        ];
+        let with = |head: &[&str], tail: &[&str]| {
+            let mut v: Vec<&str> = head.to_vec();
+            v.extend_from_slice(&base);
+            v.extend_from_slice(tail);
+            parse(&v)
+        };
+        // Every flag is optional but the key, so the defaults apply.
+        let cli = with(&["deposit-queue", "init"], &["--authority-keypair", "k"]).unwrap();
+        assert!(!cli.confirm, "init is a dry run by default");
+        assert!(with(
+            &["deposit-queue", "init"],
+            &[
+                "--authority-keypair",
+                "k",
+                "--deadline-secs",
+                "7200",
+                "--max-per-batch",
+                "128",
+                "--max-per-block",
+                "2",
+                "--min-amount",
+                "5",
+                "--fee-lamports",
+                "9",
+                "--fee-recipient",
+                SETTLEMENT,
+                "--blocks-per-batch",
+                "64",
+            ]
+        )
+        .is_ok());
+        assert!(
+            with(&["deposit-queue", "init"], &[]).is_err(),
+            "the key is required"
+        );
+        assert!(with(
+            &["deposit-queue", "propose"],
+            &[
+                "--authority-keypair",
+                "k",
+                "--activation-delay-slots",
+                "150",
+                "--max-per-block",
+                "2"
+            ]
+        )
+        .is_ok());
+        assert!(with(&["deposit-queue", "activate"], &["--payer-keypair", "k"]).is_ok());
+        assert!(with(&["deposit-queue", "show"], &[]).is_ok());
+        assert!(with(
+            &["close-deposit"],
+            &["--index", "3", "--payer-keypair", "k"]
+        )
+        .is_ok());
+        assert!(
+            with(&["close-deposit"], &["--payer-keypair", "k"]).is_err(),
+            "--index is required"
+        );
+        assert!(parse(&[
+            "bridge-config",
+            "init",
+            "--authority-keypair",
+            "k",
+            "--bridge",
+            SETTLEMENT,
+            "--settlement",
+            SETTLEMENT,
+            "--inbox",
+            SETTLEMENT
+        ])
+        .is_ok());
+        assert!(parse(&["bridge-config", "show", "--bridge", SETTLEMENT]).is_ok());
+    }
+
+    #[test]
     fn the_old_vault_example_names_forward_to_the_vault_subcommands() {
         let renames: &[(&str, &[&str])] = &[
             ("init-vault", &["vault", "init"]),
@@ -947,5 +1493,124 @@ mod tests {
         });
         let err = execute(&chain, cmd, Mode::Dry).await.unwrap_err();
         assert_eq!(err.name, "AuthorityMissing");
+    }
+
+    const REGISTER_ARGS: &[&str] = &[
+        "vkey",
+        "register",
+        "--settlement",
+        SETTLEMENT,
+        "--chain-id",
+        "7",
+        "--genesis",
+        "genesis.json",
+        "--guest-tag",
+        "v0.2.0",
+        "--elf-sha256",
+        "ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12",
+        "--program-vk",
+        "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+        "--registry-keypair",
+        "r.json",
+        "--payer-keypair",
+        "p.json",
+    ];
+
+    #[test]
+    fn each_release_gets_its_own_proving_key_directory() {
+        let (k, a) = (PathBuf::from("/keys/131"), PathBuf::from("/keys/120"));
+        let same = proving_key_dirs("1.3.1-alpha", k.clone(), None, None).unwrap();
+        assert_eq!(same.len(), 1);
+        assert_eq!(same["1.3.1-alpha"], k);
+        let two = proving_key_dirs(
+            "1.3.1-alpha",
+            k.clone(),
+            Some("1.2.0-alpha"),
+            Some(a.clone()),
+        )
+        .unwrap();
+        assert_eq!(two["1.3.1-alpha"], k);
+        assert_eq!(
+            two["1.2.0-alpha"], a,
+            "the anchor release mounts its own keys"
+        );
+        // Another anchor release with no directory: the map has no entry, and the register refuses by name.
+        let none = proving_key_dirs("1.3.1-alpha", k.clone(), Some("1.2.0-alpha"), None).unwrap();
+        assert!(!none.contains_key("1.2.0-alpha"));
+        // An anchor directory for the same release would hand the image the wrong keys for it.
+        for anchor in [None, Some("1.3.1-alpha")] {
+            let e =
+                proving_key_dirs("1.3.1-alpha", k.clone(), anchor, Some(a.clone())).unwrap_err();
+            assert_eq!(e.name, "AnchorProvingKeyDirUnused", "{e}");
+        }
+    }
+
+    #[test]
+    fn vkey_register_defaults_the_node_tag_to_the_current_release() {
+        let mut with = REGISTER_ARGS.to_vec();
+        with.extend(["--zisk", "1.3.1-alpha"]);
+        match parse(&with).unwrap().command {
+            Command::Vkey(VkeyCommand::Register(a)) => assert_eq!(a.evm_tag, "v0.3.0"),
+            other => panic!("expected vkey register, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vkey_register_needs_the_zisk_release() {
+        let e = parse(REGISTER_ARGS).unwrap_err();
+        assert_eq!(e.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        assert!(e.to_string().contains("--zisk"), "{e}");
+        let mut with = REGISTER_ARGS.to_vec();
+        with.extend(["--zisk", "1.3.1-alpha", "--anchor-zisk", "1.2.0-alpha"]);
+        match parse(&with).unwrap().command {
+            Command::Vkey(VkeyCommand::Register(a)) => {
+                assert_eq!(a.zisk, "1.3.1-alpha");
+                assert_eq!(a.anchor_zisk.as_deref(), Some("1.2.0-alpha"));
+            }
+            other => panic!("expected vkey register, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vkey_retire_version_takes_a_release_and_both_keys_and_is_a_dry_run_by_default() {
+        let cli = parse(&[
+            "vkey",
+            "retire-version",
+            "--settlement",
+            SETTLEMENT,
+            "--zisk",
+            "1.2.0-alpha",
+            "--registry-keypair",
+            "r.json",
+            "--payer-keypair",
+            "p.json",
+        ])
+        .unwrap();
+        assert!(!cli.confirm);
+        match cli.command {
+            Command::Vkey(VkeyCommand::RetireVersion(a)) => assert_eq!(a.zisk, "1.2.0-alpha"),
+            other => panic!("expected vkey retire-version, got {other:?}"),
+        }
+        assert!(parse(&["vkey", "retire-version", "--settlement", SETTLEMENT]).is_err());
+    }
+
+    #[tokio::test]
+    async fn retire_version_refuses_an_unreadable_key_file_by_name() {
+        let chain = crate::commands::fake::FakeChain::default();
+        let cli = parse(&[
+            "vkey",
+            "retire-version",
+            "--settlement",
+            SETTLEMENT,
+            "--zisk",
+            "1.2.0-alpha",
+            "--registry-keypair",
+            "/nonexistent/r.json",
+            "--payer-keypair",
+            "/nonexistent/p.json",
+        ])
+        .unwrap();
+        let e = execute(&chain, cli.command, Mode::Dry).await.unwrap_err();
+        assert_eq!(e.name, "KeypairUnreadable");
     }
 }

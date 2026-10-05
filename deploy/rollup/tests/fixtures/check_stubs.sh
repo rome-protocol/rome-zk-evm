@@ -9,12 +9,12 @@ set_world() { # healthy by default; callers overwrite single files
   echo 95 > "$S/ver_block"; echo 0 > "$S/ver_step"
   echo 500 > "$S/idle_ticks"; echo 0 > "$S/idle_step"
   echo 3 > "$S/oldest_age"
-  echo 7 > "$S/cursor_next"; echo 5 > "$S/root_final"
+  echo 7 > "$S/cursor_next"; echo 5 > "$S/root_final"; echo 2 > "$S/cursor_version"
   echo 0 > "$S/prover_behind"; echo 12 > "$S/prover_lag"
   echo 0 > "$S/ver_peers"
   echo 700 > "$S/sealed_total"; echo 0 > "$S/sealed_step"; echo 40 > "$S/finalized_total"; echo 0 > "$S/finalized_step"
   echo 5000000000 > "$S/payer_lamports"
-  rm -f "$S/chain_status" "$S/chain_status_fail" "$S/exit_config_fail"
+  rm -f "$S/chain_status" "$S/chain_status_fail" "$S/exit_config_fail" "$S/exit_config" "$S/deposit_queue" "$S/deposit_queue_fail" "$S/vkey_show" "$S/vkey_show_fail" "$S/vault_show" "$S/vault_show_fail"
 }
 
 make_stubs() {
@@ -47,16 +47,18 @@ case "\$url" in
       printf '{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":%s}}\n' "\$v"; exit 0
     fi
     case "\$pk" in
-      CursorPdaFixture*) kind=cursor; val="\$(cat "\$S/cursor_next")" ;;
+      CursorPdaFixture*) kind=cursor; val="\$(cat "\$S/cursor_next")"; ver="\$(cat "\$S/cursor_version")" ;;
       RootPdaFixture*) kind=root; val="\$(cat "\$S/root_final")" ;;
       *) exit 1 ;;
     esac
     [[ "\$val" == missing ]] && { echo '{"jsonrpc":"2.0","id":1,"result":{"value":null}}'; exit 0; }
-    python3 - "\$kind" "\$val" <<'PY'
+    python3 - "\$kind" "\$val" "\${ver:-1}" <<'PY'
 import sys, base64, struct
-kind, val = sys.argv[1], int(sys.argv[2])
+kind, val, ver = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 length, off = (21, 13) if kind == "cursor" else (202, 186)
+if kind == "cursor" and ver == 2: length = 69   # the deposit-aware cursor
 d = bytearray(length); struct.pack_into("<Q", d, off, val)
+if kind == "cursor": d[4] = ver
 print('{"jsonrpc":"2.0","id":1,"result":{"value":{"data":["%s","base64"]}}}' % base64.b64encode(bytes(d)).decode())
 PY
     ;;

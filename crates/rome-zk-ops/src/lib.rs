@@ -1,5 +1,5 @@
 //! `rome-zk-ops`: the operator CLI. Settlement commands: `chain-id`, `register`, `refund-deposit`,
-//! `exit-config propose|activate|show`, `migrate` and `init-cursor`.
+//! `exit-config propose|activate|show`, `migrate`, `init-cursor` and `vkey register|show`.
 //!
 //! Three rules hold for every command:
 //!
@@ -19,7 +19,9 @@ pub mod chain;
 pub mod cli;
 pub mod commands;
 pub mod error;
+pub mod genesis;
 pub mod keys;
+pub mod rebuild;
 pub mod render;
 
 pub use error::{Mode, OpsError, Report};

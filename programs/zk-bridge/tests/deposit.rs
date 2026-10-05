@@ -158,6 +158,15 @@ fn queue_account(settlement: &Pubkey, chain_id: u64, count: u64, head: [u8; 32])
     owned(bridge_program_id(), d)
 }
 
+/// The chain's root with `head_pending_batch` set to `head`: 0 for a chain that never posted, 1 or more for one
+/// that has.
+fn root_with_head(chain_id: u64, authority: &Pubkey, owner: Pubkey, head: u64) -> Account {
+    let mut a = rome_zk_testkit::root_account_with_authority(chain_id, authority, owner);
+    let o = rome_zk_layouts::root::OFF_HEAD_PENDING_BATCH;
+    a.data[o..o + 8].copy_from_slice(&head.to_le_bytes());
+    a
+}
+
 fn registry_account(chain_id: u64, inbox: &Pubkey, owner: Pubkey) -> Account {
     use rome_zk_layouts::registry as r;
     let mut d = vec![0u8; r::REGISTRY_LEN];
@@ -273,7 +282,7 @@ impl Rig {
         );
         self.put(
             rome_zk_layouts::root::pda(sp, chain_id).0,
-            rome_zk_testkit::root_account_with_authority(chain_id, &authority, *sp),
+            root_with_head(chain_id, &authority, *sp, 1),
         );
         self.put(
             rome_zk_layouts::registry::pda(sp, chain_id).0,
@@ -676,6 +685,62 @@ async fn deposit_refuses_a_root_at_another_address() {
     let mut ix = rig.deposit_ix(0, 0, 5_000, [0x42; 20]);
     ix.accounts[D_ROOT] = AccountMeta::new_readonly(other_root, false);
     rig.deposit_refused(0, ix, BridgeError::RootNotCanonical)
+        .await;
+}
+
+/// A chain whose root has never taken a posted batch can be reclaimed by anyone, so it takes no deposits, even
+/// when everything else about it is valid and a queue is already in place.
+#[tokio::test]
+async fn deposit_refuses_a_chain_that_never_posted() {
+    let mut rig = Rig::new();
+    let root_key = rome_zk_layouts::root::pda(&settlement_program_id(), CHAIN_ID).0;
+    rig.put(
+        root_key,
+        root_with_head(CHAIN_ID, &Pubkey::new_unique(), settlement_program_id(), 0),
+    );
+    let ix = rig.deposit_ix(0, 0, 5_000, [0x42; 20]);
+    rig.deposit_refused(0, ix, BridgeError::ChainNeverPosted)
+        .await;
+}
+
+/// A chain that has posted takes deposits, at any later head.
+#[tokio::test]
+async fn deposit_accepts_a_chain_that_has_posted() {
+    let mut rig = Rig::new();
+    let root_key = rome_zk_layouts::root::pda(&settlement_program_id(), CHAIN_ID).0;
+    rig.put(
+        root_key,
+        root_with_head(CHAIN_ID, &Pubkey::new_unique(), settlement_program_id(), 9),
+    );
+    let mut ctx = rig.start().await;
+    let ix = rig.deposit_ix(0, 0, 5_000, [0x42; 20]);
+    rig.send(&mut ctx, ix, Some(0), "Deposit (chain at batch 9)")
+        .await
+        .expect("a chain that has posted takes deposits");
+}
+
+/// A registry that names another inbox is refused at Deposit, as at CloseDeposit and InitDepositQueue: the
+/// re-registration of a reclaimed id, with an inbox of the registrant's choosing, takes no deposits.
+#[tokio::test]
+async fn deposit_refuses_a_registry_naming_another_inbox() {
+    let mut rig = Rig::new();
+    let key = rome_zk_layouts::registry::pda(&settlement_program_id(), CHAIN_ID).0;
+    rig.put(
+        key,
+        registry_account(CHAIN_ID, &Pubkey::new_unique(), settlement_program_id()),
+    );
+    let ix = rig.deposit_ix(0, 0, 5_000, [0x42; 20]);
+    rig.deposit_refused(0, ix, BridgeError::WrongInboxProgram)
+        .await;
+}
+
+#[tokio::test]
+async fn deposit_refuses_a_missing_bridge_config() {
+    let mut rig = Rig::new();
+    let key = bridge_config::pda(&bridge_program_id()).0;
+    rig.put(key, funded_account(0));
+    let ix = rig.deposit_ix(0, 0, 5_000, [0x42; 20]);
+    rig.deposit_refused(0, ix, BridgeError::WrongBridgeConfig)
         .await;
 }
 

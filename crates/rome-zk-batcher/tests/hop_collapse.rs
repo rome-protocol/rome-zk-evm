@@ -132,13 +132,15 @@ async fn finalize_and_decode(
     );
     assert!(!decoded.finalized, "must not already be finalized");
 
-    let finalize_ix = zk_inbox_client::finalize_batch_ix(
+    let finalize_ix = zk_inbox_client::finalize_batch_v2_ix(
         &program_id,
         &payer.pubkey(),
         &settlement_program,
         chain_id,
         batch,
         0,
+        0,
+        None,
     );
     send(ctx, &[finalize_ix], payer)
         .await

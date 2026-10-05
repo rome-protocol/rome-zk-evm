@@ -4,6 +4,8 @@
 
 pub mod expected;
 
+pub use veritas::VerifyingKey;
+
 use std::path::PathBuf;
 
 pub type W = [u8; 32];
@@ -138,14 +140,37 @@ fn arr<const N: usize>(v: &[u8]) -> [u8; N] {
 }
 
 pub fn calldata(file: &'static str, name: &'static str) -> Fixture {
-    let doc = std::fs::read_to_string(fixture_path(&format!("s10/{file}"))).expect("read calldata");
+    calldata_at(&format!("s10/{file}"), name)
+}
+
+/// One of the per-release fixtures: the same three blocks proven with each ZisK release.
+pub fn release_fixture(release: &str, block: u32) -> Fixture {
+    calldata_at(
+        &format!("zisk-releases/zisk-{release}/block{block}.json"),
+        "release block",
+    )
+}
+
+pub const RELEASE_BLOCKS: [u32; 3] = [14, 166, 169];
+
+fn calldata_at(rel: &str, name: &'static str) -> Fixture {
+    let doc = std::fs::read_to_string(fixture_path(rel)).expect("read calldata");
+    let program_vk: [u8; 32] = arr(&hex_to_bytes(&json_str(&doc, "programVK")));
+    let rootc: [u8; 32] = arr(&hex_to_bytes(&json_str(&doc, "rootCVadcopFinal")));
+    let public_values: [u8; 512] = arr(&hex_to_bytes(&json_str(&doc, "publicValues")));
+    // The per-release files carry no `publicSignal`; it is worked out from the other three fields.
+    let signal = if doc.contains("\"publicSignal\"") {
+        arr(&hex_to_bytes(&json_str(&doc, "publicSignal")))
+    } else {
+        veritas::zisk_public_signal(&program_vk, &public_values, &rootc)
+    };
     Fixture {
         name,
         proof: arr(&hex_to_bytes(&json_str(&doc, "proofBytes"))),
-        program_vk: arr(&hex_to_bytes(&json_str(&doc, "programVK"))),
-        rootc: arr(&hex_to_bytes(&json_str(&doc, "rootCVadcopFinal"))),
-        public_values: arr(&hex_to_bytes(&json_str(&doc, "publicValues"))),
-        signal: arr(&hex_to_bytes(&json_str(&doc, "publicSignal"))),
+        program_vk,
+        rootc,
+        public_values,
+        signal,
     }
 }
 
@@ -456,8 +481,8 @@ fn keccak_mod_r(parts: &[&[u8]]) -> W {
     reduce_mod(&solana_program::keccak::hashv(parts).to_bytes(), &R)
 }
 
-pub fn challenges(proof: &[u8; 768], signal: &W) -> Chal {
-    let beta = keccak_mod_r(&[&veritas::vk::COMMITMENTS, signal, &proof[0..192]]);
+pub fn challenges(key: &VerifyingKey, proof: &[u8; 768], signal: &W) -> Chal {
+    let beta = keccak_mod_r(&[key.commitments(), signal, &proof[0..192]]);
     let gamma = keccak_mod_r(&[&beta]);
     let alpha = keccak_mod_r(&[&beta, &gamma, &proof[192..256]]);
     let zeta = keccak_mod_r(&[&alpha, &proof[256..448]]);
@@ -491,8 +516,8 @@ pub fn lagrange_1(zeta: &W) -> W {
 }
 
 /// The scalar of [z]_1 in step 9 of spec section 7, for the evaluations in `proof` (words 18 to 23).
-pub fn z_coefficient(proof: &[u8; 768], signal: &W) -> W {
-    let c = challenges(proof, signal);
+pub fn z_coefficient(key: &VerifyingKey, proof: &[u8; 768], signal: &W) -> W {
+    let c = challenges(key, proof, signal);
     let (a, b, cc) = (word_of(proof, 18), word_of(proof, 19), word_of(proof, 20));
     let bz = mul_mod(&c.beta, &c.zeta, &R);
     let k = |k: u8| mul_mod(&bz, &small(k), &R);
@@ -518,8 +543,8 @@ fn word_of(buf: &[u8], i: usize) -> W {
 /// Sets proof word 18 (a-bar) so that the scalar of [z]_1 in step 9 is exactly zero, and returns it.
 /// The challenges do not depend on a-bar (spec section 6), so the equation is linear in it:
 /// (a + beta zeta + gamma) F2 F3 alpha = -(L_1 alpha^2 + u).
-pub fn make_z_coefficient_zero(proof: &mut [u8; 768], signal: &W) {
-    let c = challenges(proof, signal);
+pub fn make_z_coefficient_zero(key: &VerifyingKey, proof: &mut [u8; 768], signal: &W) {
+    let c = challenges(key, proof, signal);
     let (b, cc) = (word_of(proof, 19), word_of(proof, 20));
     let bz = mul_mod(&c.beta, &c.zeta, &R);
     let f = |e: &W, mult: u8| {
@@ -541,14 +566,14 @@ pub fn make_z_coefficient_zero(proof: &mut [u8; 768], signal: &W) {
     let f1 = mul_mod(&rhs, &inv_mod(&denom, &R), &R);
     let a = sub_mod(&sub_mod(&f1, &bz, &R), &c.gamma, &R);
     proof[18 * 32..19 * 32].copy_from_slice(&a);
-    assert_eq!(z_coefficient(proof, signal), [0u8; 32]);
+    assert_eq!(z_coefficient(key, proof, signal), [0u8; 32]);
 }
 
 /// [D]_1 of step 9, computed in the test with the solana-bn254 group operations, for a proof whose nine
 /// points are on the curve. It pins the test's scalars (including the z-coefficient) to the library's.
-pub fn d_by_hand(proof: &[u8; 768], signal: &W) -> [u8; 64] {
+pub fn d_by_hand(key: &VerifyingKey, proof: &[u8; 768], signal: &W) -> [u8; 64] {
     use solana_bn254::prelude::{alt_bn128_g1_addition_be, alt_bn128_g1_multiplication_be};
-    let c = challenges(proof, signal);
+    let c = challenges(key, proof, signal);
     let ev = |i: usize| word_of(proof, i);
     let (a, b, cc, s1, s2, zw) = (ev(18), ev(19), ev(20), ev(21), ev(22), ev(23));
     let t1 = add_mod(&add_mod(&a, &mul_mod(&c.beta, &s1, &R), &R), &c.gamma, &R);
@@ -563,17 +588,17 @@ pub fn d_by_hand(proof: &[u8; 768], signal: &W) -> [u8; 64] {
     let zh_zn = mul_mod(&zh, &zn, &R);
     let zh_z2n = mul_mod(&zh_zn, &zn, &R);
     let terms: [(&[u8], W); 9] = [
-        (&veritas::vk::Q_M, mul_mod(&a, &b, &R)),
-        (&veritas::vk::Q_L, a),
-        (&veritas::vk::Q_R, b),
-        (&veritas::vk::Q_O, cc),
-        (&proof[192..256], z_coefficient(proof, signal)),
-        (&veritas::vk::S_SIGMA_3, coef_s3),
+        (key.q_m(), mul_mod(&a, &b, &R)),
+        (key.q_l(), a),
+        (key.q_r(), b),
+        (key.q_o(), cc),
+        (&proof[192..256], z_coefficient(key, proof, signal)),
+        (key.s_sigma_3(), coef_s3),
         (&proof[256..320], neg_mod(&zh, &R)),
         (&proof[320..384], neg_mod(&zh_zn, &R)),
         (&proof[384..448], neg_mod(&zh_z2n, &R)),
     ];
-    let mut d = veritas::vk::Q_C;
+    let mut d = *key.q_c();
     for (point, scalar) in terms {
         let mut mi = [0u8; 96];
         mi[..64].copy_from_slice(point);

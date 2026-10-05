@@ -16,6 +16,7 @@
 //! (previously the caller/payer — forward-looking bookkeeping that was never enforced by anything). See
 //! the crate README's "Fund-safety invariants".
 
+use crate::bridge_config;
 use crate::errors::BridgeError;
 use crate::instruction::InitVaultArgs;
 use crate::state::{vault_authority_pda, vault_config, vault_config_pda, vault_token_pda};
@@ -33,7 +34,7 @@ use solana_system_interface::program as system_program;
 /// accounts: `[payer (signer, writable), vault_config (writable, NEW), mint (read-only), vault_token
 /// (writable, NEW), vault_authority (read-only, PDA), chain_authority (signer — must equal the settlement
 /// `root.authority` for `args.chain_id`), root (read-only — the settlement `["root", chain_id]` PDA, owned
-/// by `args.settlement_program`), token_program, system_program]`.
+/// by `args.settlement_program`), token_program, system_program, bridge_config (read-only)]`.
 pub fn init_vault(
     program_id: &Pubkey,
     it: &mut std::slice::Iter<AccountInfo>,
@@ -48,6 +49,7 @@ pub fn init_vault(
     let root_acc = next_account_info(it)?;
     let token_program_acc = next_account_info(it)?;
     let sys = next_account_info(it)?;
+    let config_acc = next_account_info(it)?;
 
     if !payer.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -57,6 +59,11 @@ pub fn init_vault(
     }
     if *token_program_acc.key != crate::token::TOKEN_PROGRAM_ID {
         return Err(ProgramError::IncorrectProgramId);
+    }
+    // Only the bridge config's settlement program gets a vault.
+    let config = bridge_config::load(program_id, config_acc)?;
+    if args.settlement_program.to_bytes() != config.settlement_program {
+        return Err(BridgeError::WrongSettlementProgram.into());
     }
     if args.mint_decimals > 18 {
         return Err(BridgeError::InvalidMintDecimals.into());

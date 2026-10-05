@@ -90,7 +90,8 @@ pub enum BridgeIx {
     /// (writable, NEW, PDA-owned by the SPL Token program), vault_authority (read-only, PDA, never holds
     /// data), chain_authority (signer — must equal the settlement `root.authority` for `chain_id`), root
     /// (read-only — the settlement `["root", chain_id]` PDA, owned by `settlement_program`), token_program,
-    /// system_program]`. Gated by the settlement chain authority — see `init_vault.rs`'s module doc.
+    /// system_program, bridge_config (read-only — must name `settlement_program`)]`. Gated by the settlement
+    /// chain authority — see `init_vault.rs`'s module doc.
     InitVault(InitVaultArgs),
     /// accounts: `[funder (signer), funder_token_account (writable), vault_config (read-only),
     /// vault_token (writable), token_program]`. Permissionless.
@@ -98,14 +99,16 @@ pub enum BridgeIx {
     /// accounts: `[vault_config (read-only), exit_config (read-only), exit_record (writable),
     /// exit_consumer (read-only — this program's own `["exit_consumer", chain_id]` PDA, CPI-signed),
     /// settlement_program (read-only, executable), payer_refund (writable), vault_token (writable),
-    /// vault_authority (read-only), recipient_ata (writable), token_program]`. Permissionless — funds
+    /// vault_authority (read-only), recipient_ata (writable), token_program, bridge_config (read-only — must
+    /// name the vault's settlement program)]`. Permissionless — funds
     /// always land at `record.sol_recipient`'s ATA regardless of who submits the transaction.
     ReleaseExit(ReleaseExitArgs),
     /// accounts: `[depositor (signer, writable), depositor_token (writable), vault_config (read-only),
     /// vault_token (writable), deposit_queue (writable), deposit_record (writable, NEW), exit_config
     /// (read-only, at the chain's settlement program), fee_recipient (writable), token_program,
     /// system_program, root (read-only, at the chain's settlement program), registry (read-only, at the
-    /// chain's settlement program)]`. Permissionless: the depositor's own signature moves the tokens.
+    /// chain's settlement program), bridge_config (read-only — must name the chain's settlement program and
+    /// the registry's inbox)]`. Permissionless: the depositor's own signature moves the tokens.
     Deposit(DepositArgs),
     /// accounts: `[payer (signer, writable), authority (signer — the bridge program's upgrade authority),
     /// bridge_config (writable, NEW, the `["bridge_config"]` PDA), program_data (read-only — this program's

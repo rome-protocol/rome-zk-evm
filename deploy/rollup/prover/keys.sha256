@@ -1,14 +1,14 @@
-# Pinned aggregate sha256 of the ZisK 1.2.0-alpha proving keys that Rome's proofs were made with: provingKey (about 53.7 GB)
-# and provingKeySnark (about 27.0 GB). check-keys.sh checks them against this file before every prover start; see its
-# header for the format and the hash recipe. File names are sorted bytewise (LC_ALL=C), so a pin does not depend on the
-# locale of the host that checks it.
+# Pinned aggregate sha256 of the ZisK 1.3.1-alpha proving keys that Rome's proofs are made with: provingKey (about 15.8 GB
+# unpacked, 5.1 GB compressed) and provingKeySnark (about 26.2 GB unpacked, 21.9 GB compressed). check-keys.sh checks them
+# against this file before every prover start; see its header for the format and the hash recipe. File names are sorted
+# bytewise (LC_ALL=C), so a pin does not depend on the locale of the host that checks it.
 #
-# The *.consttree files under provingKey are not hashed. ziskup generates them on the host when it installs the key (a
-# GPU install writes them its own way), so they are left out of the hash; each proof's local verify still uses them.
+# The *.consttree files are not hashed. ziskup generates them on the host when it installs the key (a GPU install
+# writes them its own way), so they are left out of the hash; each proof's local verify still uses them.
 #
-# These are the keys that `ziskup -v 1.2.0-alpha --provingkey` and `ziskup setup_snark` install (see docs/PROVER-HOST.md).
+# These are the keys that `ziskup -v 1.3.1-alpha --provingkey` and `ziskup setup_snark` install (see docs/PROVER-HOST.md).
 # A different ZisK release has different keys: do not re-pin to make a mismatch go away, install the release this file was
 # made for. Pin a key set of your own, on purpose, with:
 #   ZISK_HOME=<where the keys are> MANIFEST=./prover/keys.sha256 bash ./prover/check-keys.sh --write
-7200c160f249ce49ab16ec00fa566210b6ec24ecc407ed402e4241e739c113b4  provingKey
-71056920ca412beed123096ebfcd764159534cf8f182b5832ec0f563fb56e912  provingKeySnark
+46602f3d41139d8e8f0f73bf59c17310061b47a74e75c919495de6d0897c343d  provingKey
+ebbc9dd8928c9ac0779721f0404ccb577fe1c7604dba5259a207bdc265f2de54  provingKeySnark

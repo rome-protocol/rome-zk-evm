@@ -7,22 +7,32 @@ use solana_program::program_error::ProgramError;
 mod field;
 mod g1;
 mod verify;
+pub mod versions;
 pub mod vk;
+
+pub use versions::{zisk_version, Status, ZiskVersion};
+pub use vk::VerifyingKey;
 
 /// Length of `verify_zisk`'s input: the ABI of specification section 1.5.
 pub const ZISK_ABI_LEN: usize = 1344;
 /// Length of `verify`'s input: the proof followed by the public signal.
 pub const VERIFY_LEN: usize = 800;
 
-/// Verifies a proof in the 1,344-byte ABI of section 1.5: proof, `programVK`, `rootCVadcopFinal`,
-/// `publicValues`. `Ok(true)` accepts, `Ok(false)` rejects, and `InvalidInstructionData` means the
-/// input is malformed (section 5).
-pub fn verify_zisk(data: &[u8]) -> Result<bool, ProgramError> {
+/// Verifies a proof of one ZisK release, given in the 1,344-byte ABI of section 1.5: proof, `programVK`,
+/// `rootCVadcopFinal`, `publicValues`. `Ok(true)` accepts, `Ok(false)` rejects, and `InvalidInstructionData`
+/// means the input is malformed (section 5). A proof whose `rootCVadcopFinal` is not the release's pinned
+/// one is rejected before anything is hashed. A release without a key (withdrawn, in a production build)
+/// gives `InvalidArgument`.
+pub fn verify_zisk(version: &ZiskVersion, data: &[u8]) -> Result<bool, ProgramError> {
     if data.len() != ZISK_ABI_LEN {
         return Err(ProgramError::InvalidInstructionData);
     }
+    let key = version.key.as_ref().ok_or(ProgramError::InvalidArgument)?;
+    if data[800..832] != version.root_c {
+        return Ok(false);
+    }
     let signal = zisk_public_signal(&data[768..800], &data[832..1344], &data[800..832]);
-    Ok(verify::run(&data[..768], &signal)?.accepted)
+    Ok(verify::run(key, &data[..768], &signal)?.accepted)
 }
 
 /// The public signal of section 1.5: SHA-256 of `programVK || publicValues || rootCVadcopFinal`,
@@ -32,12 +42,12 @@ pub fn zisk_public_signal(program_vk: &[u8], public_values: &[u8], rootc: &[u8])
     Fr::reduce_be_bytes(&digest).to_be_bytes()
 }
 
-/// Verifies a proof given as 768 proof bytes followed by the 32-byte public signal.
-pub fn verify(data: &[u8]) -> Result<bool, ProgramError> {
+/// Verifies a proof under `key`, given as 768 proof bytes followed by the 32-byte public signal.
+pub fn verify(key: &VerifyingKey, data: &[u8]) -> Result<bool, ProgramError> {
     if data.len() != VERIFY_LEN {
         return Err(ProgramError::InvalidInstructionData);
     }
-    Ok(verify::run(&data[..768], &data[768..])?.accepted)
+    Ok(verify::run(key, &data[..768], &data[768..])?.accepted)
 }
 
 /// Every intermediate value of one verification (specification sections 6, 7 and 9.3). For tests.
@@ -65,15 +75,16 @@ pub struct Trace {
 }
 
 #[doc(hidden)]
-pub fn trace(proof: &[u8], signal: &[u8]) -> Result<Trace, ProgramError> {
-    verify::run(proof, signal)
+pub fn trace(key: &VerifyingKey, proof: &[u8], signal: &[u8]) -> Result<Trace, ProgramError> {
+    verify::run(key, proof, signal)
 }
 
 #[cfg(not(feature = "no-entrypoint"))]
 mod entrypoint {
-    //! The program instruction of specification section 1.4: the instruction data is the 1,344-byte
-    //! ABI; accounts and the program id are ignored; success is exactly `verify_zisk` returning
-    //! `Ok(true)`; REJECT and MALFORMED both fail with `InvalidInstructionData`.
+    //! The program instruction of specification section 1.4: the instruction data is one release byte (the
+    //! registry's scheme byte) followed by the 1,344-byte ABI; accounts and the program id are ignored;
+    //! success is exactly `verify_zisk` returning `Ok(true)` under that release; REJECT, MALFORMED and an
+    //! unknown release all fail with `InvalidInstructionData`.
     use solana_program::{
         account_info::AccountInfo, entrypoint, entrypoint::ProgramResult,
         program_error::ProgramError, pubkey::Pubkey,
@@ -86,7 +97,13 @@ mod entrypoint {
         _accounts: &[AccountInfo],
         data: &[u8],
     ) -> ProgramResult {
-        match super::verify_zisk(data) {
+        let Some((&scheme, abi)) = data.split_first() else {
+            return Err(ProgramError::InvalidInstructionData);
+        };
+        let Some(version) = super::zisk_version(scheme) else {
+            return Err(ProgramError::InvalidInstructionData);
+        };
+        match super::verify_zisk(version, abi) {
             Ok(true) => Ok(()),
             Ok(false) | Err(_) => Err(ProgramError::InvalidInstructionData),
         }

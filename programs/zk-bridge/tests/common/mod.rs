@@ -38,6 +38,31 @@ pub fn associated_token_program_id() -> Pubkey {
     zk_bridge::token::ASSOCIATED_TOKEN_PROGRAM_ID
 }
 
+/// The bridge's `["bridge_config"]` address.
+pub fn bridge_config_pda() -> Pubkey {
+    rome_zk_layouts::deposit_queue::bridge_config::pda(&bridge_program_id()).0
+}
+
+/// The bridge config, owned by the bridge, naming `settlement` as the canonical settlement program.
+pub fn bridge_config_account(settlement: Pubkey) -> Account {
+    use rome_zk_layouts::deposit_queue::bridge_config;
+    let mut d = vec![0u8; bridge_config::LEN];
+    bridge_config::write(
+        &mut d,
+        &bridge_config::BridgeConfigFields {
+            settlement_program: settlement.to_bytes(),
+            inbox_program: rome_zk_testkit::fixed_inbox_program_id().to_bytes(),
+        },
+    );
+    Account {
+        lamports: rome_zk_testkit::rent_exempt(d.len()),
+        data: d,
+        owner: bridge_program_id(),
+        executable: false,
+        rent_epoch: 0,
+    }
+}
+
 pub fn funded_account(lamports: u64) -> Account {
     Account {
         lamports,
@@ -103,7 +128,21 @@ pub fn decode_token_amount(d: &[u8]) -> u64 {
 /// Associated Token Account program (`release_exit.rs`'s idempotent-create test CPIs it for
 /// real; every other test simply never references it). Callers add whatever accounts their test needs
 /// before `start_with_context`.
+///
+/// The bridge config is in place, naming `settlement_program_id()` as the canonical settlement program: every
+/// instruction under test here that takes the config (`InitVault`, `ReleaseExit`) reads it. A test that needs
+/// another config adds its own account at `bridge_config_pda()`, which replaces this one.
 pub fn base_program_test() -> solana_program_test::ProgramTest {
+    let mut pt = base_program_test_without_config();
+    pt.add_account(
+        bridge_config_pda(),
+        bridge_config_account(settlement_program_id()),
+    );
+    pt
+}
+
+/// [`base_program_test`] without the bridge config account.
+pub fn base_program_test_without_config() -> solana_program_test::ProgramTest {
     rome_zk_testkit::program_test(
         &[
             rome_zk_testkit::ProgramSpec::new("zk_bridge", bridge_program_id()),

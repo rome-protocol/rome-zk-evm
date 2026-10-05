@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 const PROGRAM: Pubkey = Pubkey::new_from_array([9u8; 32]);
 const SETTLEMENT_PROGRAM: Pubkey = Pubkey::new_from_array([7u8; 32]);
+const BRIDGE_PROGRAM: Pubkey = Pubkey::new_from_array([5u8; 32]);
 const CHAIN_ID: u64 = 200_198;
 
 // ===================== the fake chain (Sender + AccountOps over one shared, mutable state) =====================
@@ -59,12 +60,91 @@ struct Inner {
     /// can hold the failure itself open and control exactly when it lands, instead of it firing on the very
     /// first poll of the batch's own settle task.
     delay_chunk_fail: HashMap<u64, Arc<tokio::sync::Notify>>,
+    /// Accounts of other programs (the exit config, the deposit queue and its records), each with its owner.
+    other_accounts: HashMap<Pubkey, (Vec<u8>, Pubkey)>,
 }
 
 #[derive(Clone, Default)]
 struct FakeChain(Arc<Mutex<Inner>>);
 
 impl FakeChain {
+    /// A chain whose exit config names `BRIDGE_PROGRAM` and whose queue holds one deposit per entry of
+    /// `enqueued_at`, each enqueued at that unix time.
+    fn seed_deposit_queue(&self, max_per_block: u16, deadline_secs: u32, enqueued_at: &[i64]) {
+        use rome_zk_layouts::deposit_queue::{deposit_queue as dq, deposit_record as dr};
+        let mut inner = self.0.lock().unwrap();
+        let exit_config = rome_zk_layouts::exit::exit_config::write(
+            &rome_zk_layouts::exit::exit_config::ExitConfigFields {
+                chain_id: CHAIN_ID,
+                exit_portal: [7; 20],
+                bridge_program: BRIDGE_PROGRAM.to_bytes(),
+                pending_exit_portal: [0; 20],
+                pending_bridge_program: [0; 32],
+                pending_exit_cap: 0,
+                pending_poster_bond: 0,
+                activation_slot: 0,
+                pending_mask: 0,
+            },
+        );
+        inner.other_accounts.insert(
+            zk_inbox_client::exit_config_pda(&SETTLEMENT_PROGRAM, CHAIN_ID).0,
+            (exit_config.to_vec(), SETTLEMENT_PROGRAM),
+        );
+        let mut queue = vec![0u8; dq::LEN];
+        dq::write(
+            &mut queue,
+            &dq::DepositQueueFields {
+                count: enqueued_at.len() as u64,
+                head_hash: [0; 32],
+                params: dq::DepositParams {
+                    inclusion_deadline_secs: deadline_secs,
+                    max_per_batch: 8,
+                    max_per_block,
+                    min_amount: 1,
+                    fee_lamports: 0,
+                    fee_recipient: [0; 32],
+                },
+                pending: dq::DepositParams::default(),
+                activation_slot: 0,
+            },
+        );
+        let sp = SETTLEMENT_PROGRAM.to_bytes();
+        inner.other_accounts.insert(
+            dq::pda(&BRIDGE_PROGRAM, &sp, CHAIN_ID).0,
+            (queue, BRIDGE_PROGRAM),
+        );
+        for (index, ts) in enqueued_at.iter().enumerate() {
+            let mut record = vec![0u8; dr::LEN];
+            dr::write(
+                &mut record,
+                &dr::DepositRecordFields {
+                    index: index as u64,
+                    enqueue_unix_ts: *ts,
+                    sender: [1; 32],
+                    recipient: [2; 20],
+                    amount_gwei: 1,
+                    hash_after: [3; 32],
+                },
+            );
+            inner.other_accounts.insert(
+                dr::pda(&BRIDGE_PROGRAM, &sp, CHAIN_ID, index as u64).0,
+                (record, BRIDGE_PROGRAM),
+            );
+        }
+    }
+
+    /// Puts a pending proposal with `deadline_secs` as its inclusion deadline into the seeded queue.
+    fn seed_pending_deadline(&self, deadline_secs: u32) {
+        use rome_zk_layouts::deposit_queue::deposit_queue as dq;
+        let key = dq::pda(&BRIDGE_PROGRAM, &SETTLEMENT_PROGRAM.to_bytes(), CHAIN_ID).0;
+        let mut inner = self.0.lock().unwrap();
+        let (data, _) = inner.other_accounts.get_mut(&key).expect("a seeded queue");
+        let mut fields = dq::read(data).unwrap();
+        fields.pending.inclusion_deadline_secs = deadline_secs;
+        fields.activation_slot = 1;
+        dq::write(data, &fields);
+    }
+
     fn set_cursor(&self, next_batch: u64) {
         self.0.lock().unwrap().next_batch = next_batch;
     }
@@ -260,6 +340,9 @@ impl AccountOps for FakeChain {
     async fn get_account(&self, pubkey: &Pubkey) -> Result<Option<Vec<u8>>, ResolveError> {
         let (cursor_pda, _) = zk_inbox_client::cursor_pda(&PROGRAM, &SETTLEMENT_PROGRAM, CHAIN_ID);
         let (root_pda, _) = zk_settlement_client::root_pda(&SETTLEMENT_PROGRAM, CHAIN_ID);
+        if let Some((data, _)) = self.0.lock().unwrap().other_accounts.get(pubkey) {
+            return Ok(Some(data.clone()));
+        }
         if *pubkey == cursor_pda {
             let gate = self.0.lock().unwrap().delay_cursor_read.take();
             if let Some(gate) = gate {
@@ -280,6 +363,13 @@ impl AccountOps for FakeChain {
                 .map(|b| self.encode_batch_account(batch, b)));
         }
         Ok(None)
+    }
+
+    async fn get_account_owner(&self, pubkey: &Pubkey) -> Result<Option<Pubkey>, ResolveError> {
+        if let Some((_, owner)) = self.0.lock().unwrap().other_accounts.get(pubkey) {
+            return Ok(Some(*owner));
+        }
+        Ok(self.get_account(pubkey).await?.map(|_| Pubkey::default()))
     }
 
     async fn accounts_exist(&self, pubkeys: &[Pubkey]) -> Result<Vec<bool>, ResolveError> {
@@ -327,7 +417,8 @@ impl Sender for FakeChain {
                             }
                         }
                     }
-                    zk_inbox_client::InboxIx::FinalizeBatch { .. } => {
+                    zk_inbox_client::InboxIx::FinalizeBatch { .. }
+                    | zk_inbox_client::InboxIx::FinalizeBatchV2 { .. } => {
                         let batch_pda = ix.accounts[0].pubkey;
                         if let Some(&batch) = inner.batch_pda_index.get(&batch_pda) {
                             if let Some(gate) = inner.delay_finalize.get(&batch) {
@@ -405,7 +496,8 @@ impl Sender for FakeChain {
                         inner.chunk_sealed_order.push((batch, idx));
                     }
                 }
-                zk_inbox_client::InboxIx::FinalizeBatch { .. } => {
+                zk_inbox_client::InboxIx::FinalizeBatch { .. }
+                | zk_inbox_client::InboxIx::FinalizeBatchV2 { .. } => {
                     let batch_pda = ix.accounts[0].pubkey;
                     if let Some(&batch) = inner.batch_pda_index.get(&batch_pda) {
                         if !inner.batches[&batch].finalized {
@@ -839,6 +931,12 @@ async fn submit_group_re_checks_failed_after_resolve_batch_id_even_when_no_wait_
             "group 1's own OpenBatch still succeeds — its chunk send is configured to fail but is held \
              shut on `chunk_gate` for now, so `self.failed` is still false at this point",
         );
+
+    // Let batch 0's own settle task finish first: its finalize reads the cursor too, and the gate below
+    // must be taken by the third `submit_group`'s read, not by that one.
+    for _ in 0..1_000 {
+        tokio::task::yield_now().await;
+    }
 
     // Gate the NEXT cursor read (the one the third `submit_group`'s own `resolve_batch_id` is about to
     // make) — deterministic control over the exact await point the re-check guards.
@@ -1639,4 +1737,166 @@ async fn submit_group_observes_solana_clock_skew_once_per_opened_batch() {
         .expect("group 1 posts");
     poster.finish().await.expect("both batches settle");
     assert_eq!(metrics.solana_clock_skew_seconds.get_sample_count(), 2);
+}
+
+// ===================== the deposit deadline is checked before OpenBatch =====================
+
+fn wall_clock_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+fn poster_on(chain: &FakeChain) -> WindowedPoster<FakeChain, FakeChain> {
+    WindowedPoster::new(
+        Arc::new(chain.clone()),
+        Arc::new(chain.clone()),
+        Metrics::new(),
+        Arc::new(RecordingSink::default()) as Arc<dyn PostRootSink>,
+        window_config(2),
+        shared_newest_block(10),
+    )
+}
+
+/// A batch that leaves out a deposit already past its inclusion deadline would be refused at finalize, and
+/// could then only be abandoned: it is not opened at all.
+#[tokio::test]
+async fn a_batch_that_the_inbox_would_refuse_for_an_overdue_deposit_is_not_opened() {
+    let chain = FakeChain::default();
+    chain.set_cursor(0);
+    chain.set_head_final_batch(0);
+    // Two deposits, the first enqueued two hours ago against a one hour deadline.
+    chain.seed_deposit_queue(2, 3_600, &[wall_clock_secs() - 7_200, wall_clock_secs()]);
+    let mut poster = poster_on(&chain);
+    let mut expected_next_batch = 0u64;
+
+    let err = poster
+        .submit_group(vec![block(1, 1)], &mut expected_next_batch)
+        .await
+        .expect_err("an empty range with deposit 0 overdue must be refused");
+    assert!(
+        matches!(&err, PipelineError::Deposits(m) if m.contains("was not opened")),
+        "unexpected error: {err}"
+    );
+    assert!(chain.open_order().is_empty(), "no OpenBatch may be sent");
+    assert_eq!(expected_next_batch, 0, "the batch id is not used up");
+}
+
+/// With the next deposit still inside its window the same group opens.
+#[tokio::test]
+async fn a_batch_that_leaves_out_only_a_young_deposit_is_opened() {
+    let chain = FakeChain::default();
+    chain.set_cursor(0);
+    chain.set_head_final_batch(0);
+    chain.seed_deposit_queue(2, 3_600, &[wall_clock_secs() - 60, wall_clock_secs()]);
+    let mut poster = poster_on(&chain);
+    let mut expected_next_batch = 0u64;
+
+    poster
+        .submit_group(vec![block(1, 1)], &mut expected_next_batch)
+        .await
+        .expect("deposit 0 is inside its window");
+    assert_eq!(chain.open_order(), vec![0]);
+}
+
+/// The second batch of a window starts its range where the first one ends, not at the cursor, which only
+/// moves when the first one finalizes: here the first batch takes deposit 0 and the second leaves out deposit 1,
+/// which is overdue.
+#[tokio::test]
+async fn the_next_range_starts_where_the_batch_opened_before_it_ends() {
+    let chain = FakeChain::default();
+    chain.set_cursor(0);
+    chain.set_head_final_batch(0);
+    chain.seed_deposit_queue(
+        1,
+        3_600,
+        &[wall_clock_secs() - 60, wall_clock_secs() - 7_200],
+    );
+    let mut poster = poster_on(&chain);
+    let mut expected_next_batch = 0u64;
+
+    let mut taking_the_first = block(1, 1);
+    taking_the_first.deposits_end = Some(1);
+    poster
+        .submit_group(vec![taking_the_first], &mut expected_next_batch)
+        .await
+        .expect("a full block of one deposit may leave an overdue one out");
+    let err = poster
+        .submit_group(vec![block(2, 2)], &mut expected_next_batch)
+        .await
+        .expect_err("the second batch starts at deposit 1, which is overdue");
+    assert!(
+        matches!(&err, PipelineError::Deposits(m) if m.contains("was not opened")),
+        "unexpected error: {err}"
+    );
+    assert_eq!(chain.open_order(), vec![0]);
+}
+
+/// What `check_deadline_at_open` says about a deposit enqueued at 1_000_000 that the batch leaves out, with the
+/// batch about to open `seconds_after_enqueue` later.
+async fn check_open(chain: &FakeChain, seconds_after_enqueue: i64) -> Result<(), PipelineError> {
+    rome_zk_batcher::deposits::check_deadline_at_open(
+        chain,
+        &SETTLEMENT_PROGRAM,
+        CHAIN_ID,
+        0,
+        0,
+        0,
+        1_000_000 + seconds_after_enqueue,
+    )
+    .await
+}
+
+/// The host clock and the cluster clock differ and `OpenBatch` lands after the check, so a batch is not opened
+/// within 300 s of the deposit's deadline.
+#[tokio::test]
+async fn a_batch_is_not_opened_within_300_seconds_of_the_deadline() {
+    let chain = FakeChain::default();
+    chain.seed_deposit_queue(2, 3_600, &[1_000_000, 1_000_000]);
+    // 301 s before the deadline: opens.
+    check_open(&chain, 3_600 - 301)
+        .await
+        .expect("301 s before the deadline is open-able");
+    // 300 s before: refused (age >= deadline - 300).
+    let err = check_open(&chain, 3_600 - 300)
+        .await
+        .expect_err("300 s before the deadline is refused");
+    assert!(
+        matches!(&err, PipelineError::Deposits(m) if m.contains("was not opened")),
+        "unexpected error: {err}"
+    );
+    // 299 s before: refused.
+    let err = check_open(&chain, 3_600 - 299)
+        .await
+        .expect_err("299 s before the deadline is refused");
+    assert!(
+        matches!(&err, PipelineError::Deposits(m) if m.contains("was not opened")),
+        "unexpected error: {err}"
+    );
+}
+
+/// While a proposal waits to activate, the shorter of the two inclusion deadlines applies.
+#[tokio::test]
+async fn the_shorter_of_the_active_and_pending_deadline_is_the_one_applied() {
+    // The pending deadline is shorter: it is the one used.
+    let chain = FakeChain::default();
+    chain.seed_deposit_queue(2, 3_600, &[1_000_000, 1_000_000]);
+    chain.seed_pending_deadline(1_800);
+    check_open(&chain, 1_800 - 301)
+        .await
+        .expect("301 s before the pending deadline opens");
+    check_open(&chain, 1_800 - 299)
+        .await
+        .expect_err("299 s before the pending deadline is refused");
+    // The active deadline is shorter: it is the one used, and a longer pending one does not relax it.
+    let chain = FakeChain::default();
+    chain.seed_deposit_queue(2, 1_800, &[1_000_000, 1_000_000]);
+    chain.seed_pending_deadline(3_600);
+    check_open(&chain, 1_800 - 301)
+        .await
+        .expect("301 s before the active deadline opens");
+    check_open(&chain, 1_800 - 299)
+        .await
+        .expect_err("299 s before the active deadline is refused");
 }

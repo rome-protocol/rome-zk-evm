@@ -35,6 +35,7 @@
 use clap::Parser;
 use rome_zk_batcher::anchor::{self, Anchor};
 use rome_zk_batcher::config::Config;
+use rome_zk_batcher::deposits::{self, DepositStart};
 use rome_zk_batcher::grouping::grouper_from_profile;
 use rome_zk_batcher::loaded_accounts;
 use rome_zk_batcher::metrics::Metrics;
@@ -367,6 +368,29 @@ async fn main() -> ExitCode {
         }
     };
 
+    // The deposit cursor's `deposit_next` at the resume point and the queue's per-batch limit, read after the
+    // startup recovery so every earlier batch is final: the log source checks the first credited deposit's
+    // index against it, and the grouper starts the first batch's range there and caps it at the limit.
+    let deposit_start = match deposits::read_deposit_start(
+        deps.rpc.as_ref(),
+        &deps.config.inbox_program_id,
+        &deps.config.settlement_program_id,
+        chain_id,
+    )
+    .await
+    {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!("failed to read the deposit cursor and queue limit: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    tracing::info!(
+        "deposits: next index {}, per-batch limit {:?}",
+        deposit_start.next,
+        deposit_start.cap.map(|c| c.limit())
+    );
+
     // The newest block number this run has actually seen
     // appended to the ordered log, shared between the main loop (writer, on every `source.next_block()`
     // that returns a block) and every batch's own settle task (reader, at its own hand-off time) — the
@@ -388,6 +412,7 @@ async fn main() -> ExitCode {
             chain_id,
             &profile_identity,
             anchor,
+            deposit_start,
             &mut expected_next_batch,
             &mut poster,
             &newest_block,
@@ -404,6 +429,7 @@ async fn main() -> ExitCode {
             chain_id,
             &profile_identity,
             anchor,
+            deposit_start,
             &mut expected_next_batch,
             &mut poster,
             &newest_block,
@@ -429,6 +455,7 @@ async fn run_once(
     chain_id: u64,
     profile_identity: &rome_zk_profile::ProfileIdentity,
     anchor: Anchor,
+    deposit_start: DepositStart,
     expected_next_batch: &mut u64,
     poster: &mut WindowedPoster<RpcSender, RpcClient>,
     newest_block: &AtomicU64,
@@ -440,7 +467,9 @@ async fn run_once(
         profile_identity.sub_blocks_per_block,
         anchor.from_block,
         anchor.prev_block_timestamp_secs,
-    ) {
+    )
+    .map(|s| s.with_deposit_start(deposit_start.next))
+    {
         Ok(s) => s,
         Err(e) => {
             tracing::error!("failed to open log at {log_dir:?}: {e}");
@@ -455,7 +484,8 @@ async fn run_once(
         deps.config.max_frames_per_batch,
         deps.config.max_frame_body_len,
         anchor.from_block.checked_sub(1),
-    );
+    )
+    .with_deposits(deposit_start.next, deposit_start.cap);
 
     let mut first_block_checked = false;
     loop {
@@ -542,6 +572,7 @@ async fn run_follow(
     chain_id: u64,
     profile_identity: &rome_zk_profile::ProfileIdentity,
     anchor: Anchor,
+    deposit_start: DepositStart,
     expected_next_batch: &mut u64,
     poster: &mut WindowedPoster<RpcSender, RpcClient>,
     newest_block: &AtomicU64,
@@ -560,7 +591,9 @@ async fn run_follow(
         profile_identity.sub_blocks_per_block,
         anchor.from_block,
         anchor.prev_block_timestamp_secs,
-    ) {
+    )
+    .map(|s| s.with_deposit_start(deposit_start.next))
+    {
         Ok(s) => s,
         Err(e) => {
             tracing::error!("failed to open log at {log_dir:?}: {e}");
@@ -574,7 +607,8 @@ async fn run_follow(
         deps.config.max_frames_per_batch,
         deps.config.max_frame_body_len,
         anchor.from_block.checked_sub(1),
-    );
+    )
+    .with_deposits(deposit_start.next, deposit_start.cap);
 
     // `--follow` verifies the log's first block against the anchor exactly as
     // `--once` does, before any grouping — a log that does not hold the anchor's own block first (pruned,

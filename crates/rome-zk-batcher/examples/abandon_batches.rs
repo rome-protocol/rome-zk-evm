@@ -9,6 +9,11 @@
 //! own devnet measurement runs left behind.
 //!
 //! Usage: `cargo run -p rome-zk-batcher --example abandon_batches -- <keypair_path> <inbox_program_id> <settlement_program_id> <chain_id> <batch_id>...`
+//!
+//! **List the ids oldest first.** `AbandonBatch` refuses a batch while the batch before it is open and not
+//! finalized (the previous-batch check that keeps deposit ranges in batch order), so the ids go in ascending
+//! order and each call sees its predecessor already gone or final. A batch that is already finalized cannot be
+//! abandoned at all.
 
 use rome_zk_batcher::sender::{RpcSender, SendTuning, Sender};
 use solana_keypair::read_keypair_file;

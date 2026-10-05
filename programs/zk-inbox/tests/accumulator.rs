@@ -545,6 +545,10 @@ async fn a_v1_shaped_batch_account_is_refused_by_every_instruction() {
                 rent_epoch: 0,
             },
         );
+        pt.add_account(
+            client::cursor_pda(&program_id, &settlement_program, chain_id).0,
+            rome_zk_testkit::cursor_account_for(2, program_id, chain_id, 1_000),
+        );
         let mut ctx = pt.start_with_context().await;
         let ix = client::seal_leaf_ix(&program_id, &settlement_program, chain_id, batch, 0);
         let err = send(&mut ctx, &[ix], &authority, &[]).await.unwrap_err();
@@ -559,7 +563,7 @@ async fn a_v1_shaped_batch_account_is_refused_by_every_instruction() {
     // account is refused the same way regardless of who signs.
     {
         let mut ctx = fresh_ctx(program_id, batch_pda, &v1_account, &authority.pubkey()).await;
-        let ix = client::finalize_batch_ix(
+        let ix = finalize_v2(
             &program_id,
             &authority.pubkey(),
             &settlement_program,
@@ -1086,12 +1090,16 @@ async fn finalize_small(n: u32) {
         batch_pda,
         fixture.account(program_id, n, &leaves, &sealed, false),
     );
+    pt.add_account(
+        client::cursor_pda(&program_id, &fixture.settlement_program, fixture.chain_id).0,
+        rome_zk_testkit::cursor_account_for(2, program_id, fixture.chain_id, 1_000),
+    );
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
     let cu = send(
         &mut ctx,
-        &[client::finalize_batch_ix(
+        &[finalize_v2(
             &program_id,
             &authority.pubkey(),
             &fixture.settlement_program,
@@ -1162,6 +1170,10 @@ async fn finalize_batch_before_all_leaves_present_errors() {
         batch_pda,
         fixture.account(program_id, 2, &leaves, &[0, 1], false),
     );
+    pt.add_account(
+        client::cursor_pda(&program_id, &fixture.settlement_program, fixture.chain_id).0,
+        rome_zk_testkit::cursor_account_for(2, program_id, fixture.chain_id, 1_000),
+    );
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
@@ -1169,7 +1181,7 @@ async fn finalize_batch_before_all_leaves_present_errors() {
     // the (now earlier) authority check, so this test still isolates the leaf-completeness gate.
     let err = send(
         &mut ctx,
-        &[client::finalize_batch_ix(
+        &[finalize_v2(
             &program_id,
             &authority.pubkey(),
             &fixture.settlement_program,
@@ -1212,12 +1224,16 @@ async fn finalize_batch_twice_errors() {
         batch_pda,
         fixture.account(program_id, 2, &leaves, &[0, 1], false),
     );
+    pt.add_account(
+        client::cursor_pda(&program_id, &fixture.settlement_program, fixture.chain_id).0,
+        rome_zk_testkit::cursor_account_for(2, program_id, fixture.chain_id, 1_000),
+    );
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
     send(
         &mut ctx,
-        &[client::finalize_batch_ix(
+        &[finalize_v2(
             &program_id,
             &authority.pubkey(),
             &fixture.settlement_program,
@@ -1232,7 +1248,7 @@ async fn finalize_batch_twice_errors() {
     .unwrap();
     let err = send(
         &mut ctx,
-        &[client::finalize_batch_ix(
+        &[finalize_v2(
             &program_id,
             &authority.pubkey(),
             &fixture.settlement_program,
@@ -1283,12 +1299,16 @@ async fn finalize_batch_900_leaves_within_cu_budget() {
         batch_pda,
         fixture.account(program_id, n, &leaves, &sealed, false),
     );
+    pt.add_account(
+        client::cursor_pda(&program_id, &fixture.settlement_program, fixture.chain_id).0,
+        rome_zk_testkit::cursor_account_for(2, program_id, fixture.chain_id, 1_000),
+    );
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
     let cu = send(
         &mut ctx,
-        &[client::finalize_batch_ix(
+        &[finalize_v2(
             &program_id,
             &authority.pubkey(),
             &fixture.settlement_program,
@@ -1357,13 +1377,17 @@ async fn finalize_batch_step_continuation_without_the_authority_signer_is_refuse
         batch_pda,
         fixture.account(program_id, n, &leaves, &sealed, false),
     );
+    pt.add_account(
+        client::cursor_pda(&program_id, &fixture.settlement_program, fixture.chain_id).0,
+        rome_zk_testkit::cursor_account_for(2, program_id, fixture.chain_id, 1_000),
+    );
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
     let step = 1300u32;
     send(
         &mut ctx,
-        &[client::finalize_batch_ix(
+        &[finalize_v2(
             &program_id,
             &authority.pubkey(),
             &fixture.settlement_program,
@@ -1377,7 +1401,7 @@ async fn finalize_batch_step_continuation_without_the_authority_signer_is_refuse
     .await
     .expect("first (signed) step must succeed");
 
-    let mut ix = client::finalize_batch_ix(
+    let mut ix = finalize_v2(
         &program_id,
         &authority.pubkey(),
         &fixture.settlement_program,
@@ -1441,6 +1465,10 @@ async fn finalize_batch_2500_leaves_resumes_across_transactions() {
         batch_pda,
         fixture.account(program_id, n, &leaves, &sealed, false),
     );
+    pt.add_account(
+        client::cursor_pda(&program_id, &fixture.settlement_program, fixture.chain_id).0,
+        rome_zk_testkit::cursor_account_for(2, program_id, fixture.chain_id, 1_000),
+    );
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
@@ -1448,7 +1476,7 @@ async fn finalize_batch_2500_leaves_resumes_across_transactions() {
     let step = 1300u32;
     let cu1 = send(
         &mut ctx,
-        &[client::finalize_batch_ix(
+        &[finalize_v2(
             &program_id,
             &authority.pubkey(),
             &fixture.settlement_program,
@@ -1477,7 +1505,7 @@ async fn finalize_batch_2500_leaves_resumes_across_transactions() {
 
     let cu2 = send(
         &mut ctx,
-        &[client::finalize_batch_ix(
+        &[finalize_v2(
             &program_id,
             &authority.pubkey(),
             &fixture.settlement_program,
@@ -1557,12 +1585,16 @@ async fn finalize_batch_signed_by_the_batch_authority_succeeds() {
         batch_pda,
         fixture.account(program_id, fixture.expected_count, &leaves, &sealed, false),
     );
+    pt.add_account(
+        client::cursor_pda(&program_id, &fixture.settlement_program, fixture.chain_id).0,
+        rome_zk_testkit::cursor_account_for(2, program_id, fixture.chain_id, 1_000),
+    );
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
     send(
         &mut ctx,
-        &[client::finalize_batch_ix(
+        &[finalize_v2(
             &program_id,
             &authority.pubkey(),
             &fixture.settlement_program,
@@ -1603,11 +1635,15 @@ async fn finalize_batch_missing_the_authority_account_errors() {
         batch_pda,
         fixture.account(program_id, fixture.expected_count, &leaves, &sealed, false),
     );
+    pt.add_account(
+        client::cursor_pda(&program_id, &fixture.settlement_program, fixture.chain_id).0,
+        rome_zk_testkit::cursor_account_for(2, program_id, fixture.chain_id, 1_000),
+    );
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
     // The old shape: only the batch pda, no trailing authority account at all.
-    let mut ix = client::finalize_batch_ix(
+    let mut ix = finalize_v2(
         &program_id,
         &authority.pubkey(),
         &fixture.settlement_program,
@@ -1644,12 +1680,16 @@ async fn finalize_batch_with_an_unsigned_authority_account_errors() {
         batch_pda,
         fixture.account(program_id, fixture.expected_count, &leaves, &sealed, false),
     );
+    pt.add_account(
+        client::cursor_pda(&program_id, &fixture.settlement_program, fixture.chain_id).0,
+        rome_zk_testkit::cursor_account_for(2, program_id, fixture.chain_id, 1_000),
+    );
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
     // The right pubkey, present, but not marked as a signer in the account list — and not actually
     // signed (no extra_signers), so the compiled message never requires (or carries) its signature.
-    let mut ix = client::finalize_batch_ix(
+    let mut ix = finalize_v2(
         &program_id,
         &authority.pubkey(),
         &fixture.settlement_program,
@@ -1687,12 +1727,16 @@ async fn finalize_batch_signed_by_the_wrong_key_errors() {
         batch_pda,
         fixture.account(program_id, fixture.expected_count, &leaves, &sealed, false),
     );
+    pt.add_account(
+        client::cursor_pda(&program_id, &fixture.settlement_program, fixture.chain_id).0,
+        rome_zk_testkit::cursor_account_for(2, program_id, fixture.chain_id, 1_000),
+    );
     let mut ctx = pt.start_with_context().await;
     let payer = ctx.payer.insecure_clone();
 
     // `wrong` genuinely signs — the transaction is well-formed — but its pubkey is not what the batch
     // account stores at `OFF_AUTHORITY`.
-    let ix = client::finalize_batch_ix(
+    let ix = finalize_v2(
         &program_id,
         &wrong.pubkey(),
         &fixture.settlement_program,
@@ -1735,7 +1779,7 @@ async fn finalize_batch_by_a_third_party_after_it_permissionlessly_sealed_every_
     );
     pt.add_account(
         client::cursor_pda(&program_id, &settlement_program, chain_id).0,
-        cursor_account(program_id, chain_id, batch),
+        cursor_account_for(2, program_id, chain_id, batch),
     );
     for kp in [&authority, &third_party] {
         pt.add_account(
@@ -1834,7 +1878,7 @@ async fn finalize_batch_by_a_third_party_after_it_permissionlessly_sealed_every_
     // every SealLeaf call, but it is not the batch's `authority` — must be refused.
     let err = send(
         &mut ctx,
-        &[client::finalize_batch_ix(
+        &[finalize_v2(
             &program_id,
             &third_party.pubkey(),
             &settlement_program,
@@ -1856,7 +1900,7 @@ async fn finalize_batch_by_a_third_party_after_it_permissionlessly_sealed_every_
     // The real authority can still finalize.
     send(
         &mut ctx,
-        &[client::finalize_batch_ix(
+        &[finalize_v2(
             &program_id,
             &authority.pubkey(),
             &settlement_program,
@@ -2117,7 +2161,7 @@ async fn chunk_lane_end_to_end_open_write_seal_close_requires_final_root() {
     );
     pt.add_account(
         client::cursor_pda(&program_id, &settlement_program, chain_id).0,
-        cursor_account(program_id, chain_id, batch),
+        cursor_account_for(2, program_id, chain_id, batch),
     );
     pt.add_account(
         authority.pubkey(),
@@ -2247,7 +2291,7 @@ async fn chunk_lane_end_to_end_open_write_seal_close_requires_final_root() {
     .expect("SealLeaf must succeed");
     send(
         &mut ctx,
-        &[client::finalize_batch_ix(
+        &[finalize_v2(
             &program_id,
             &authority.pubkey(),
             &settlement_program,
@@ -2323,7 +2367,7 @@ async fn open_one_chunk_batch(
     );
     pt.add_account(
         client::cursor_pda(&program_id, &settlement_program, chain_id).0,
-        cursor_account(program_id, chain_id, batch),
+        cursor_account_for(2, program_id, chain_id, batch),
     );
     pt.add_account(
         authority.pubkey(),
@@ -2554,7 +2598,7 @@ async fn seal_accepts_the_correct_hash_and_acc_matches_the_reference() {
     .expect("SealLeaf");
     send(
         &mut ctx,
-        &[client::finalize_batch_ix(
+        &[finalize_v2(
             &program_id,
             &authority.pubkey(),
             &settlement_program,
@@ -3908,4 +3952,25 @@ async fn chunk_close_rejects_a_foreign_system_account_posing_as_an_absent_batch(
         msg.contains("Custom(8)") || msg.contains("InvalidSeeds"),
         "expected WrongBatchAccount/InvalidSeeds, got {msg}"
     );
+}
+
+/// `FinalizeBatchV2` over an empty deposit range (the chain has no deposits, the cursor's `deposit_next` is 0).
+fn finalize_v2(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    settlement_program: &Pubkey,
+    chain_id: u64,
+    batch: u64,
+    step: u32,
+) -> solana_program::instruction::Instruction {
+    client::finalize_batch_v2_ix(
+        program_id,
+        authority,
+        settlement_program,
+        chain_id,
+        batch,
+        step,
+        0,
+        None,
+    )
 }

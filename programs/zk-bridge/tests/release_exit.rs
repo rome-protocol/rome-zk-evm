@@ -588,3 +588,39 @@ async fn create_ata_idempotent_then_release_lands_for_a_recipient_with_no_ata() 
         "a no-op create must never touch the account's existing balance"
     );
 }
+
+/// `release_refuses_a_vault_whose_settlement_program_is_not_the_configs`: the vault config names the settlement
+/// program the vault was made under. When the bridge config names another one, nothing is released and the
+/// record stays.
+#[tokio::test]
+async fn release_with_another_settlement_program_than_the_config_is_refused() {
+    let mut scene = build_scene(AMOUNT_WEI, [0u8; 20], settlement_program_id()).await;
+    scene.ctx.set_account(
+        &bridge_config_pda(),
+        &solana_sdk::account::AccountSharedData::from(bridge_config_account(Pubkey::new_unique())),
+    );
+    let ix = release_ix(&scene);
+    let payer = scene.payer.insecure_clone();
+    let (result, ..) = rome_zk_testkit::send_measuring_cu(&mut scene.ctx, &[ix], &payer, &[]).await;
+    let err = result.expect_err("a vault under another settlement program must be refused");
+    assert_eq!(
+        custom_error(&err),
+        Some(zk_bridge::errors::BridgeError::WrongSettlementProgram as u32)
+    );
+    let vault_bal = decode_token_amount(
+        &get_account(&mut scene.ctx, scene.vault_token_pda)
+            .await
+            .unwrap()
+            .data,
+    );
+    assert_eq!(
+        vault_bal, VAULT_STARTING_BALANCE,
+        "the vault must be untouched"
+    );
+    assert!(
+        get_account(&mut scene.ctx, scene.exit_record_pda)
+            .await
+            .is_some(),
+        "the record must not be consumed by a refused call"
+    );
+}

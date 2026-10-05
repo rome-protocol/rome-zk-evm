@@ -291,13 +291,15 @@ async fn main() {
     let finalize_sig = send(
         &rpc,
         &payer,
-        &[zk_inbox_client::finalize_batch_ix(
+        &[zk_inbox_client::finalize_batch_v2_ix(
             &program_id,
             &payer.pubkey(),
             &args.settlement_program,
             chain_id,
             batch,
             0,
+            0,
+            None,
         )],
     )
     .await;

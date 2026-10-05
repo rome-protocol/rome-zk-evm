@@ -2,7 +2,8 @@
 mod common;
 use common::*;
 use solana_program::program_error::ProgramError;
-use veritas::{verify, verify_zisk, zisk_public_signal};
+use veritas::vk::ZISK_1_2_0;
+use veritas::{zisk_public_signal, zisk_version};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Out {
@@ -20,11 +21,12 @@ fn classify(r: Result<bool, ProgramError>) -> Out {
     }
 }
 
+/// The fixtures here are ZisK 1.2.0 proofs, checked under the 1.2.0 key the test feature provides.
 fn zisk(abi: &[u8]) -> Out {
-    classify(verify_zisk(abi))
+    classify(veritas::verify_zisk(zisk_version(1).unwrap(), abi))
 }
 fn ver(input: &[u8]) -> Out {
-    classify(verify(input))
+    classify(veritas::verify(&ZISK_1_2_0, input))
 }
 
 fn block14() -> Fixture {
@@ -144,10 +146,10 @@ fn m4_off_curve_z_commitment_with_zero_scalar() {
     let f = block14();
     let signal = zisk_public_signal(&f.program_vk, &f.public_values, &f.rootc);
     // The test's own arithmetic agrees with the library on the real proof before it is trusted.
-    let t = veritas::trace(&f.proof, &signal).expect("well-formed");
-    assert_eq!(challenges(&f.proof, &signal).alpha, t.alpha);
+    let t = veritas::trace(&ZISK_1_2_0, &f.proof, &signal).expect("well-formed");
+    assert_eq!(challenges(&ZISK_1_2_0, &f.proof, &signal).alpha, t.alpha);
     assert_eq!(
-        d_by_hand(&f.proof, &signal),
+        d_by_hand(&ZISK_1_2_0, &f.proof, &signal),
         t.d,
         "step 9 by hand, real proof"
     );
@@ -155,8 +157,8 @@ fn m4_off_curve_z_commitment_with_zero_scalar() {
     let mut proof = f.proof;
     proof[32 * 7 + 31] ^= 1;
     assert!(!on_curve_or_identity(&proof[192..256]));
-    make_z_coefficient_zero(&mut proof, &signal);
-    assert_eq!(z_coefficient(&proof, &signal), [0u8; 32]);
+    make_z_coefficient_zero(&ZISK_1_2_0, &mut proof, &signal);
+    assert_eq!(z_coefficient(&ZISK_1_2_0, &proof, &signal), [0u8; 32]);
     assert_eq!(expected_class(&proof), Out::Malformed);
     let mut abi = f.abi();
     abi[..768].copy_from_slice(&proof);
@@ -167,10 +169,10 @@ fn m4_off_curve_z_commitment_with_zero_scalar() {
     // Control: the same a-bar with [z]_1 left on the curve is well-formed, its scalar is zero in the
     // library too (step 9 recomputed by hand matches), and the proof is simply rejected.
     let mut control = f.proof;
-    make_z_coefficient_zero(&mut control, &signal);
-    let tc = veritas::trace(&control, &signal).expect("well-formed");
+    make_z_coefficient_zero(&ZISK_1_2_0, &mut control, &signal);
+    let tc = veritas::trace(&ZISK_1_2_0, &control, &signal).expect("well-formed");
     assert_eq!(
-        d_by_hand(&control, &signal),
+        d_by_hand(&ZISK_1_2_0, &control, &signal),
         tc.d,
         "step 9 by hand, zero scalar"
     );

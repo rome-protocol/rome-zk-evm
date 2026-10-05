@@ -9,14 +9,17 @@
 //!   queues only under the bridge config's settlement program, so a queue at that address proves `sp` is
 //!   the canonical one; a vault initialised under any other settlement program finds no queue there;
 //! - the chain's `root`, `registry` and `exit_config` sit at their PDAs under `sp` and are owned by it. A
-//!   chain whose root or registry is gone (a reclaimed chain keeps its queue and vault) takes no deposits,
-//!   since nothing could credit or refund them;
+//!   chain whose root or registry is gone takes no deposits, since nothing could credit or refund them,
+//!   and neither does a chain whose root has never taken a posted batch (such a chain can be reclaimed by
+//!   anyone; one that has posted never can). The registry must name the bridge config's inbox, the same
+//!   check `CloseDeposit` makes;
 //! - the record sits at `["deposit", sp, chain_id, count]` and is created, or adopted if its address was
 //!   pre-funded.
 //!
 //! The record's sender, and the leaf the hash chain commits to, is the depositor's wallet key, never the
 //! token account's address.
 
+use crate::bridge_config;
 use crate::deposit_queue::{load_queue, load_registry, require_root, syscall_keccak};
 use crate::errors::BridgeError;
 use crate::instruction::DepositArgs;
@@ -38,7 +41,7 @@ use solana_system_interface::{instruction as system_instruction, program as syst
 /// accounts: `[depositor (signer, writable), depositor_token (writable), vault_config (read-only),
 /// vault_token (writable), deposit_queue (writable), deposit_record (writable, NEW), exit_config
 /// (read-only), fee_recipient (writable), token_program, system_program, root (read-only), registry
-/// (read-only)]`.
+/// (read-only), bridge_config (read-only)]`.
 pub fn deposit(
     program_id: &Pubkey,
     it: &mut std::slice::Iter<AccountInfo>,
@@ -56,6 +59,7 @@ pub fn deposit(
     let sys = next_account_info(it)?;
     let root_acc = next_account_info(it)?;
     let registry_acc = next_account_info(it)?;
+    let config_acc = next_account_info(it)?;
 
     if !depositor.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -90,7 +94,11 @@ pub fn deposit(
 
     // The chain is live under that settlement program: root and registry exist and belong to it.
     require_root(&settlement_program, args.chain_id, root_acc)?;
-    load_registry(&settlement_program, args.chain_id, registry_acc)?;
+    let registry = load_registry(&settlement_program, args.chain_id, registry_acc)?;
+    let config = bridge_config::load(program_id, config_acc)?;
+    if registry.inbox_program != config.inbox_program {
+        return Err(BridgeError::WrongInboxProgram.into());
+    }
 
     // The chain's exit config names this program as its bridge, and the recipient is not the portal.
     let (expect_exit_config, _) = exit_config::pda(&settlement_program, args.chain_id);

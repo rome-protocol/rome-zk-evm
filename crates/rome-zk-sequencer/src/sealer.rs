@@ -1902,6 +1902,91 @@ mod tests {
             .any(|keys| keys.contains(&first_key)));
     }
 
+    /// A deposit feed that has found no queue (the chain has an exit config but no deposit queue, or no exit
+    /// config at all) changes nothing about sealing: an empty tick is idle, and a run of ticks seals the same
+    /// headers, hashes and log records as a sealer with no feed. This is the sequencer that has `[deposits]` in its
+    /// config before the operator has created a queue.
+    #[tokio::test]
+    async fn a_feed_with_no_queue_seals_exactly_as_no_feed() {
+        use crate::deposits::test_support::{feed, MockChain};
+        use crate::testutil::signed_raw_tx;
+        let sender = PrivateKeySigner::random();
+        let base_ts = 1_757_000_000_000_000u64;
+
+        // The same 40 ticks (one carrying a transaction) against a sealer with no feed, then one with a feed
+        // whose poller sees no queue, then one whose poller sees no exit config.
+        async fn run(
+            feed: Option<(crate::deposits::DepositFeed, MockChain)>,
+            sender: &PrivateKeySigner,
+            base_ts: u64,
+        ) -> (
+            Vec<(B256, Option<u64>, usize)>,
+            Vec<crate::log::SubBlockRecord>,
+        ) {
+            let dir = tempdir().unwrap();
+            let mut s = SealerState::new(
+                MockExecutor::new(),
+                LogWriter::open(dir.path(), 1_000).unwrap(),
+                PrivateKeySigner::random(),
+                ChannelSink::new(64),
+                1,
+                DEFAULT_BLOCK_GAS_LIMIT,
+                Address::ZERO,
+                SUB_BLOCKS_PER_BLOCK,
+                ResumePoint::default(),
+            );
+            if let Some((feed, chain)) = &feed {
+                s = s.with_deposits(feed.clone());
+                chain.poller(feed).poll_once().await.unwrap();
+            }
+            let mut out = Vec::new();
+            for i in 0..40u64 {
+                let txs = if i == 3 {
+                    vec![signed_raw_tx(sender, 1, 0)]
+                } else {
+                    vec![]
+                };
+                let tick = s
+                    .seal_sub_block(txs, base_ts + i * 50_000, SubBlockLimits::unbounded())
+                    .await
+                    .unwrap();
+                if tick.is_idle() {
+                    // An empty tick that opens no block is idle; record that too, so both runs must agree on it.
+                    assert!(
+                        !(3..=22).contains(&i),
+                        "tick {i} is idle only before the transaction or after its block"
+                    );
+                    out.push((B256::ZERO, None, 0));
+                    continue;
+                }
+                let r = tick.sealed();
+                out.push((r.header_hash, r.header.deposits_end, r.deposits_credited));
+            }
+            let mut records = Vec::new();
+            crate::log::replay(dir.path(), false, |r| records.push(r.clone())).unwrap();
+            (out, records)
+        }
+
+        let (plain, plain_log) = run(None, &sender, base_ts).await;
+        let no_queue = MockChain::without_queue();
+        let (with_feed, feed_log) = run(Some((feed(), no_queue)), &sender, base_ts).await;
+        let no_exit_config = MockChain::new(4);
+        no_exit_config.reader.accounts.lock().unwrap().clear();
+        let (with_empty, empty_log) = run(Some((feed(), no_exit_config)), &sender, base_ts).await;
+
+        assert!(plain.iter().all(|(_, end, n)| end.is_none() && *n == 0));
+        assert_eq!(plain, with_feed);
+        assert_eq!(plain, with_empty);
+        assert_eq!(plain_log.len(), feed_log.len());
+        assert_eq!(plain_log.len(), empty_log.len());
+        for ((a, b), c) in plain_log.iter().zip(&feed_log).zip(&empty_log) {
+            assert_eq!(a.header, b.header);
+            assert_eq!(a.header, c.header);
+            assert_eq!(a.withdrawals, b.withdrawals);
+            assert!(b.withdrawals.is_empty() && c.withdrawals.is_empty());
+        }
+    }
+
     /// Without a feed the sealer is what it was: an empty tick is idle, and a block with transactions carries
     /// no `deposits_end` and no withdrawals.
     #[tokio::test]

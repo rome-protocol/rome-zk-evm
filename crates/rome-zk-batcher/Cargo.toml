@@ -41,6 +41,8 @@ rome-zk-layouts = { path = "../rome-zk-layouts" }
 # solana_client_v1;` alias instead (`tests/devnet_probe.rs`), never a second Cargo dependency.
 solana-program.workspace = true
 solana-sdk-ids.workspace = true
+# The one plain transfer that tops a v1 batch cursor up to the rent minimum before the first V2.
+solana-system-interface = { workspace = true, features = ["bincode"] }
 solana-loader-v3-interface.workspace = true
 solana-client.workspace = true
 solana-sdk.workspace = true
@@ -116,7 +118,6 @@ bs58 = "0.5"
 # Agave line now; see the production-deps comment above).
 solana-instruction-error.workspace = true
 solana-compute-budget-interface.workspace = true
-solana-system-interface = { workspace = true, features = ["bincode"] }
 
 [lints]
 workspace = true

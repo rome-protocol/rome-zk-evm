@@ -273,8 +273,19 @@ pub fn decode_inbox_tx(
                 }
             }
             InboxIx::SealLeaf { .. } => out.ix_names.push("SealLeaf"),
+            // `FinalizeBatchV2` is the live finalize; the retired `FinalizeBatch` stays so recorded history
+            // still decodes. Both feed the same event: the lifecycle only needs the batch and the `step`.
             InboxIx::FinalizeBatch { step } => {
                 out.ix_names.push("FinalizeBatch");
+                if let Some(pda) = batch_pda {
+                    out.batch_events.push(BatchEvent::Finalized {
+                        batch_pda: pda,
+                        step,
+                    });
+                }
+            }
+            InboxIx::FinalizeBatchV2 { step, .. } => {
+                out.ix_names.push("FinalizeBatchV2");
                 if let Some(pda) = batch_pda {
                     out.batch_events.push(BatchEvent::Finalized {
                         batch_pda: pda,
@@ -721,6 +732,42 @@ mod tests {
             decoded0.batch_events,
             vec![BatchEvent::Finalized { batch_pda, step: 0 }]
         );
+    }
+
+    /// `FinalizeBatchV2 { step, deposit_to }` is recorded as a finalize step with its `step`, exactly as
+    /// `FinalizeBatch { step }` is; the batch account is still account 0.
+    #[test]
+    fn decode_inbox_tx_finalize_batch_v2_is_recorded_like_finalize_batch() {
+        let program_id = Pubkey::new_unique();
+        let payer = Pubkey::new_unique();
+        let bridge = Pubkey::new_unique();
+        let batch_pda = zk_inbox_client::batch_pda(&program_id, &SETTLEMENT_PROGRAM, 200_101, 4003)
+            .0
+            .to_string();
+        for (step, deposit_to, bridge_program) in
+            [(1, 0, None), (0, 3, Some(&bridge)), (0, 0, Some(&bridge))]
+        {
+            let ix = zk_inbox_client::finalize_batch_v2_ix(
+                &program_id,
+                &payer,
+                &SETTLEMENT_PROGRAM,
+                200_101,
+                4003,
+                step,
+                deposit_to,
+                bridge_program,
+            );
+            let msg = raw_message(&payer, &[ix]);
+            let decoded = decode_inbox_tx(&msg, &program_id.to_string(), &SETTLEMENT_PROGRAM);
+            assert_eq!(decoded.ix_names, vec!["FinalizeBatchV2"]);
+            assert_eq!(
+                decoded.batch_events,
+                vec![BatchEvent::Finalized {
+                    batch_pda: batch_pda.clone(),
+                    step,
+                }]
+            );
+        }
     }
 
     #[test]

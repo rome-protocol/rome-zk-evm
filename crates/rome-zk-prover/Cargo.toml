@@ -22,6 +22,8 @@ zk-settlement-client = { path = "../zk-settlement-client" }
 # module's own inbox-batch/cursor reads.
 zk-inbox-client = { path = "../zk-inbox-client" }
 rome-zk-layouts = { path = "../rome-zk-layouts" }
+# The prover checks each proof under the key of the release the chain's registry entry names; Veritas's table
+# holds one key per release that is still accepted, and the withdrawn 1.2.0 key is not linked in.
 veritas = { path = "../../programs/veritas", features = ["no-entrypoint"] }
 # Postgres job history: the same pattern `rome-zk-settlement-watcher` already uses for
 # `migrations/explorer` — copied for `migrations/prover` here (both crates' own `sqlx::migrate!`).

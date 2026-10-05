@@ -5,5 +5,9 @@
 # keeps `prove()` itself from hanging on it. `prove()` returning promptly here does not claim the
 # escaped helper is also killed (it is not, by construction of this test); that is the accepted
 # bound of the process-group defense, not a claim this crate makes about every possible tool.
+if [ "${1:-}" = "--version" ]; then
+  echo "cargo-zisk 1.3.1-alpha [cpu] (306a9c9 fake-build)"
+  exit 0
+fi
 setsid sh -c 'sleep 3119' &
 sleep 3120

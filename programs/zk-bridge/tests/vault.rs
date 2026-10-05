@@ -377,14 +377,10 @@ async fn fund_increases_vault_balance() {
     assert_eq!(funder_after, 3_000);
 }
 
-/// `attacker_first_does_not_lock_out_real_authority`: the un-frontrunnable re-keying.
-/// The attacker-first race, RUN real BPF, is closed AT THE CORE. Under the OLD chain_id-only keying the
-/// attacker's InitVault SUCCEEDS at the sole per-chain slot and the real authority's later InitVault is
-/// refused `VaultAlreadyInitialized` — locked out. With vault PDAs keyed by `[settlement_program,
-/// chain_id]`, the attacker's hostile-settlement InitVault still succeeds (the chain-authority gate only
-/// proves self-consistency of whatever settlement they name), but at a DIFFERENT address
-/// (`pda(hostile_settlement, chain_id)`); the real authority's InitVault naming the REAL settlement then
-/// ALSO succeeds, at `pda(real_settlement, chain_id)` — not locked out, because the two calls were never
+/// `attacker_first_does_not_lock_out_real_authority`: an attacker who names their own settlement program and
+/// signs as the root authority of their own self-consistent root is refused (`WrongSettlementProgram`): only the
+/// bridge config's settlement program gets a vault. The refusal creates nothing, and the real authority's
+/// `InitVault` then succeeds. The vault addresses are also keyed by settlement program, so the two were never
 /// contending for the same address.
 #[tokio::test]
 async fn attacker_first_does_not_lock_out_real_authority() {
@@ -403,8 +399,7 @@ async fn attacker_first_does_not_lock_out_real_authority() {
     pt.add_account(mint, mint_account(9));
     // the REAL root, owned by the REAL settlement, authority = the real chain authority.
     pt.add_account(root_pda(), root_account(&real_chain_authority.pubkey()));
-    // the ATTACKER's own self-consistent root: owned by their OWN (undeployed, but that is not checked
-    // here — `InitVault` never CPIs into `settlement_program`) hostile settlement id, with themselves as
+    // the ATTACKER's own self-consistent root: owned by their own hostile settlement id, with themselves as
     // `authority`.
     let attacker_root_pda = rome_zk_layouts::root::pda(&hostile_settlement, CHAIN_ID).0;
     pt.add_account(
@@ -434,12 +429,15 @@ async fn attacker_first_does_not_lock_out_real_authority() {
         &[&attacker_chain_authority],
     )
     .await;
-    r1.expect(
-        "the attacker's self-consistent hostile-settlement InitVault succeeds — at ITS OWN address",
+    assert_init_vault_refused(r1, zk_bridge::errors::BridgeError::WrongSettlementProgram);
+    let (attacker_cfg_pda, _) =
+        zk_bridge_client::vault_config_pda(&bridge_program_id(), &hostile_settlement, CHAIN_ID);
+    assert!(
+        get_account(&mut ctx, attacker_cfg_pda).await.is_none(),
+        "a refused InitVault creates no vault_config"
     );
 
-    // --- REAL AUTHORITY SECOND: InitVault naming the real settlement, signed by the real root.authority —
-    // must NOT be refused VaultAlreadyInitialized: this is a DIFFERENT address than the attacker's. ---
+    // --- REAL AUTHORITY SECOND: InitVault naming the real settlement, signed by the real root.authority ---
     let real_ix = zk_bridge_client::init_vault_ix(
         &bridge_program_id(),
         &payer.pubkey(),
@@ -452,35 +450,92 @@ async fn attacker_first_does_not_lock_out_real_authority() {
     let (r2, ..) =
         rome_zk_testkit::send_measuring_cu(&mut ctx, &[real_ix], &payer, &[&real_chain_authority])
             .await;
-    r2.expect(
-        "the real chain authority must NOT be locked out by an earlier hostile-settlement InitVault",
-    );
+    r2.expect("the real chain authority must NOT be locked out by an earlier hostile-settlement InitVault");
 
-    let (attacker_cfg_pda, _) =
-        zk_bridge_client::vault_config_pda(&bridge_program_id(), &hostile_settlement, CHAIN_ID);
     let (real_cfg_pda, _) =
         zk_bridge_client::vault_config_pda(&bridge_program_id(), &real_settlement, CHAIN_ID);
     assert_ne!(
         attacker_cfg_pda, real_cfg_pda,
-        "the attacker's config and the real config must live at DIFFERENT addresses"
+        "the attacker's address and the real config's must differ"
     );
-
-    let attacker_cfg = zk_bridge_client::decode_vault_config_account(
-        &get_account(&mut ctx, attacker_cfg_pda).await.unwrap().data,
-    )
-    .unwrap();
-    assert_eq!(attacker_cfg.settlement_program, hostile_settlement);
-    assert_eq!(attacker_cfg.authority, attacker_chain_authority.pubkey());
-
     let real_cfg = zk_bridge_client::decode_vault_config_account(
         &get_account(&mut ctx, real_cfg_pda).await.unwrap().data,
     )
     .unwrap();
     assert_eq!(
         real_cfg.settlement_program, real_settlement,
-        "the real chain's config must name the REAL settlement, not be overwritten/blocked by the attacker's"
+        "the real chain's config must name the REAL settlement"
     );
     assert_eq!(real_cfg.authority, real_chain_authority.pubkey());
+}
+
+fn assert_init_vault_refused(
+    r: Result<(), solana_sdk::transaction::TransactionError>,
+    want: zk_bridge::errors::BridgeError,
+) {
+    match r {
+        Err(solana_sdk::transaction::TransactionError::InstructionError(
+            _,
+            solana_sdk::instruction::InstructionError::Custom(c),
+        )) => assert_eq!(c, want as u32, "expected {want:?}, got Custom({c})"),
+        other => panic!("expected {want:?}, got {other:?}"),
+    }
+}
+
+/// `init_vault_refuses_a_settlement_program_the_bridge_config_does_not_name`: the same refusal when the bridge
+/// config itself names a different settlement program than the one the caller passes (the real one here).
+#[tokio::test]
+async fn init_vault_refuses_a_settlement_program_other_than_the_configs() {
+    let mut pt = base_program_test();
+    let payer = Keypair::new();
+    let chain_authority = Keypair::new();
+    pt.add_account(payer.pubkey(), funded_account(50_000_000_000));
+    let mint = Pubkey::new_unique();
+    pt.add_account(mint, mint_account(9));
+    pt.add_account(root_pda(), root_account(&chain_authority.pubkey()));
+    // A config that names some other settlement program replaces the default one.
+    pt.add_account(
+        bridge_config_pda(),
+        bridge_config_account(Pubkey::new_unique()),
+    );
+    let mut ctx = pt.start_with_context().await;
+    let ix = zk_bridge_client::init_vault_ix(
+        &bridge_program_id(),
+        &payer.pubkey(),
+        CHAIN_ID,
+        mint,
+        9,
+        settlement_program_id(),
+        &chain_authority.pubkey(),
+    );
+    let (r, ..) =
+        rome_zk_testkit::send_measuring_cu(&mut ctx, &[ix], &payer, &[&chain_authority]).await;
+    assert_init_vault_refused(r, zk_bridge::errors::BridgeError::WrongSettlementProgram);
+}
+
+/// `init_vault_refuses_a_missing_bridge_config`: no config, no vault.
+#[tokio::test]
+async fn init_vault_refuses_a_missing_bridge_config() {
+    let mut pt = base_program_test_without_config();
+    let payer = Keypair::new();
+    let chain_authority = Keypair::new();
+    pt.add_account(payer.pubkey(), funded_account(50_000_000_000));
+    let mint = Pubkey::new_unique();
+    pt.add_account(mint, mint_account(9));
+    pt.add_account(root_pda(), root_account(&chain_authority.pubkey()));
+    let mut ctx = pt.start_with_context().await;
+    let ix = zk_bridge_client::init_vault_ix(
+        &bridge_program_id(),
+        &payer.pubkey(),
+        CHAIN_ID,
+        mint,
+        9,
+        settlement_program_id(),
+        &chain_authority.pubkey(),
+    );
+    let (r, ..) =
+        rome_zk_testkit::send_measuring_cu(&mut ctx, &[ix], &payer, &[&chain_authority]).await;
+    assert_init_vault_refused(r, zk_bridge::errors::BridgeError::WrongBridgeConfig);
 }
 
 /// `real_vault_address_is_derivable_from_the_real_settlement_only`: `vault_config_pda(program,

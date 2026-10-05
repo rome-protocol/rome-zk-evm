@@ -671,6 +671,11 @@ mod tests {
         async fn get_account(&self, pubkey: &Pubkey) -> Result<Option<Vec<u8>>, ResolveError> {
             Ok(self.0.lock().unwrap().get(pubkey).cloned())
         }
+        async fn get_account_owner(&self, pubkey: &Pubkey) -> Result<Option<Pubkey>, ResolveError> {
+            // This fake holds no exit config or deposit queue, so the owner is never asked about those.
+            Ok(self.get_account(pubkey).await?.map(|_| Pubkey::default()))
+        }
+
         async fn accounts_exist(&self, pubkeys: &[Pubkey]) -> Result<Vec<bool>, ResolveError> {
             let st = self.0.lock().unwrap();
             Ok(pubkeys.iter().map(|p| st.contains_key(p)).collect())

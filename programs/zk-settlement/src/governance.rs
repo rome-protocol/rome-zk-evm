@@ -790,6 +790,73 @@ fn close_to(acc: &AccountInfo, dest: &AccountInfo) -> ProgramResult {
     Ok(())
 }
 
+/// What a registry write may name for `curve` and `scheme`. Scheme 0 is Groth16 on either curve. Every
+/// scheme that names a ZisK release is a BN254 key (the pairing is BN254's), so a ZisK scheme on any other
+/// curve is refused, and so is a scheme number no release has taken.
+pub(crate) fn check_curve_and_scheme(curve: u8, scheme: u8) -> Result<(), SettleError> {
+    let curve_known = curve == registry::CURVE_BN254 || curve == registry::CURVE_BLS12_381;
+    let scheme_known = scheme == registry::SCHEME_GROTH16 || registry::is_zisk_scheme(scheme);
+    let zisk_on_bn254 = !registry::is_zisk_scheme(scheme) || curve == registry::CURVE_BN254;
+    if curve_known && scheme_known && zisk_on_bn254 {
+        Ok(())
+    } else {
+        Err(SettleError::UnknownCurveOrScheme)
+    }
+}
+
+/// The refusal a release's status gives to a write that is not a retirement. Only an open release takes one.
+pub(crate) fn status_write_refusal(status: veritas::Status) -> Option<SettleError> {
+    match status {
+        veritas::Status::Open => None,
+        veritas::Status::Closing => Some(SettleError::ZiskVersionClosing),
+        veritas::Status::Withdrawn => Some(SettleError::ZiskVersionWithdrawn),
+    }
+}
+
+/// [`status_write_refusal`] for the release `scheme` names. A scheme that is not a ZisK release (Groth16) has
+/// no status. A ZisK scheme this build has no row for is refused as withdrawn, the same as at proof time.
+pub(crate) fn release_write_refusal(scheme: u8) -> Option<SettleError> {
+    if !registry::is_zisk_scheme(scheme) {
+        return None;
+    }
+    match veritas::zisk_version(scheme) {
+        Some(version) => status_write_refusal(version.status),
+        None => Some(SettleError::ZiskVersionWithdrawn),
+    }
+}
+
+/// The first pair in `entries` that holds one programVK under two different ZisK releases.
+pub(crate) fn find_key_under_two_releases(entries: &[RegistryEntryArg]) -> Option<SettleError> {
+    for (i, a) in entries.iter().enumerate() {
+        for b in &entries[i + 1..] {
+            if registry::is_zisk_scheme(a.scheme)
+                && registry::is_zisk_scheme(b.scheme)
+                && a.scheme != b.scheme
+                && a.vkey_hash == b.vkey_hash
+            {
+                return Some(SettleError::VkeyUnderOtherZiskVersion);
+            }
+        }
+    }
+    None
+}
+
+/// The checks `SetRegistryEntry` makes on every entry it writes, applied to each genesis entry of
+/// `InitChainV2` on the reserved path: curve and scheme, then the release's status, then the programVK held
+/// under two releases. Genesis entries are all new, so none of them is a retirement.
+pub(crate) fn check_genesis_registry(entries: &[RegistryEntryArg]) -> Result<(), SettleError> {
+    for e in entries {
+        check_curve_and_scheme(e.curve, e.scheme)?;
+        if let Some(refusal) = release_write_refusal(e.scheme) {
+            return Err(refusal);
+        }
+    }
+    match find_key_under_two_releases(entries) {
+        Some(refusal) => Err(refusal),
+        None => Ok(()),
+    }
+}
+
 /// `SetRegistryEntry` (25): registers a verifier key with an explicit activation delay — vkey rotation is
 /// an explicit instruction with a delay. accounts:
 /// [registry_authority (signer), payer (signer, writable — funds the one-time v1->v2 realloc), global_config
@@ -801,8 +868,13 @@ fn close_to(acc: &AccountInfo, dest: &AccountInfo) -> ProgramResult {
 /// activation, the devnet case; `RETIRED_SLOT` = `u64::MAX` always passes this, by construction — it is
 /// never in the past). `entry.layout_id` must be `LAYOUT_ZISK_V1` or `LAYOUT_HEADER_FALLBACK`
 /// (`UnknownLayout`), and `LAYOUT_HEADER_FALLBACK` only on a reserved chain (`HeaderFallbackNotAllowed`
-/// for a permissionless one); `entry.curve`/`entry.scheme` must be one of the known constants
-/// (`UnknownCurveOrScheme`).
+/// for a permissionless one); `entry.curve`/`entry.scheme` must be one of the known constants, and a ZisK
+/// scheme must be on BN254 (`UnknownCurveOrScheme`).
+///
+/// **The release rules.** Any write other than retiring a present entry needs the entry's ZisK release to be
+/// open: `ZiskVersionWithdrawn` for a withdrawn release, `ZiskVersionClosing` for a closing one. Retiring a
+/// present entry is always allowed. A new ZisK entry may not take a `vkey_hash` that a non-retired entry holds
+/// under another ZisK scheme (`VkeyUnderOtherZiskVersion`).
 ///
 /// **Rotation never touches another entry; retirement is explicit.** The key is
 /// `(curve, scheme, vkey_hash)` — the same key `registry::find` uses, NOT `(curve, scheme, layout_id)`
@@ -843,13 +915,7 @@ pub fn set_registry_entry(
     if entry.layout_id == registry::LAYOUT_HEADER_FALLBACK && !chainid::is_reserved(chain_id) {
         return Err(SettleError::HeaderFallbackNotAllowed.into());
     }
-    let curve_known =
-        entry.curve == registry::CURVE_BN254 || entry.curve == registry::CURVE_BLS12_381;
-    let scheme_known =
-        entry.scheme == registry::SCHEME_GROTH16 || entry.scheme == registry::SCHEME_PLONK;
-    if !curve_known || !scheme_known {
-        return Err(SettleError::UnknownCurveOrScheme.into());
-    }
+    check_curve_and_scheme(entry.curve, entry.scheme)?;
 
     let (expect_registry, _) = crate::chain::registry_pda(program_id, chain_id);
     if expect_registry != *registry_acc.key {
@@ -893,7 +959,7 @@ pub fn set_registry_entry(
     // rather than silently acting on either copy. Also records the first RETIRED slot seen
     // (`activation_slot == RETIRED_SLOT`), scanned in the same pass, for the full-registry reuse path
     // below — cheaper than a second scan, and every slot is already being read.
-    let (count, existing, first_retired_idx) = {
+    let (count, existing, first_retired_idx, held_under_other_release) = {
         let d = registry_acc.try_borrow_data()?;
         let hdr = registry::read_header(&d).map_err(|_| ProgramError::InvalidAccountData)?;
         if hdr.chain_id != chain_id {
@@ -901,6 +967,7 @@ pub fn set_registry_entry(
         }
         let mut existing: Option<(usize, u8, u64)> = None;
         let mut first_retired_idx = None;
+        let mut held_under_other_release = false;
         for i in 0..(hdr.count as usize).min(registry::MAX_ENTRIES) {
             let (e, activation_slot) =
                 registry::entry_at(&d, i).map_err(|_| ProgramError::InvalidAccountData)?;
@@ -914,9 +981,38 @@ pub fn set_registry_entry(
             if first_retired_idx.is_none() && activation_slot == registry::RETIRED_SLOT {
                 first_retired_idx = Some(i);
             }
+            // The same programVK, not retired, under another ZisK release.
+            if e.curve == registry::CURVE_BN254
+                && registry::is_zisk_scheme(e.scheme)
+                && e.scheme != entry.scheme
+                && e.vkey_hash == entry.vkey_hash
+                && activation_slot != registry::RETIRED_SLOT
+            {
+                held_under_other_release = true;
+            }
         }
-        (hdr.count, existing, first_retired_idx)
+        (
+            hdr.count,
+            existing,
+            first_retired_idx,
+            held_under_other_release,
+        )
     };
+
+    // Writing under a release depends on the release's status. The one write that never does is retiring an
+    // entry that is present: cleanup has to work whatever the status, and a withdrawn release's entries are
+    // exactly the ones that need it. Anything else, a new entry or a moved activation slot, needs an open
+    // release. A new entry also may not take a programVK that another release's live entry holds, so one
+    // programVK still picks one entry (`registry::find_zisk`).
+    let retires_a_present_entry = existing.is_some() && activation_slot == registry::RETIRED_SLOT;
+    if !retires_a_present_entry {
+        if let Some(refusal) = release_write_refusal(entry.scheme) {
+            return Err(refusal.into());
+        }
+        if existing.is_none() && held_under_other_release {
+            return Err(SettleError::VkeyUnderOtherZiskVersion.into());
+        }
+    }
 
     let (target_idx, is_new_slot) = match existing {
         // Present: only the activation slot changes — never a different layout for the same vkey.
@@ -1261,5 +1357,161 @@ mod pda_parity_tests {
     #[test]
     fn reserved_allow_seeds_matches_rome_zk_layouts() {
         assert_eq!(reserved_allow_seeds(7), reserved_allow::seeds(7));
+    }
+}
+
+#[cfg(test)]
+mod release_rule_tests {
+    use super::*;
+    use rome_zk_layouts::registry::{
+        CURVE_BLS12_381, CURVE_BN254, LAYOUT_ZISK_V1, SCHEME_GROTH16, SCHEME_ZISK_1_2_0,
+        SCHEME_ZISK_1_3_1,
+    };
+
+    fn arg(curve: u8, scheme: u8, vk: u8) -> RegistryEntryArg {
+        RegistryEntryArg {
+            curve,
+            scheme,
+            vkey_hash: [vk; 32],
+            layout_id: LAYOUT_ZISK_V1,
+        }
+    }
+
+    /// The three statuses, one by one: only an open release takes a write. No release ships as Closing, so
+    /// this is the one place the Closing refusal can be reached.
+    #[test]
+    fn only_an_open_release_takes_a_write() {
+        use veritas::Status;
+        assert_eq!(status_write_refusal(Status::Open), None);
+        assert_eq!(
+            status_write_refusal(Status::Closing),
+            Some(SettleError::ZiskVersionClosing)
+        );
+        assert_eq!(
+            status_write_refusal(Status::Withdrawn),
+            Some(SettleError::ZiskVersionWithdrawn)
+        );
+    }
+
+    /// The release list in `rome-zk-layouts` (what off-chain callers read) and the one in Veritas (what the
+    /// program checks) are two tables. They must name the same releases under the same scheme numbers, in
+    /// the same order, so a caller that finds a release by number gets the release the program means.
+    #[test]
+    fn the_layouts_release_list_and_the_veritas_one_agree() {
+        use rome_zk_layouts::registry::ZISK_RELEASES;
+        assert_eq!(ZISK_RELEASES.len(), veritas::versions::ZISK_VERSIONS.len());
+        for (layouts, program) in ZISK_RELEASES
+            .iter()
+            .zip(veritas::versions::ZISK_VERSIONS.iter())
+        {
+            assert_eq!(layouts.scheme, program.scheme, "{}", layouts.name);
+            assert_eq!(layouts.name, program.name);
+        }
+        assert_eq!(SCHEME_ZISK_1_2_0, veritas::versions::SCHEME_ZISK_1_2_0);
+        assert_eq!(SCHEME_ZISK_1_3_1, veritas::versions::SCHEME_ZISK_1_3_1);
+        // Every number the program knows is a ZisK scheme to the layouts crate, and the other way round.
+        for v in veritas::versions::ZISK_VERSIONS.iter() {
+            assert!(rome_zk_layouts::registry::is_zisk_scheme(v.scheme));
+        }
+        assert!(!rome_zk_layouts::registry::is_zisk_scheme(SCHEME_GROTH16));
+        assert!(veritas::zisk_version(SCHEME_GROTH16).is_none());
+    }
+
+    #[test]
+    fn the_shipped_table_has_1_2_0_withdrawn_and_1_3_1_open() {
+        assert_eq!(
+            release_write_refusal(SCHEME_ZISK_1_2_0),
+            Some(SettleError::ZiskVersionWithdrawn)
+        );
+        assert_eq!(release_write_refusal(SCHEME_ZISK_1_3_1), None);
+        // Groth16 is not a ZisK release: no status applies to it.
+        assert_eq!(release_write_refusal(SCHEME_GROTH16), None);
+    }
+
+    #[test]
+    fn a_zisk_scheme_needs_bn254_and_an_unknown_scheme_or_curve_is_refused() {
+        assert_eq!(
+            check_curve_and_scheme(CURVE_BN254, SCHEME_ZISK_1_3_1),
+            Ok(())
+        );
+        assert_eq!(check_curve_and_scheme(CURVE_BN254, SCHEME_GROTH16), Ok(()));
+        assert_eq!(
+            check_curve_and_scheme(CURVE_BLS12_381, SCHEME_GROTH16),
+            Ok(())
+        );
+        for (curve, scheme) in [
+            (CURVE_BLS12_381, SCHEME_ZISK_1_2_0),
+            (CURVE_BLS12_381, SCHEME_ZISK_1_3_1),
+            (CURVE_BN254, 3),
+            (CURVE_BN254, 255),
+            (2, SCHEME_GROTH16),
+        ] {
+            assert_eq!(
+                check_curve_and_scheme(curve, scheme),
+                Err(SettleError::UnknownCurveOrScheme),
+                "curve {curve} scheme {scheme}"
+            );
+        }
+    }
+
+    /// The genesis rule, in the order the instruction applies it: curve and scheme, then the release's
+    /// status, then one key under two releases.
+    #[test]
+    fn genesis_entries_go_through_the_same_checks() {
+        let ok = [
+            arg(CURVE_BN254, SCHEME_ZISK_1_3_1, 1),
+            arg(CURVE_BN254, SCHEME_GROTH16, 0),
+        ];
+        assert_eq!(check_genesis_registry(&ok), Ok(()));
+        assert_eq!(
+            check_genesis_registry(&[arg(CURVE_BN254, SCHEME_ZISK_1_2_0, 1)]),
+            Err(SettleError::ZiskVersionWithdrawn)
+        );
+        assert_eq!(
+            check_genesis_registry(&[arg(CURVE_BLS12_381, SCHEME_ZISK_1_3_1, 1)]),
+            Err(SettleError::UnknownCurveOrScheme)
+        );
+        assert_eq!(
+            check_genesis_registry(&[arg(CURVE_BN254, 9, 1)]),
+            Err(SettleError::UnknownCurveOrScheme)
+        );
+    }
+
+    /// Check 5 on its own: with two releases both writable, one key under both is refused. (Only one release
+    /// is open today, so `check_genesis_registry` stops at the status first; this is the rule a later open
+    /// release meets.)
+    #[test]
+    fn one_key_under_two_zisk_releases_is_refused() {
+        let entries = [
+            arg(CURVE_BN254, SCHEME_ZISK_1_2_0, 7),
+            arg(CURVE_BN254, SCHEME_ZISK_1_3_1, 7),
+        ];
+        assert_eq!(
+            find_key_under_two_releases(&entries),
+            Some(SettleError::VkeyUnderOtherZiskVersion)
+        );
+        // The same key under one release twice is the duplicate rule's, not this one's; a Groth16 entry that
+        // shares the key is not a ZisK entry; and two different keys never clash.
+        assert_eq!(
+            find_key_under_two_releases(&[
+                arg(CURVE_BN254, SCHEME_ZISK_1_3_1, 7),
+                arg(CURVE_BN254, SCHEME_ZISK_1_3_1, 7),
+            ]),
+            None
+        );
+        assert_eq!(
+            find_key_under_two_releases(&[
+                arg(CURVE_BN254, SCHEME_ZISK_1_3_1, 7),
+                arg(CURVE_BN254, SCHEME_GROTH16, 7),
+            ]),
+            None
+        );
+        assert_eq!(
+            find_key_under_two_releases(&[
+                arg(CURVE_BN254, SCHEME_ZISK_1_2_0, 7),
+                arg(CURVE_BN254, SCHEME_ZISK_1_3_1, 8),
+            ]),
+            None
+        );
     }
 }

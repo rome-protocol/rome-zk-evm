@@ -292,6 +292,24 @@ pub enum SettleError {
     /// reading the same bridge for the life of the chain. Refused before any account is created or
     /// written. Portal, cap and bond proposals are unaffected.
     BridgeProgramSetOnce = 86,
+
+    // --- ZisK releases ---
+    /// `PostRootProved`: the registry entry the proof's programVK matches names a ZisK release that is
+    /// withdrawn (or one this build has no row for). No proof is verified under it; the chain registers a key
+    /// under an open release instead. Refused before the layout checks and before the pairing.
+    ZiskVersionWithdrawn = 87,
+    /// `PostRootProved`: the proof's `rootCVadcopFinal` (`proof_abi[800..832]`) is not the value pinned for the
+    /// release the registry entry names. A proof can carry any recursion root it likes, so the pinned one is
+    /// the only one accepted. Refused before the layout checks and before the pairing.
+    RootCNotOfVersion = 88,
+    /// `SetRegistryEntry` or a genesis registry names a ZisK release that is closing. A closing release
+    /// takes no new entries and no moved activation slot; its existing entries still verify and can be
+    /// retired. Refused before anything is written.
+    ZiskVersionClosing = 89,
+    /// `SetRegistryEntry` or a genesis registry names a programVK that a registry entry which is not
+    /// retired already holds under a different ZisK release. One programVK picks one entry, so the
+    /// release a proof is checked under can never be a choice. Retire the other release's entry first.
+    VkeyUnderOtherZiskVersion = 90,
 }
 
 impl From<SettleError> for ProgramError {

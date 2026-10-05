@@ -261,20 +261,7 @@ async fn main() {
             max_pending: 16,
             inbox_program: args.inbox_program,
             max_drift_secs: 60, // the default — this driver exercises PostRoot only
-            registry_entries: vec![
-                zk_settlement_client::RegistryEntry {
-                    curve: rome_zk_layouts::registry::CURVE_BN254,
-                    scheme: rome_zk_layouts::registry::SCHEME_PLONK,
-                    vkey_hash: [0u8; 32],
-                    layout_id: rome_zk_layouts::registry::LAYOUT_HEADER_FALLBACK,
-                },
-                zk_settlement_client::RegistryEntry {
-                    curve: rome_zk_layouts::registry::CURVE_BN254,
-                    scheme: rome_zk_layouts::registry::SCHEME_GROTH16,
-                    vkey_hash: [0u8; 32],
-                    layout_id: rome_zk_layouts::registry::LAYOUT_HEADER_FALLBACK,
-                },
-            ],
+            registry_entries: genesis_registry_entries(),
         },
     );
     let sig = send(&rpc, &payer, &[init_ix]).await;
@@ -346,13 +333,15 @@ async fn main() {
     let finalize_inbox_sig = send(
         &rpc,
         &payer,
-        &[zk_inbox_client::finalize_batch_ix(
+        &[zk_inbox_client::finalize_batch_v2_ix(
             &args.inbox_program,
             &payer.pubkey(),
             &program_id,
             chain_id,
             batch,
             0,
+            0,
+            None,
         )],
     )
     .await;
@@ -510,6 +499,46 @@ async fn main() {
     close_program(&args.rpc_url, &args.keypair, &program_id);
     let _ = program_keypair_path; // kept on disk in case close needs a retry; not deleted here
     println!("OK: devnet flow complete for chain {chain_id} batch {batch}");
+}
+
+/// The genesis registry this driver registers its chain with: the header-fallback entry under the open ZisK
+/// release (the program refuses a withdrawn one) and the zeroed Groth16 slot.
+fn genesis_registry_entries() -> Vec<zk_settlement_client::RegistryEntry> {
+    vec![
+        zk_settlement_client::RegistryEntry {
+            curve: rome_zk_layouts::registry::CURVE_BN254,
+            scheme: rome_zk_layouts::registry::SCHEME_ZISK_1_3_1,
+            vkey_hash: [0u8; 32],
+            layout_id: rome_zk_layouts::registry::LAYOUT_HEADER_FALLBACK,
+        },
+        zk_settlement_client::RegistryEntry {
+            curve: rome_zk_layouts::registry::CURVE_BN254,
+            scheme: rome_zk_layouts::registry::SCHEME_GROTH16,
+            vkey_hash: [0u8; 32],
+            layout_id: rome_zk_layouts::registry::LAYOUT_HEADER_FALLBACK,
+        },
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The driver's genesis registry must not name the withdrawn release: the upgraded program refuses it.
+    #[test]
+    fn genesis_registry_names_the_open_zisk_release() {
+        let entries = genesis_registry_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0].scheme,
+            rome_zk_layouts::registry::SCHEME_ZISK_1_3_1
+        );
+        assert_ne!(
+            entries[0].scheme,
+            rome_zk_layouts::registry::SCHEME_ZISK_1_2_0
+        );
+        assert_eq!(entries[1].scheme, rome_zk_layouts::registry::SCHEME_GROTH16);
+    }
 }
 
 fn keccak_sw(parts: &[&[u8]]) -> [u8; 32] {

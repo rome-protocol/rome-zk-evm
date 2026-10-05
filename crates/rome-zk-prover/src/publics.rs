@@ -42,9 +42,9 @@ mod tests {
     fn gate_proof_bytes() -> Vec<u8> {
         std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../fixtures/prover-input/txv1-dev-reset6-batch-1.plonk.bin"
+            "/../../fixtures/prover-input/txv1-dev-reset6-batch-1.zisk-1.3.1.plonk.bin"
         ))
-        .expect("fixtures/prover-input/txv1-dev-reset6-batch-1.plonk.bin")
+        .expect("fixtures/prover-input/txv1-dev-reset6-batch-1.zisk-1.3.1.plonk.bin")
     }
 
     fn gate_sidecar() -> serde_json::Value {
@@ -60,7 +60,7 @@ mod tests {
         let cd = from_zisk_proof_file(&gate_proof_bytes()).expect("decode gate proof");
         assert_eq!(
             hex::encode(cd.program_vk),
-            "e5ea5c144f19aba3e8a72f897dcb565c1b18bc335b54fd93e06b06689c53cb03",
+            "77c143cfbae4b986c642f0bed1be5ee2bb33338eee23cc5b3c20c86043cc8dc2",
             "the gate proof must decode to the registered vkey of record"
         );
         let pv_bytes =

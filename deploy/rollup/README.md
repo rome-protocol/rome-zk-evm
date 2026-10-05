@@ -151,6 +151,12 @@ command and is never printed. Run `init` first: the commands read the chain from
 | `./rollup exit-config activate [--confirm]` | activates a proposal once its slot has passed |
 | `./rollup exit-config show` | prints the exit configuration and any pending change |
 | `./rollup vault init\|fund\|show` | creates, funds and reads your chain's vault (see [Your chain's vault](#your-chains-vault)) |
+| `./rollup deposit-queue init [parameter flags] [--confirm]` | creates your chain's deposit queue with the standard parameters (a 12 hour deadline, 256 deposits a batch, 4 a block, a 0.001 SOL minimum, a 0.0001 SOL fee paid to your payer key); the chain must have posted a root first, and the per-block limit is checked against the blocks per batch `init` rendered |
+| `./rollup deposit-queue propose [parameter flags] [--activation-slot N \| --activation-delay-slots N] [--confirm]` | proposes new parameters; a new proposal replaces a pending one, and the activation slot must be between one and two challenge windows away |
+| `./rollup deposit-queue activate [--confirm]` | makes the pending parameters live once their slot has passed |
+| `./rollup deposit-queue show` | prints the live and pending parameters, how many deposits the queue holds, how many the chain has taken, and how long the oldest waiting deposit has waited against the deadline |
+| `./rollup deposit --amount N --recipient 0x... --keypair FILE [--wrap-sol] [--confirm]` | deposits `N` raw token units from the depositor's own key, to be credited to the 20-byte address on your chain |
+| `./rollup close-deposit --index N [--confirm]` | gives a deposit record's rent back to its depositor once the batch that credited it is final |
 | `./rollup release-exit --message-hash 0x... [--confirm]` | releases a proved exit from the vault to its recipient |
 | `./rollup migrate --registry-keypair FILE --max-drift-secs N [--confirm]` | brings an older chain's accounts forward; only the registry authority can run it |
 
@@ -166,13 +172,21 @@ is not running is skipped with the reason.
 | --- | --- | --- |
 | service | each service is running | `ServiceMissing` |
 | chain id, sequencer head, derive lag, verifier peers | the chain id matches, blocks (or the idle counter) advance, the verifier keeps pace and has no peers | `ChainIdMismatch`, `SequencerStalled`, `DeriveBehind`, `VerifierHasPeers` |
-| batcher cursor, inbox batches, roots | the accounts on Solana read, and the sequencer is not two batches' worth of blocks ahead of the posted batches | `CursorUnreadable`, `NoBatchPosted`, `BatcherBehind`, `RootUnreadable` |
+| batcher cursor, inbox batches, roots | the accounts on Solana read, and the sequencer is not two batches' worth of blocks ahead of the posted batches | `CursorUnreadable`, `NoBatchPosted`, `BatcherBehind`, `BlocksPerBatchUnreadable`, `RootUnreadable` |
 | batches finalized | blocks were sealed and the batcher finalized a batch since the first sample from at least the window ago | `BatchesNotFinalizing` |
 | settlement lag, prover lag (`PROVER=on`) | the prover is at most 2 batches behind | `SettlementBehind`, `ProverBehind` |
 | verification key (`PROVER=on`) | a verification key for the proving layout is active in the registry | `VkeyNotActive` |
 | payer balance | the payer holds at least the floor | `PayerBelowFloor` |
 | reclaim deadline | the chain has posted a root, or the deadline is further away than the margin | `ReclaimDeadlineNear` inside the margin, `ReclaimDeadlinePassed` once it is over |
 | exit config | the exit configuration reads, and is shown | `ExitConfigUnreadable` |
+| deposit-capable key | before a deposit queue exists, the registry's active key equals the `programVK` in the `vkey.json` that `./rollup guest-build` wrote from a guest at v0.2.0 or later (a `WARN` when `vkey.json` records no guest tag) | `GuestNotDepositCapable`, `DepositKeyNotActive`, `DepositKeyNotRegistered` |
+| deposit caps | the per-block limit times the blocks per batch fits the per-batch limit, for the live parameters and for a pending proposal | `DepositCapsExceedBatch`, `BlocksPerBatchUnreadable` |
+| genesis balance | the genesis gives at most one account a balance, and the vault holds it until the chain has a final batch (afterwards the vault's balance is shown, since exits move it); before the deposit queue exists a missing or short vault is a `WARN` | `GenesisFundedAccountLimit`, `GenesisBalanceNotWholeLamports`, `GenesisUnreadable`, `VaultMissing`, `VaultBelowGenesis`, `VaultUnreadable` |
+| exit config bridge | once the deposit queue exists, the exit configuration names the bridge program in `programs.devnet.json` (before it exists a missing exit configuration is skipped; one that names another bridge always fails) | `ExitConfigMissing`, `ExitConfigNamesNoBridge`, `ExitConfigBridgeMismatch` |
+| deposits section | a deposit queue exists only when the sequencer's config has a `[deposits]` section | `DepositsSectionMissing` |
+| deposit cursor | the batch cursor is in the deposit-aware format once the chain has finalized a batch after the upgrade | `CursorNotV2` |
+| oldest deposit | the oldest waiting deposit has waited less than three quarters of the deadline, the shorter of the live and a pending one (a `WARN` past half) | `DepositNearDeadline` |
+| deposit backlog | shows the deposits the queue holds that no batch has taken yet | `DepositQueueUnreadable` |
 
 The batcher's own age gauge resets each time a batch closes by age and stands still while the batcher waits on Solana,
 so it cannot see a stuck batcher. `check` compares two counters instead: blocks the sequencer sealed and batches the
@@ -252,12 +266,20 @@ the genesis root written at registration. Withdrawals need a final root, so no w
 Proofs are checked against your chain's verification key. Ask Rome to register it after registering your chain,
 as described above. `VKEY_JSON` must describe that registered key, and `ELF_DIR` must contain the matching guest
 program built for your chain's genesis. The batch guest source is published at
-[`rome-protocol/rome-zk-guest`](https://github.com/rome-protocol/rome-zk-guest), tag `v0.2.0`, and uses crates
-from this repository. Build it with `./rollup guest-build`. The command builds an image with the ZisK
-1.2.0-alpha toolchain that clones `rome-zk-evm` at `ROME_ZK_TAG` and `rome-zk-guest` at `ROME_ZK_GUEST_TAG`
-from `.env`. Set `ROME_ZK_TAG=v0.2.2` as shown below; the guest tag defaults to `v0.2.0`. It builds the guest
-for `rendered/genesis.json` and writes `rendered/guest/<sha256>.elf` and `rendered/guest/vkey.json`. Two
-machines get the same sha256 for the same genesis. It takes about 8 minutes the first time and about 6 minutes once the image exists. It refuses by name
+[`rome-protocol/rome-zk-guest`](https://github.com/rome-protocol/rome-zk-guest), tag `v0.2.0`. From the root of
+this repository, run `git clone --branch v0.2.0 https://github.com/rome-protocol/rome-zk-guest.git .fork`,
+then `cd .fork && git submodule update --init --recursive`. The guest uses crates from this repository.
+Build it with `./rollup guest-build`. The command builds the guest-build image (the toolchain of one ZisK release,
+1.2.0-alpha by default, and the default stays that until this guide moves to the newer release, so set `ZISK_RELEASE` in `.env` to build for another, and the image name carries it, and the two public sources, `rome-zk-evm` at `ROME_ZK_TAG` and `rome-zk-guest` at `ROME_ZK_GUEST_TAG`, from
+`.env`; set `ROME_ZK_TAG=v0.2.2` as shown below; the guest tag defaults to `v0.2.0`), builds the guest for `rendered/genesis.json` inside it and
+writes `rendered/guest/<sha256>.elf` and `rendered/guest/vkey.json`. Two machines get the same sha256 for the same
+genesis. The command passes the release to the image as a build argument (`ZISK_RELEASE`) with its toolchain tag, and refuses a release with no pin file (`ZiskReleaseUnknown`); each release's download URLs, sha256 values,
+Rust toolchain tag and key-set root are pinned in `guest-build/zisk/<release>.env`, which has files for 1.2.0-alpha and
+1.3.1-alpha. `vkey.json` names the release (`zisk`) and its scheme number (`scheme`: 1 for 1.2.0-alpha, 2 for
+1.3.1-alpha), and a proving-key directory of another release is refused (`ProvingKeyMismatch`, naming both releases).
+The release is the image's own, so a guest locked to the ZisK crates of another release is refused when the image is built
+(`GuestZiskMismatch`), and a `cargo-zisk` of another release or commit when it runs (`ZiskToolchainMismatch`).
+It takes about 8 minutes the first time and about 6 minutes once the image exists. It refuses by name
 a genesis whose chain id differs from `rendered/chain-id.env` (`ChainIdMismatch`) and a genesis with more than
 one funded account (`GenesisFundedAccountLimit`). The programVK in `vkey.json` is computed with the ZisK proving
 keys, which the command mounts read-only from `ZISK_HOME` (about 36 GB of memory, about 40 seconds); without
@@ -282,7 +304,7 @@ compose file mounts them.
 
 Before every start the prover checks those keys against a manifest of hashes (`prover/keys.sha256`, checked by
 `prover/check-keys.sh`, both mounted into the container). The manifest in this folder is pinned to the keys of
-ZisK 1.2.0-alpha, and a mismatch stops the prover by name (`KeysShaMismatch`). The `*.consttree` files under
+ZisK 1.3.1-alpha, and a mismatch stops the prover by name (`KeysShaMismatch`). The `*.consttree` files under
 `provingKey` are not part of the hash: ziskup generates them on the host at install. Only to pin a key set of your own,
 on purpose, run this once on the host and keep the result:
 

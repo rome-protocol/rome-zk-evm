@@ -3,10 +3,11 @@
 # (args.txt) and then behaves like succeeds.sh. Never invokes any real ZisK toolchain.
 set -eu
 if [ "${1:-}" = "--version" ]; then
-  echo "cargo-zisk 1.2.0-alpha [gpu] (fbbc69b 2026-08-26T22:06:35.808557029Z)"
+  echo "cargo-zisk 1.3.1-alpha [gpu] (306a9c9 fake-build)"
   exit 0
 fi
 echo "$*" > "$(dirname "$0")/args.txt"
+echo "${ZISK_HOME:-unset}" > "$(dirname "$0")/zisk_home.txt"
 out=""
 while [ "$#" -gt 0 ]; do
   case "$1" in

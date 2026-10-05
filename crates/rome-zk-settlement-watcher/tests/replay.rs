@@ -21,7 +21,7 @@ use support::{
     raw_message_from_ixs, FailAfter, FixtureSource, NullBodyOnce, ScriptedSource, TestPg,
 };
 use zk_inbox_client::{
-    abandon_batch_ix, close_batch_ix, finalize_batch_ix, open_batch_ix, open_chunk_ix,
+    abandon_batch_ix, close_batch_ix, finalize_batch_v2_ix, open_batch_ix, open_chunk_ix,
     seal_chunk_ix,
 };
 
@@ -570,7 +570,16 @@ async fn partial_finalize_batch_leaves_the_batch_open_until_the_cursor_completes
         raw_message_from_ixs(&payer, &[open_ix]),
         false,
     );
-    let step1_ix = finalize_batch_ix(&program_id, &payer, &SETTLEMENT_PROGRAM, 200_101, 1, 1);
+    let step1_ix = finalize_batch_v2_ix(
+        &program_id,
+        &payer,
+        &SETTLEMENT_PROGRAM,
+        200_101,
+        1,
+        1,
+        0,
+        None,
+    );
     source.push_newest(
         "2step1000000000000000000000000000000000000000000000000000",
         101,
@@ -591,7 +600,16 @@ async fn partial_finalize_batch_leaves_the_batch_open_until_the_cursor_completes
     assert_eq!(status, "open", "step=1 of 10 must not finalize the batch");
 
     // The completing call: step=0 means "the rest, in this call".
-    let step0_ix = finalize_batch_ix(&program_id, &payer, &SETTLEMENT_PROGRAM, 200_101, 1, 0);
+    let step0_ix = finalize_batch_v2_ix(
+        &program_id,
+        &payer,
+        &SETTLEMENT_PROGRAM,
+        200_101,
+        1,
+        0,
+        0,
+        None,
+    );
     source.push_newest(
         "3step0000000000000000000000000000000000000000000000000000",
         102,
@@ -1156,7 +1174,16 @@ async fn block_status_reports_the_confirmed_suffix_until_the_finalizing_tx_itsel
         raw_message_from_ixs(&payer, &[open_ix]),
         false,
     );
-    let finalize_ix = finalize_batch_ix(&program_id, &payer, &SETTLEMENT_PROGRAM, 200_101, 1, 0);
+    let finalize_ix = finalize_batch_v2_ix(
+        &program_id,
+        &payer,
+        &SETTLEMENT_PROGRAM,
+        200_101,
+        1,
+        0,
+        0,
+        None,
+    );
     source.push_newest(
         "2finalize0000000000000000000000000000000000000000000000000",
         101,
@@ -1292,7 +1319,16 @@ async fn a_closed_finalized_batch_still_reads_data_posted() {
         raw_message_from_ixs(&payer, &[open_ix]),
         false,
     );
-    let finalize_ix = finalize_batch_ix(&program_id, &payer, &SETTLEMENT_PROGRAM, 200_101, 1, 0);
+    let finalize_ix = finalize_batch_v2_ix(
+        &program_id,
+        &payer,
+        &SETTLEMENT_PROGRAM,
+        200_101,
+        1,
+        0,
+        0,
+        None,
+    );
     source.push_newest(
         "2finalize0000000000000000000000000000000000000000000000000",
         101,
@@ -1403,7 +1439,16 @@ async fn a_dropped_finalizing_tx_shows_data_posted_dropped() {
         raw_message_from_ixs(&payer, &[open_ix]),
         false,
     );
-    let finalize_ix = finalize_batch_ix(&program_id, &payer, &SETTLEMENT_PROGRAM, 200_101, 1, 0);
+    let finalize_ix = finalize_batch_v2_ix(
+        &program_id,
+        &payer,
+        &SETTLEMENT_PROGRAM,
+        200_101,
+        1,
+        0,
+        0,
+        None,
+    );
     source.push_newest(
         "2finalize0000000000000000000000000000000000000000000000000",
         101,
@@ -1446,7 +1491,16 @@ async fn re_deriving_after_a_cursor_reset_does_not_double_count_a_finalize_step(
         raw_message_from_ixs(&payer, &[open_ix]),
         false,
     );
-    let step_ix = finalize_batch_ix(&program_id, &payer, &SETTLEMENT_PROGRAM, 200_101, 1, 1);
+    let step_ix = finalize_batch_v2_ix(
+        &program_id,
+        &payer,
+        &SETTLEMENT_PROGRAM,
+        200_101,
+        1,
+        1,
+        0,
+        None,
+    );
     source.push_newest(
         "2step100000000000000000000000000000000000000000000000000",
         101,

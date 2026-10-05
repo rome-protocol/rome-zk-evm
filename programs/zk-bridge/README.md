@@ -44,12 +44,18 @@ authorise a release for that chain — see `rome_zk_layouts::exit::exit_consumer
   funded or wired, and that wiring additionally verifies `vault_config.settlement_program`/`authority`
   before funding/wiring as defense in depth (belt and suspenders — the CORE property is the keying, not
   this check).
+  The bridge config (`["bridge_config"]`, a last read-only account) must exist and name `settlement_program`
+  as its settlement program (`WrongSettlementProgram` otherwise), so only the canonical settlement program
+  ever gets a vault.
   `mint_decimals` is also checked against the mint account's own real decimals byte (offset 44 of the
   standard 82-byte layout) — `MintDecimalsMismatch` on a mismatch, so an operator typo can never mis-scale
   every future `ReleaseExit` payout.
 - **`Fund { chain_id, amount }`** — a permissionless SPL transfer into the vault. Anyone may top it up;
   nothing about who funds it is trusted, only where the tokens land (the vault's own PDA-derived account).
-- **`ReleaseExit { chain_id, message_hash }`** — the core instruction. See "Fund-safety invariants" below.
+- **`ReleaseExit { chain_id, message_hash }`** — the core instruction. See "Fund-safety invariants" below. It
+  also takes the bridge config as a last read-only account and refuses a vault whose settlement program is not
+  the config's (`WrongSettlementProgram`), so the `exit_consumer` signature only ever goes to the canonical
+  settlement program.
 - **`InitBridgeConfig { settlement_program, inbox_program }`** — writes the bridge's one config account
   (`["bridge_config"]`) once. The signer must be this program's own upgrade authority: the instruction reads
   the program's real `ProgramData` account and refuses a wrong address, a wrong owner, an immutable program or
@@ -61,12 +67,17 @@ authorise a release for that chain — see `rome_zk_layouts::exit::exit_consumer
   `["root", chain_id]` account, owned by that program, and `root.authority` must sign. It refuses a settlement
   program other than the config's, a reserved chain id, a registry that is not at the config's settlement
   program's registry address, not owned by it, for another chain, or naming an inbox other than the config's, a
-  vault whose mint has more than 9 decimals, and any parameter outside the bounds below. A pre-funded queue
+  vault whose mint has more than 9 decimals, any parameter outside the bounds below, and a chain whose root has
+  never taken a posted batch (`ChainNeverPosted`: `head_pending_batch` is 0). Such a chain can be reclaimed by
+  anyone, which would strand the deposits in its vault; the counter only grows and reclaim needs it at 0, so a
+  chain that holds a queue is never reclaimed and its registry's inbox never changes. A pre-funded queue
   address is adopted, and a queue that already holds data is refused.
 - **`ProposeDepositParams { chain_id, activation_slot, params }`** and **`ActivateDepositParams { chain_id }`**
-  — the chain authority proposes new parameters (same root check, same bounds), with an activation slot at least
-  one `root.challenge_window_slots` away; anyone may activate them once that slot is reached. A proposal is
-  refused while another is pending.
+  — the chain authority proposes new parameters (same root check, same bounds), with an activation slot between one
+  and two `root.challenge_window_slots` from the current slot (`ActivationTooSoon`, `ActivationTooLate`); anyone
+  may activate them once that slot is reached. A new valid proposal replaces a pending one, so a proposal that
+  cannot activate is corrected by proposing again; an invalid proposal changes nothing. Activation runs every
+  bound check again on the pending values.
 
 - **`Deposit { chain_id, amount, l2_recipient }`** (tag 3) — a user locks `amount` base units of the vault's mint
   in the vault and queues a credit of the same value, in gwei, to a 20-byte address on the chain. The depositor
@@ -76,8 +87,9 @@ authorise a release for that chain — see `rome_zk_layouts::exit::exit_consumer
   address that was pre-funded is adopted. Every account is bound by address: the vault config and the queue sit at
   their PDAs under the vault config's settlement program, and the chain's root, registry and exit config are that
   program's accounts. Refused by name: a vault config or queue of another settlement program or chain; a chain whose
-  root or registry is gone or not owned by the settlement program (a reclaimed chain keeps its queue and vault, so
-  a deposit there could never be credited or refunded); an exit config naming another bridge; a zero recipient or
+  root or registry is gone or not owned by the settlement program; a root that has never taken a posted batch
+  (`ChainNeverPosted`); a registry that names an inbox other than the bridge config's (the config is a last
+  read-only account); an exit config naming another bridge; a zero recipient or
   the exit portal; a fee recipient other than the parameter; an amount below the minimum; a mint whose amount does
   not fit in gwei; a record address that already holds a record.
   Accounts, in order: `depositor`, `depositor_token`, `vault_config`, `vault_token`, `deposit_queue`,
@@ -215,25 +227,25 @@ seeded by these values, so a random mint/recipient previously made every figure 
 that PDA's own bump-seed search depth. Pinned, every figure below is bit-exact across
 repeated runs of the same binary (verified: 3 consecutive `cargo test` runs, identical CU each time).
 
-- `ReleaseExit`, whole transaction (the `ConsumeExit` CPI + the SPL transfer included): **45,873 CU**
-  (54,506 before the crate bump), comfortably inside the 1.4M per-transaction ceiling.
+- `ReleaseExit`, whole transaction (the `ConsumeExit` CPI + the SPL transfer included): **47,924 CU**
+  (it reads the bridge config now), comfortably inside the 1.4M per-transaction ceiling.
 - `ConsumeExit`, the nested CPI frame within that same transaction (real bridge, not a test-only stub):
   **15,835 CU** (15,794 before the crate bump) — unaffected by the vault re-key (it derives `zk-settlement`'s own PDA, not
   `zk-bridge`'s).
 - `InitVault` (incl. the `InitializeAccount3` CPI, the chain-authority-gate's root read, and the
-  mint_decimals check): **30,753 CU** (39,998 before the crate bump). `Fund` (incl. the SPL `Transfer`
-  CPI): **8,902 CU** (7,354 before the crate bump, measured against a random mint, so not comparable).
+  mint_decimals check): **32,791 CU** (it reads the bridge config now). `Fund` (incl. the SPL `Transfer`
+  CPI): **8,929 CU**.
 
 Deposit setup (same tests, `programs/zk-bridge/tests/deposit_setup.rs`; printed by each test):
-`InitBridgeConfig` **12,718 CU** (4,948 to 5,014 for the refusals, 14,271 when the address was pre-funded and
-adopted), `InitDepositQueue` **19,881 CU** (it computes the queue's seed hash with the keccak syscall),
-`ProposeDepositParams` **12,906 CU**, `ActivateDepositParams` **6,686 CU**.
+`InitBridgeConfig` **12,730 CU** (4,960 to 5,026 for the refusals, 14,283 when the address was pre-funded and
+adopted), `InitDepositQueue` **20,007 CU** (it computes the queue's seed hash with the keccak syscall),
+`ProposeDepositParams` **13,030 CU**, `ActivateDepositParams` **7,269 CU**.
 
 Deposits (`programs/zk-bridge/tests/deposit.rs`; printed by each test, against fixture accounts for the settlement
-side): `Deposit` **36,039 CU** for the first deposit of a queue (33,040 and 34,540 for the next two of the golden
-test), **39,353 CU** when the record address was pre-funded
-and adopted, **54,751 CU** for the wrap-SOL instructions and a `Deposit` in one transaction; a refusal costs
-5,767 to 26,626 CU. `CloseDeposit` **12,453 CU** (5,135 to 11,717 CU for the refusals).
+side): `Deposit` **38,012 CU** for the first deposit of a queue (35,013 and 36,513 for the next two of the golden
+test), **41,326 CU** when the record address was pre-funded
+and adopted, **56,724 CU** for the wrap-SOL instructions and a `Deposit` in one transaction; a refusal costs
+6,084 to 28,599 CU. `CloseDeposit` **12,453 CU** (5,135 to 11,717 CU for the refusals).
 
 (Re-key note: promoting `settlement_program` into the vault PDA seeds shifts every PDA's own
 bump-seed search depth, so these figures moved from their earlier values — down, in this measurement,

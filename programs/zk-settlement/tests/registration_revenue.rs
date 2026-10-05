@@ -919,7 +919,7 @@ async fn permissionless_init_chain_refuses_caller_supplied_registry_entries() {
     );
     fields.registry_entries = vec![sclient::RegistryEntry {
         curve: rome_zk_layouts::registry::CURVE_BN254,
-        scheme: rome_zk_layouts::registry::SCHEME_PLONK,
+        scheme: rome_zk_layouts::registry::SCHEME_ZISK_1_3_1,
         vkey_hash: [0x42u8; 32],
         layout_id: rome_zk_layouts::registry::LAYOUT_ZISK_V1,
     }];
@@ -982,7 +982,7 @@ async fn reserved_init_chain_still_accepts_registry_entries() {
     allow_reserved(&mut ctx, &r, chain_id).await;
     let entry = sclient::RegistryEntry {
         curve: rome_zk_layouts::registry::CURVE_BN254,
-        scheme: rome_zk_layouts::registry::SCHEME_PLONK,
+        scheme: rome_zk_layouts::registry::SCHEME_ZISK_1_3_1,
         vkey_hash: [0x42u8; 32],
         layout_id: rome_zk_layouts::registry::LAYOUT_ZISK_V1,
     };
@@ -1032,7 +1032,7 @@ fn set_entry_ix(r: &Rig, chain_id: u64, vkey: [u8; 32], layout_id: u8, now: u64)
         chain_id,
         sclient::RegistryEntry {
             curve: rome_zk_layouts::registry::CURVE_BN254,
-            scheme: rome_zk_layouts::registry::SCHEME_PLONK,
+            scheme: rome_zk_layouts::registry::SCHEME_ZISK_1_3_1,
             vkey_hash: vkey,
             layout_id,
         },
@@ -3550,7 +3550,7 @@ async fn post_root_proved_rejects_a_gas_in_batch_that_disagrees_with_the_proved_
     );
     fields.registry_entries = vec![sclient::RegistryEntry {
         curve: rome_zk_layouts::registry::CURVE_BN254,
-        scheme: rome_zk_layouts::registry::SCHEME_PLONK,
+        scheme: rome_zk_layouts::registry::SCHEME_ZISK_1_3_1,
         vkey_hash: vk,
         layout_id: rome_zk_layouts::registry::LAYOUT_HEADER_FALLBACK,
     }];
@@ -3605,6 +3605,11 @@ async fn post_root_proved_rejects_a_gas_in_batch_that_disagrees_with_the_proved_
 
     let mut proof_abi = vec![0u8; 768 + 32 + 32 + 512];
     proof_abi[768..800].copy_from_slice(&vk);
+    // The recursion root the entry's release (ZisK 1.3.1) pins, so the proof gets past that check to the
+    // header binding this test is about.
+    proof_abi[800..832].copy_from_slice(
+        &hex::decode("c3f12b9f8707c6a1e96df2bf6702c2ebdfbafedabeac654644a380befe091ac4").unwrap(),
+    );
 
     let args = sclient::PostRootFields {
         chain_id,

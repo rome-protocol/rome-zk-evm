@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "The operator CLI: one binary for the settlement commands (chain-id, register, refund-deposit, exit-config, migrate, init-cursor) and the bridge commands (vault init, vault fund, vault show, release-exit). Every transaction goes out as a V1 transaction through rome-zk-solana-sender."
+description = "The operator CLI: one binary for the settlement commands (chain-id, register, refund-deposit, exit-config, migrate, init-cursor) and the bridge commands (vault init, vault fund, vault show, release-exit), and Rome's checked verification-key registration (vkey register, vkey show). Every transaction goes out as a V1 transaction through rome-zk-solana-sender."
 
 [lib]
 name = "rome_zk_ops"
@@ -22,6 +22,9 @@ zk-inbox-client = { path = "../zk-inbox-client" }
 # The vault tool's planning code and the bridge instruction builders. Library only, no feature.
 zk-bridge-client = { path = "../zk-bridge-client" }
 rome-zk-layouts = { path = "../rome-zk-layouts" }
+# The ZisK release table (name, scheme number, Open/Closing/Withdrawn): `vkey register` refuses a release that is not Open from the
+# same table settlement checks. Table only, no entrypoint.
+veritas = { path = "../../programs/veritas", default-features = false, features = ["no-entrypoint"] }
 # Every transaction this CLI sends goes through this crate, as a V1 transaction. There is no other send path.
 rome-zk-solana-sender = { path = "../rome-zk-solana-sender" }
 solana-program.workspace = true
@@ -37,6 +40,11 @@ thiserror = "2"
 hex = "0.4"
 serde_json = "1"
 base64 = "0.22"
+sha2 = "0.10"
+# The genesis block the node itself would build from genesis.json (hash and state root), through the same chain spec the node
+# uses, so the vkey check compares the chain's recorded genesis with the operator's file and not with a second opinion.
+alloy-genesis = { version = "2.3", default-features = false }
+reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.2" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]

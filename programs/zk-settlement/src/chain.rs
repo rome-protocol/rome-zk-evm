@@ -172,6 +172,9 @@ pub fn init_chain(
             namespace_acc,
             args.chain_id,
         )?;
+        // The registry authority co-signs a reserved chain's genesis registry, and it is held to the same
+        // rules as `SetRegistryEntry`: a known curve and scheme, an open release, one programVK per release.
+        governance::check_genesis_registry(&args.registry_entries)?;
         0
     } else {
         // A permissionless chain carries no verifier keys of its own. Refused here,

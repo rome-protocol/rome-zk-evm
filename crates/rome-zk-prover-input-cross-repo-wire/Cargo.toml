@@ -3,7 +3,7 @@ name = "rome-zk-prover-input-cross-repo-wire"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Proves rome-zk-prover-input's wire::RomePublicInput/RomeWitnessInput encode with rome-zk-prover-input and decode with the fork's own guest_rome::input types byte for byte, and the reverse. Path-depends on the fork checkout at ../../.fork (rome-protocol/zisk-eth-client, branch deposits-guest: wire v3) — see this crate's README."
+description = "Proves rome-zk-prover-input's wire::RomePublicInput/RomeWitnessInput encode with rome-zk-prover-input and decode with the fork's own guest_rome::input types byte for byte, and the reverse. Path-depends on the fork checkout at ../../.fork (rome-protocol/zisk-eth-client, branch public-main: wire v3 on ZisK 1.3.1-alpha) — see this crate's README."
 
 # Standalone workspace, its own Cargo.lock, excluded from both the rome-zk root workspace (root
 # Cargo.toml's exclude list) and rome-zk-prover-input's own standalone one: this crate's dependency on

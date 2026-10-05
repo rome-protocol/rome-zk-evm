@@ -15,7 +15,7 @@ use rome_zk_batcher::pipeline::{self, ChunkPlan};
 use rome_zk_derive::inbox::InboxRetrieval;
 use rome_zk_derive::reader::AccountReader;
 use rome_zk_derive::PipelineError;
-use rome_zk_testkit::{cursor_account, root_account_with_authority};
+use rome_zk_testkit::{cursor_account_for, root_account_with_authority};
 use solana_program::pubkey::Pubkey;
 use solana_sdk::{
     account::Account,
@@ -114,7 +114,7 @@ async fn chunks_written_via_the_real_program_read_back_through_inbox_retrieval_m
     );
     pt.add_account(
         zk_inbox_client::cursor_pda(&program_id, &settlement_program, CHAIN_ID).0,
-        cursor_account(program_id, CHAIN_ID, BATCH_ID),
+        cursor_account_for(2, program_id, CHAIN_ID, BATCH_ID),
     );
     pt.add_account(
         payer.pubkey(),
@@ -159,13 +159,15 @@ async fn chunks_written_via_the_real_program_read_back_through_inbox_retrieval_m
     // ("transform every remaining leaf, then combine") suffices at this fixture's size.
     send(
         &mut ctx,
-        &[zk_inbox_client::finalize_batch_ix(
+        &[zk_inbox_client::finalize_batch_v2_ix(
             &program_id,
             &payer.pubkey(),
             &settlement_program,
             CHAIN_ID,
             BATCH_ID,
             0,
+            0,
+            None,
         )],
         &payer,
     )
@@ -245,7 +247,7 @@ async fn a_chunk_body_tampered_after_finalization_is_critical_acc_mismatch() {
     );
     pt.add_account(
         zk_inbox_client::cursor_pda(&program_id, &settlement_program, CHAIN_ID).0,
-        cursor_account(program_id, CHAIN_ID, BATCH_ID),
+        cursor_account_for(2, program_id, CHAIN_ID, BATCH_ID),
     );
     pt.add_account(
         payer.pubkey(),
@@ -287,13 +289,15 @@ async fn a_chunk_body_tampered_after_finalization_is_critical_acc_mismatch() {
 
     send(
         &mut ctx,
-        &[zk_inbox_client::finalize_batch_ix(
+        &[zk_inbox_client::finalize_batch_v2_ix(
             &program_id,
             &payer.pubkey(),
             &settlement_program,
             CHAIN_ID,
             BATCH_ID,
             0,
+            0,
+            None,
         )],
         &payer,
     )

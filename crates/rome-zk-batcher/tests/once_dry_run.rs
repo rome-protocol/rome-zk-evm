@@ -57,6 +57,16 @@ impl AccountOps for BanksAccountOps {
         Ok(account.map(|a| a.data))
     }
 
+    async fn get_account_owner(&self, pubkey: &Pubkey) -> Result<Option<Pubkey>, ResolveError> {
+        let account = self
+            .banks_client
+            .clone()
+            .get_account(*pubkey)
+            .await
+            .expect("BanksClient::get_account");
+        Ok(account.map(|a| a.owner))
+    }
+
     async fn accounts_exist(&self, pubkeys: &[Pubkey]) -> Result<Vec<bool>, ResolveError> {
         let mut out = Vec::with_capacity(pubkeys.len());
         for pubkey in pubkeys {
@@ -246,13 +256,15 @@ async fn post_group_real(
         }
     }
 
-    let finalize_ix = zk_inbox_client::finalize_batch_ix(
+    let finalize_ix = zk_inbox_client::finalize_batch_v2_ix(
         &program_id,
         &payer_kp.pubkey(),
         &settlement_program,
         chain_id,
         batch,
         0,
+        0,
+        None,
     );
     send(ctx, &[finalize_ix], payer_kp).await.unwrap();
 
@@ -636,13 +648,15 @@ async fn once_dry_run_reads_a_real_log_preflights_opens_sends_finalizes_and_veri
     }
 
     // --- step 6: FinalizeBatch, then verify acc against the client-side reference ---
-    let finalize_ix = zk_inbox_client::finalize_batch_ix(
+    let finalize_ix = zk_inbox_client::finalize_batch_v2_ix(
         &program_id,
         &payer_kp.pubkey(),
         &settlement_program,
         CHAIN_ID,
         batch,
         0,
+        0,
+        None,
     );
     send(&mut ctx, &[finalize_ix], &payer_kp).await.unwrap();
 
