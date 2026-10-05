@@ -57,6 +57,8 @@ hex = "0.4"
 sha2 = "0.10"
 thiserror = "2"
 tracing = "0.1"
+# Prints the `tracing` lines (a failed prove attempt's reason among them) to stderr; no features beyond `fmt`.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 anyhow = "1"
 # `killpg` on `LocalCargoZisk`'s timeout path (kill the whole process group `cargo-zisk` leads, not
 # just its own pid, so a grandchild the tool forked can never hold the drain pipe open past a

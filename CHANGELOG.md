@@ -2,7 +2,26 @@
 
 ## Unreleased
 
+- `./rollup init` with `EXITS=on` stops when it cannot read the exit payer's public key, instead of going on without checking that it differs from the batcher's payer. `./rollup check`'s exit log scan also counts failed `eth_blockNumber` reads, which stop a scan before any `eth_getLogs`.
+- Withdrawals are packaged: the node image carries `rome-zk-exit-prover`, `EXITS=on` in `.env` makes `./rollup init` render its config and `./rollup up` start it, and `./rollup check` reports the exit prover, whether exits are active and any stuck withdrawal (`ExitProverUnreachable`, `ExitsNotActive`, `ExitsStuck`). The exit prover now waits without failing until the chain's exit configuration is active. A new guide, `docs/WITHDRAWALS.md`, covers what a user sends, what the operator runs, how long it takes and every refusal. A test starts the real exit prover binary against fake servers.
+- The exit prover has a payer key of its own. Anyone can start a withdrawal, even for one wei, and each proof costs its payer a fee and about 0.002 SOL of rent, so sharing the batcher's key would let users drain it. `EXIT_PAYER_KEYPAIR_PATH` in `.env` names the key; with `EXITS=on`, `./rollup init` refuses a missing one (`ExitPayerMissing`) or the batcher's own (`ExitPayerIsBatcherPayer`), and the compose file mounts only that key into the exit prover. `./rollup check` also reports the exit payer's balance (`ExitPayerBelowFloor`, floor `EXIT_PAYER_FLOOR_LAMPORTS`), failed log reads by the exit prover that keep growing (`ExitLogScanFailing`), and an exit prover that cannot read the chain's exit configuration from Solana (`ExitConfigUnreadableByExitProver`).
+- The prover host setup now generates the GPU constant files for the aggregation steps too. It passed `-a` to `check-setup`, which there means `--no-aggregation`, so a GPU host had files only for the basic circuits and every proof stopped at the first aggregation step with a missing `compressor.const_gpu`. It now runs `check-setup` after both keys are unpacked, with `--proving-key-plonk` and `--plonk`. The step is now its own, with a marker file written only after it succeeds, so a run that stopped half way is repeated. A host set up before this fix has no marker: run the setup again, which sees the keys match, skips the download and runs the step, or run the `check-setup` command from docs/PROVER-HOST.md by hand. The key check now also leaves out the `*.consttree_gpu` file that step writes under `provingKeySnark`, so such a host still matches the pinned hashes.
+- `./rollup check` no longer fails `prover lag` on a quiet chain whose prover has caught up: the 600 second bound applies only while a batch is waiting to be proved, as the example alert already did.
+- Two issue forms on the public repository: a verification key request and a bug report. Blank issues are off, and the
+  issue chooser points questions to Discussions and security problems to `SECURITY.md`. The public export carries them.
+- The guide says what to have ready for a key request and that Rome registers a complete request within two business
+  days; the README has a Support section.
+- The prover no longer exits at start with the panic "Cannot start a runtime from within a runtime": its chain reads now run on their own thread, and a test starts the real binary against a fake RPC server.
+- A failed proof attempt now says why: each one logs a warning with the attempt number, the batch and the reason (for `cargo-zisk`, the last lines of its own output), and the final "prove attempts exhausted" error carries the last attempt's reason. The prover binary also prints its log lines to stderr now; it printed none before.
+- The prover's chain-read errors no longer carry the RPC URL, so an API key in `solana_rpc_url` stays out of the log and the `--once` retry line.
+- The prover's chain reads refuse a current-thread runtime by name instead of hanging, name a refused thread instead of panicking, and the binary has tests for them.
+- The key check leaves out the `*.const_gpu` files that ZisK's setup writes on a GPU host, as it already leaves out `*.consttree`, so a GPU prover host no longer fails with `KeysShaMismatch`.
 - Every default that names a release now names v0.3.0 and ZisK 1.3.1-alpha: `./rollup guest-build`, its image, and `rome-zk-ops vkey register --evm-tag`.
+- The exit prover works out the loaded-accounts limit a `ProveExit` needs from the live account sizes, including the settlement program's own data, so its proofs are no longer refused for loading too much. `loaded_accounts_data_size_limit` is now optional: unset uses the computed value, and a value below it stops the exit prover at start with an error naming the setting.
+- The exit prover reads the portal's logs in pieces of at most `max_log_range` blocks (default 10,000) up to the node's newest block, instead of one call from the start block to "latest" that a node refuses once the chain is a day or two old. The scan cursor moves to the end of each piece that worked, so a quiet stretch is not asked for again.
+- The exit prover has a new gauge, `rome_zk_exit_gate_read_ok`, that is 1 when it could read the chain's exit config and root and 0 when it could not. A failed read no longer sets `rome_zk_exit_active` to 0, so `./rollup check` no longer reads an unreachable chain as "exits are off". When the exit config names a different portal, the exit prover starts over and scans the new portal from its start block.
+- The exit prover pays proved withdrawals out itself: after its own `ProveExit` lands, and for any proved record it finds still open, it sends `ReleaseExit` with the accounts `release-exit` uses. `auto_release` (default `true`) turns it off. A payout below `release_create_account_min_lamports` (default 10,000,000) to a recipient with no wrapped SOL token account is not released automatically, so an attacker cannot make the exit payer buy token accounts for dust; it is counted in `rome_zk_exit_release_waiting`, its message hash is logged, and `release-exit` still pays it. New metrics: `rome_zk_exits_released_total` and `rome_zk_exit_release_waiting`. `docs/WITHDRAWALS.md` is updated to match.
+- An exit that waits for a manual release (a small payout to a recipient without a token account) is checked on a growing delay, from 30 seconds up to 30 minutes, with its accounts read together in one request, instead of four reads on every poll. `rome_zk_exit_gate_read_ok` is also 0 while the program accounts cannot be read.
 
 ## v0.2.2
 
@@ -12,6 +31,13 @@
 
 v0.2.2 was cut from an earlier commit than this one. The sections below describe `main`, which runs ahead of the
 programs deployed on devnet: deposits are built but not deployed there yet.
+
+## Prover host setup: key archives kept outside ZISK_HOME
+
+- `setup-prover-host.sh` downloads the key archives to a directory beside `ZISK_HOME` by default. ziskup clears
+  `ZISK_HOME` when it installs, so the old default (inside it) lost the checked archives before they were unpacked, and
+  every real install stopped with `ZiskupFailed`. A `DOWNLOAD_DIR` inside `ZISK_HOME` is now refused by name
+  (`DownloadDirInsideZiskHome`).
 
 ## The prover host on ZisK 1.3.1
 

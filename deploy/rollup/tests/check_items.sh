@@ -74,6 +74,11 @@ expect "$out" '^FAIL: settlement lag — .*lag=4' "settlement lag over the bound
 echo 5 > "$S/root_final"
 echo 9 > "$S/prover_behind"; out="$(run)"
 expect "$out" '^FAIL: prover lag' "a prover many batches behind fails"
+echo 0 > "$S/prover_behind"; echo 7468 > "$S/prover_lag"; out="$(run)"
+expect "$out" '^PASS: prover lag' "a caught-up prover on a quiet chain passes, whatever age its last proved batch had"
+echo 1 > "$S/prover_behind"; out="$(run)"
+expect "$out" '^FAIL: prover lag — ProverBehind' "an unproved batch older than 600 s fails by name"
+echo 0 > "$S/prover_lag"
 echo "sequencer batcher reth-verifier derive" > "$S/running"; out="$(run)"
 expect "$out" '^FAIL: service prover — ServiceMissing' "PROVER=on with no prover running is named"
 finish check_items

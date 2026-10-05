@@ -3,8 +3,9 @@
 # against this file before every prover start; see its header for the format and the hash recipe. File names are sorted
 # bytewise (LC_ALL=C), so a pin does not depend on the locale of the host that checks it.
 #
-# The *.consttree files are not hashed. ziskup generates them on the host when it installs the key (a GPU install
-# writes them its own way), so they are left out of the hash; each proof's local verify still uses them.
+# The *.consttree, *.consttree_gpu and *.const_gpu files are not hashed. The host's setup generates them from the keys (a
+# GPU install writes a *.const_gpu file per circuit and the PLONK step's recursivef.consttree, recursivef.const_gpu and recursivef.consttree_gpu), so they are left out of the hash;
+# each proof's local verify still uses them.
 #
 # These are the keys that `ziskup -v 1.3.1-alpha --provingkey` and `ziskup setup_snark` install (see docs/PROVER-HOST.md).
 # A different ZisK release has different keys: do not re-pin to make a mismatch go away, install the release this file was

@@ -37,6 +37,19 @@ pub struct Metrics {
     /// `"eth_getLogs"` or `"get_slot"`. Both skip the current poll rather than propagating (never crash the
     /// loop, never fall back to a wrong value like slot `0`).
     pub exit_rpc_errors_total: IntCounterVec,
+    /// `1` while the chain's exit config names a portal and the exit cap is above zero (the prover is
+    /// scanning), `0` while it is idle waiting for exits to be switched on.
+    pub exit_active: IntGauge,
+    /// `rome_zk_exit_gate_read_ok`: 1 when the last read of the chain accounts the exit prover needs (the exit
+    /// config, the root and the program accounts) worked, 0 when it failed. `exit_active` keeps its last value across a failed read, so this is what tells "exits are off" from
+    /// "the chain could not be read".
+    pub exit_gate_read_ok: IntGauge,
+    /// `rome_zk_exits_released_total`: payouts this process sent with `ReleaseExit` (an exit someone else released
+    /// is not counted).
+    pub exits_released_total: IntCounter,
+    /// `rome_zk_exit_release_waiting`: proved exits left for a manual `release-exit` because the payout is below the
+    /// token-account minimum and the recipient has no token account.
+    pub exit_release_waiting: IntGauge,
 }
 
 impl Metrics {
@@ -111,6 +124,36 @@ impl Metrics {
         )
         .unwrap();
 
+        let exit_active = IntGauge::new(
+            "rome_zk_exit_active",
+            "1 when the chain's exit config names a portal and a cap and the prover is scanning, 0 while idle",
+        )
+        .unwrap();
+        registry.register(Box::new(exit_active.clone())).unwrap();
+        let exit_gate_read_ok = IntGauge::new(
+            "rome_zk_exit_gate_read_ok",
+            "1 when the last read of the chain accounts the exit prover needs succeeded, 0 when it failed",
+        )
+        .unwrap();
+        registry
+            .register(Box::new(exit_gate_read_ok.clone()))
+            .unwrap();
+        let exits_released_total = IntCounter::new(
+            "rome_zk_exits_released_total",
+            "Payouts this process sent with ReleaseExit",
+        )
+        .unwrap();
+        registry
+            .register(Box::new(exits_released_total.clone()))
+            .unwrap();
+        let exit_release_waiting = IntGauge::new(
+            "rome_zk_exit_release_waiting",
+            "Proved exits left for a manual release-exit: the payout is below the token-account minimum and the recipient has no token account",
+        )
+        .unwrap();
+        registry
+            .register(Box::new(exit_release_waiting.clone()))
+            .unwrap();
         registry
             .register(Box::new(prove_attempts_total.clone()))
             .unwrap();
@@ -148,6 +191,10 @@ impl Metrics {
             exit_log_decode_errors_total,
             exit_read_errors_total,
             exit_rpc_errors_total,
+            exit_active,
+            exit_gate_read_ok,
+            exits_released_total,
+            exit_release_waiting,
         })
     }
 

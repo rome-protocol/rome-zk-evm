@@ -96,7 +96,7 @@ pub struct Config {
     #[serde(default = "default_confirm_poll_interval_ms")]
     pub confirm_poll_interval_ms: u64,
     /// The follower loop: consecutive prove attempts for the SAME batch — each
-    /// with a freshly wiped work directory — before it halts with `ProveAttemptsExhausted { attempts }`
+    /// with a freshly wiped work directory — before it halts with `FollowerError::ProveAttemptsExhausted { attempts, last }`
     /// rather than retrying forever. `LocalCargoZisk::prove` itself reads none of this — it makes
     /// exactly one subprocess invocation per call; the retry-with-wipe loop is `follower`'s own.
     #[serde(default = "default_max_prove_attempts")]

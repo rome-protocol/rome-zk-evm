@@ -66,12 +66,40 @@ struct RpcFetch<'a> {
     rt: &'a tokio::runtime::Runtime,
     client: solana_client::nonblocking::rpc_client::RpcClient,
 }
+
+/// Runs one RPC read to completion from a SYNC trait method.
+///
+/// The follower calls these methods from inside `Runtime::block_on`, and `block_on` panics ("Cannot start a runtime
+/// from within a runtime") on any thread that is already driving a runtime. The read therefore runs on its own
+/// short-lived thread, which has no runtime context, while the caller waits for it. This needs a multi-thread
+/// runtime: on a current-thread runtime the caller holds the only driver and the read would wait for it forever, so
+/// that flavour is refused by name instead. A panic on the read thread, or a thread the system refuses to start,
+/// comes back as an `Err` the caller turns into its own named `FetchError`, never a panic here.
+fn read_off_runtime<T: Send>(
+    rt: &tokio::runtime::Runtime,
+    read: impl std::future::Future<Output = T> + Send,
+) -> Result<T, String> {
+    if rt.handle().runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+        return Err(
+            "the RPC read needs a multi-thread runtime; this one would never finish it".to_string(),
+        );
+    }
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("rpc-read".to_string())
+            .spawn_scoped(scope, move || rt.block_on(read))
+            .map_err(|e| format!("could not start the RPC read thread: {e}"))?
+            .join()
+            .map_err(|_| "the RPC read thread panicked".to_string())
+    })
+}
+
 impl SnapshotFetch for RpcFetch<'_> {
     fn get_multiple_accounts(
         &mut self,
         keys: &[Pubkey],
     ) -> Result<(u64, Vec<Option<Vec<u8>>>), rome_zk_prover::anchor::FetchError> {
-        self.rt.block_on(async {
+        read_off_runtime(self.rt, async {
             let resp = self
                 .client
                 .get_multiple_accounts_with_commitment(
@@ -79,12 +107,17 @@ impl SnapshotFetch for RpcFetch<'_> {
                     solana_commitment_config::CommitmentConfig::finalized(),
                 )
                 .await
-                .map_err(|e| rome_zk_prover::anchor::FetchError(e.to_string()))?;
+                .map_err(|e| {
+                    rome_zk_prover::anchor::FetchError(rome_zk_solana_sender::describe_rpc_error(
+                        &e,
+                    ))
+                })?;
             Ok((
                 resp.context.slot,
                 resp.value.into_iter().map(|a| a.map(|a| a.data)).collect(),
             ))
         })
+        .map_err(rome_zk_prover::anchor::FetchError)?
     }
 
     /// A plain `getBalance` — reporting only, never folded into the decision
@@ -93,12 +126,12 @@ impl SnapshotFetch for RpcFetch<'_> {
         &mut self,
         payer: &Pubkey,
     ) -> Result<u64, rome_zk_prover::anchor::FetchError> {
-        self.rt.block_on(async {
-            self.client
-                .get_balance(payer)
-                .await
-                .map_err(|e| rome_zk_prover::anchor::FetchError(e.to_string()))
+        read_off_runtime(self.rt, async {
+            self.client.get_balance(payer).await.map_err(|e| {
+                rome_zk_prover::anchor::FetchError(rome_zk_solana_sender::describe_rpc_error(&e))
+            })
         })
+        .map_err(rome_zk_prover::anchor::FetchError)?
     }
 }
 impl rome_zk_prover_input::inbox::AccountFetch for RpcFetch<'_> {
@@ -110,30 +143,36 @@ impl rome_zk_prover_input::inbox::AccountFetch for RpcFetch<'_> {
         &mut self,
         pubkey: &Pubkey,
     ) -> Result<Option<Vec<u8>>, rome_zk_prover_input::inbox::FetchError> {
-        self.rt.block_on(async {
+        read_off_runtime(self.rt, async {
             self.client
                 .get_account_with_commitment(pubkey, self.client.commitment())
                 .await
                 .map(|resp| resp.value.map(|a| a.data))
-                .map_err(|e| rome_zk_prover_input::inbox::FetchError(e.to_string()))
+                .map_err(|e| {
+                    rome_zk_prover_input::inbox::FetchError(
+                        rome_zk_solana_sender::describe_rpc_error(&e),
+                    )
+                })
         })
+        .map_err(rome_zk_prover_input::inbox::FetchError)?
     }
     fn get_multiple_accounts(
         &mut self,
         pubkeys: &[Pubkey],
     ) -> Result<Vec<Option<Vec<u8>>>, rome_zk_prover_input::inbox::FetchError> {
-        self.rt.block_on(async {
+        read_off_runtime(self.rt, async {
             let mut out = Vec::with_capacity(pubkeys.len());
             for page in pubkeys.chunks(rome_zk_prover_input::inbox::MAX_ACCOUNTS_PER_GET_MULTIPLE) {
-                let accounts = self
-                    .client
-                    .get_multiple_accounts(page)
-                    .await
-                    .map_err(|e| rome_zk_prover_input::inbox::FetchError(e.to_string()))?;
+                let accounts = self.client.get_multiple_accounts(page).await.map_err(|e| {
+                    rome_zk_prover_input::inbox::FetchError(
+                        rome_zk_solana_sender::describe_rpc_error(&e),
+                    )
+                })?;
                 out.extend(accounts.into_iter().map(|a| a.map(|a| a.data)));
             }
             Ok(out)
         })
+        .map_err(rome_zk_prover_input::inbox::FetchError)?
     }
 }
 
@@ -262,6 +301,15 @@ fn main() -> anyhow::Result<()> {
     if args.follow && args.dry_run && args.iterations.is_none() {
         anyhow::bail!("--follow --dry-run requires --iterations N (the live gate runs a bounded read-only walk)");
     }
+
+    // Without a subscriber every `tracing` line (a failed prove attempt's reason among them) goes nowhere.
+    // The level is fixed at info: `RUST_LOG` filtering needs tracing-subscriber's `env-filter`, which the lock
+    // does not carry.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .with_writer(std::io::stderr)
+        .try_init();
 
     let cfg = rome_zk_prover::config::Config::load(&args.config)?;
     let vkey = cfg.load_vkey_of_record()?;
@@ -415,7 +463,10 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                Err(e) => println!("simulateTransaction RPC error: {e}"),
+                Err(e) => println!(
+                    "simulateTransaction RPC error: {}",
+                    rome_zk_solana_sender::describe_rpc_error(&e)
+                ),
             }
             return Ok(());
         }
@@ -480,5 +531,80 @@ fn main() -> anyhow::Result<()> {
         Err(e @ FollowerError::AbandonedInboxBatch { .. }) => anyhow::bail!("{e}"),
         Err(e @ FollowerError::VerifierBehindAlarm { .. }) => anyhow::bail!("{e}"),
         Err(e) => anyhow::bail!("{e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rome_zk_prover_input::inbox::AccountFetch;
+
+    #[test]
+    fn a_read_made_from_inside_block_on_returns() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let got = rt.block_on(async { read_off_runtime(&rt, async { 7u32 }) });
+        assert_eq!(got, Ok(7));
+    }
+
+    #[test]
+    fn a_panicking_read_becomes_an_error() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let got: Result<u32, String> =
+            rt.block_on(async { read_off_runtime(&rt, async { panic!("boom") }) });
+        assert!(got.unwrap_err().contains("panicked"));
+    }
+
+    /// On a current-thread runtime the read thread would wait forever for the driver the caller holds, so
+    /// the read is refused by name instead.
+    #[test]
+    fn a_current_thread_runtime_is_refused_not_hung() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let got = rt.block_on(async { read_off_runtime(&rt, async { 1u32 }) });
+        assert!(got.unwrap_err().contains("multi-thread"));
+    }
+
+    /// The inbox account read, called from inside `block_on` as the follower does, against an address that
+    /// refuses connections: a named fetch error, not a panic and not a hang.
+    #[test]
+    fn an_inbox_account_read_inside_block_on_fails_by_name_when_the_rpc_is_down() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = solana_client::nonblocking::rpc_client::RpcClient::new(
+            "http://127.0.0.1:1".to_string(),
+        );
+        let mut fetch = RpcFetch { rt: &rt, client };
+        let got = rt.block_on(async { fetch.get_account(&Pubkey::new_unique()) });
+        assert!(got.is_err(), "an unreachable RPC must be an error");
+    }
+
+    /// The RPC URL often carries an API key, and a transport error's text ends with that URL. None of the four
+    /// reads may let the key into the error the follower logs.
+    #[test]
+    fn a_failed_read_does_not_leak_the_api_key_in_the_rpc_url() {
+        use rome_zk_prover::anchor::SnapshotFetch;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = solana_client::nonblocking::rpc_client::RpcClient::new(
+            "http://127.0.0.1:1/?api-key=SECRETKEY".to_string(),
+        );
+        let mut fetch = RpcFetch { rt: &rt, client };
+        let key = Pubkey::new_unique();
+        let texts = rt.block_on(async {
+            vec![
+                SnapshotFetch::get_multiple_accounts(&mut fetch, &[key])
+                    .unwrap_err()
+                    .0,
+                fetch.payer_lamports(&key).unwrap_err().0,
+                fetch.get_account(&key).unwrap_err().0,
+                AccountFetch::get_multiple_accounts(&mut fetch, &[key])
+                    .unwrap_err()
+                    .0,
+            ]
+        });
+        for t in texts {
+            assert!(!t.is_empty(), "the error still says something");
+            assert!(!t.contains("SECRETKEY"), "the API key leaked: {t}");
+        }
     }
 }

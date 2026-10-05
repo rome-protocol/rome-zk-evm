@@ -10,7 +10,7 @@ transaction, and sends `ProveExit` (28) the same way `rome-zk-prover` sends `Pos
 **The follower's own state is the chain** — specifically the `exit_nullifier` bit
 `ProveExit` sets for a proved message. Everything [`follower::Follower`] keeps in memory (which messages
 are pending, on what they're waiting, which are stuck) is a cache a restart rebuilds for free from
-`eth_getLogs(portal, portal_from_block)` plus one nullifier-page read per message — never a disk cursor,
+`eth_getLogs` over the portal from `portal_from_block` (in pieces, see below) plus one nullifier-page read per message — never a disk cursor,
 never a database. This replaces an earlier version of this binary whose one `from_block` cursor advanced
 for every log BEFORE the attempt's own outcome was known, silently dropping a message that came back
 `StateUnavailableAtRoot`/`QueuedForWindow` (it would never be seen again once the cursor passed its
@@ -87,8 +87,13 @@ routes every `attempt_exit` outcome:
 An undecodable log is counted (`IngestReport::decode_errors`) and skipped — the loop survives a
 malformed or foreign log, never aborts on the first one. A message seen across two overlapping polls
 (`ingest` called twice with an overlapping `fromBlock` range) is deduped by hash and attempted once.
-`run::poll_once`'s own three RPC calls fail the same way: an `eth_getLogs` error counts
-`rome_zk_exit_rpc_errors_total{method="eth_getLogs"}` and skips the poll; a `read_slot` (get_slot) error
+The log scan goes in pieces of at most `max_log_range` blocks (default `10000`), from the cursor up to the node's
+newest block (`eth_blockNumber`), because nodes refuse wide ranges: reth stops at 100,000 blocks by default. The cursor
+moves to the end of each piece that worked, whether or not it held a log. If the exit config starts naming a different
+portal, the follower starts over: the cursor goes back to `portal_from_block` and the waiting and stuck messages
+(from the old portal) are dropped.
+`run::poll_once`'s own RPC calls fail the same way: an `eth_getLogs` (or `eth_blockNumber`) error counts
+`rome_zk_exit_rpc_errors_total{method="eth_getLogs"}` (or `"eth_blockNumber"`) and skips the poll, leaving the cursor at the end of the last piece that worked; a `read_slot` (get_slot) error
 counts the same counter with `method="get_slot"` and skips the whole attempt round — never falls back to
 slot `0`, which would send a `ProveExit` tagged for the WRONG challenge window at a real fee; a `read_root`
 error does the same with `method="read_root"` — never a fabricated `head_final_batch = 0`, which would
@@ -175,13 +180,20 @@ rome-zk-exit-prover --config exit-prover.toml [--once]
 
 `Config` (TOML, `deny_unknown_fields`): `chain_id`, `settlement_program_id`, `settlement_rpc` (Solana),
 `verifier_rpc` (the L2 reth/derive node the portal lives on), `payer_key_path`, plus tuning knobs
-(`poll_interval_ms`, `compute_unit_limit`, `loaded_accounts_data_size_limit`, `priority_fee_micro_lamports`,
+(`poll_interval_ms`, `compute_unit_limit`, `loaded_accounts_data_size_limit` — unset by default, which means the binary works
+out what a `ProveExit` loads from the live account sizes (the settlement program's own data is most of it) and re-checks
+it every poll; a value set below that stops the binary with an error naming the setting — `priority_fee_micro_lamports`,
 `max_priority_fee_micro_lamports`, `confirm_timeout_secs` (default `15`), `confirm_commitment` (`finalized`, the default, or `confirmed`), `confirm_poll_interval_ms` (default `500`), `max_proof_bytes`, `metrics_addr`,
-`portal_from_block` — default `0`; Tiber's own deployed portal starts at `208399`
-(set in the operator's deploy config), `max_send_attempts` — default `5` — and `max_window_requeues` —
+`max_log_range` — default `10000`, at least `1` — `portal_from_block` — default `0`; Tiber's own deployed portal starts at `208399`
+(set in the operator's deploy config), `max_send_attempts` — default `5` — `auto_release` — default `true` — `release_create_account_min_lamports` — default `10000000` — and `max_window_requeues` —
 default `3`, bounding `Pending.window_requeues` the same way `max_send_attempts` bounds `send_attempts`).
-The exit portal ADDRESS is never configured — it is read live from `exit_config` on every restart;
-`portal_from_block` only bounds how far back a fresh follower's `eth_getLogs` scan starts.
+In the node image this binary runs as the `exit-prover` Compose service: with `EXITS=on` in `deploy/rollup/.env`,
+`./rollup init` renders `exit-prover.toml` and `./rollup up` starts it. The binary waits, healthy and without
+errors, until the chain's `exit_config` names a portal and a non-zero cap, then scans. [The withdrawals
+guide](../../docs/WITHDRAWALS.md) covers the whole flow for users and operators.
+
+The exit portal ADDRESS is never configured — it is read live from `exit_config` on every poll;
+`portal_from_block` only bounds how far back a fresh follower's log scan starts.
 
 The real end-to-end run against a live Tiber Final root needs the verifier's own
 `--rpc.eth-proof-window` set wide enough to cover the gap between an exit's send block and the batch that
@@ -197,13 +209,30 @@ retry is the mechanism; setting the flag is deployment, not code).
 `rome_zk_exit_scan_from_block` (gauge), `rome_zk_exit_log_decode_errors_total` (counter),
 `rome_zk_exit_read_errors_total{kind}` (counter — `settlement`/`verifier`/`build`; `attempt_exit`
 returning `Err(_)`, the `Sender` never touched), `rome_zk_exit_rpc_errors_total{method}` (counter —
-`eth_getLogs`/`get_slot`/`read_root`; an RPC call `run::poll_once` itself made failing outright).
+`eth_getLogs`/`eth_blockNumber`/`get_slot`/`read_root`; an RPC call `run::poll_once` itself made failing outright),
+`rome_zk_exit_active` (gauge — 1 when exits are configured and on; a failed read of the exit config or root leaves it at its
+last value) and `rome_zk_exit_gate_read_ok` (gauge — 1 when the last read of the chain accounts the exit prover needs worked, 0 when
+it failed), `rome_zk_exits_released_total` (counter — payouts this process sent) and `rome_zk_exit_release_waiting`
+(gauge — proved exits left for a manual `release-exit` because the payout is below the token-account minimum).
 
-## The release tool
+## Paying the exit out
 
-Releasing a proved exit from `programs/zk-bridge`'s vault (`ReleaseExit`) is a SEPARATE, operator-run
-tool — [`zk-bridge-client`](../zk-bridge-client)'s `release-exit` example — not part of this crate's own
-loop. See that crate's README.
+After its own `ProveExit` lands, and for every proved record it finds still open (an `ExitAlreadyProved` outcome
+whose exit record account still exists), the exit prover sends `ReleaseExit` itself. The instruction is built by
+[`zk-bridge-client`](../zk-bridge-client), the same builder `rome-zk-ops release-exit` uses, so the accounts are the
+same. `ReleaseExit` is open to anyone and has no waiting period, and the program reads the recipient from the proved
+record.
+
+Two settings control it: `auto_release` (default `true`) and `release_create_account_min_lamports` (default
+`10000000`). When the recipient's wrapped SOL token account does not exist and the payout is below that amount, the
+exit prover does not release, because anyone could otherwise make the exit payer pay token-account rent for dust. The
+message hash is logged, the exit is counted in `rome_zk_exit_release_waiting`, and the user or the operator can still
+run `release-exit`. Such an exit is looked at again after 30 seconds, then after 60, doubling up to 30 minutes, and
+starts over when its record or the token account changes; the accounts of all waiting exits that are due are read in one
+batched request. Every other refusal is logged by name (`ExitRecordNotProved`, `BridgeProgramUnset`,
+`VaultConfigNotFound`, `VaultSettlementMismatch`, `VaultDecimalsInvalid` and the undecodable-account cases). A failed
+send is retried on the next poll, and after several failures the exit prover stops trying for that run and leaves the
+exit for `release-exit`.
 
 ## Testing
 
@@ -211,11 +240,15 @@ loop. See that crate's README.
 cargo test -p rome-zk-exit-prover
 ```
 
-Every test runs against `fixtures/exit/*.json` (the anvil scenario) and in-process fakes for
-`SettlementReader`, `VerifierRpc` and `Sender` — no network, no cluster, no `build-sbf` (this is a plain
-off-chain binary). `src/follower.rs`'s own `#[cfg(test)]` module drives the retry/stuck state machine
+Every test runs against `fixtures/exit/*.json` (the anvil scenario), in-process fakes for
+`SettlementReader`, `VerifierRpc` and `Sender`, or small fake nodes on a loopback port — no real network, no cluster, no
+`build-sbf` (this is a plain off-chain binary). `src/follower.rs`'s own `#[cfg(test)]` module drives the retry/stuck state machine
 directly (no `attempt_exit`, hand-built outcomes); `tests/attempt_exit.rs` covers `attempt_exit`'s own
 refusals and cap pre-checks; `tests/follower.rs` covers the two cases that need a real `attempt_exit` call
 (the pre-send nullifier check, and the full restart-from-genesis wire loop); `tests/run.rs` covers
-`run::poll_once`'s own two RPC-failure paths (an `eth_getLogs` error, a `get_slot` error) against fakes
-that panic if the `Sender` (or any further settlement read) is ever reached.
+`run::poll_once`'s own RPC-failure paths (an `eth_getLogs` error, a `get_slot` error) against fakes
+that panic if the `Sender` (or any further settlement read) is ever reached, the chunked log scan against a fake L2
+that refuses wide ranges, the portal-change reset, and the exit gate's two gauges; `tests/binary_once.rs` runs the real
+binary with `--once` against fake Solana and L2 nodes (idle chains, an active chain, nodes that answer 500, the
+loaded-accounts limit worked out from a large program account and a too-small configured one refused, and the scan
+split by `max_log_range`).

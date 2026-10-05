@@ -128,3 +128,23 @@ impl SettlementReader for RpcSettlementReader {
             .map_err(|e| ReadError::Rpc(e.to_string()))
     }
 }
+
+impl crate::release::AccountReader for RpcSettlementReader {
+    fn read_account(&self, key: &Pubkey) -> Result<Option<Vec<u8>>, ReadError> {
+        match self.get_account_data(key) {
+            Ok(data) => Ok(Some(data)),
+            Err(ReadError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn read_accounts(&self, keys: &[Pubkey]) -> Result<Vec<Option<Vec<u8>>>, ReadError> {
+        self.client
+            .get_multiple_accounts_with_commitment(
+                keys,
+                solana_commitment_config::CommitmentConfig::finalized(),
+            )
+            .map(|r| r.value.into_iter().map(|a| a.map(|a| a.data)).collect())
+            .map_err(|e| ReadError::Rpc(e.to_string()))
+    }
+}

@@ -161,12 +161,17 @@ pub struct BlockByNumber {
 /// The RPC calls the exit prover's follow loop needs against the L2 verifier — a trait so
 /// [`crate::core::attempt_exit`]'s tests drive it against a scripted fake.
 pub trait VerifierRpc: Send + Sync {
-    /// `eth_getLogs({address, fromBlock, toBlock: "latest"})` — every `ExitInitiated` log from
-    /// `from_block` onward.
+    /// `eth_blockNumber` — the node's newest block.
+    fn eth_block_number(&self) -> Result<u64, VerifierError>;
+
+    /// `eth_getLogs({address, fromBlock, toBlock})` — every `ExitInitiated` log in `from_block..=to_block`.
+    /// Nodes refuse wide ranges (reth stops at 100,000 blocks by default), so the caller asks for one
+    /// bounded piece at a time (see [`crate::run::poll_once`]).
     fn eth_get_logs(
         &self,
         portal_address: &str,
         from_block: u64,
+        to_block: u64,
     ) -> Result<Vec<LogEntry>, VerifierError>;
 
     /// `eth_getProof(address, [slot], <hex block>)`.
@@ -187,10 +192,24 @@ pub struct HttpVerifierRpc {
 }
 
 impl VerifierRpc for HttpVerifierRpc {
+    fn eth_block_number(&self) -> Result<u64, VerifierError> {
+        let result = rpc_call(&self.url, "eth_blockNumber", serde_json::json!([]))?;
+        let hex: String =
+            serde_json::from_value(result).map_err(|source| VerifierError::Decode {
+                method: "eth_blockNumber",
+                source,
+            })?;
+        u64::from_str_radix(hex.trim_start_matches("0x"), 16).map_err(|e| VerifierError::RpcError {
+            method: "eth_blockNumber",
+            error: format!("not a block number: {hex} ({e})"),
+        })
+    }
+
     fn eth_get_logs(
         &self,
         portal_address: &str,
         from_block: u64,
+        to_block: u64,
     ) -> Result<Vec<LogEntry>, VerifierError> {
         let result = rpc_call(
             &self.url,
@@ -198,7 +217,7 @@ impl VerifierRpc for HttpVerifierRpc {
             serde_json::json!([{
                 "address": portal_address,
                 "fromBlock": block_number_hex(from_block),
-                "toBlock": "latest",
+                "toBlock": block_number_hex(to_block),
             }]),
         )?;
         serde_json::from_value(result).map_err(|source| VerifierError::Decode {

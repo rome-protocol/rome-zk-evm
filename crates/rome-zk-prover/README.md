@@ -337,7 +337,9 @@ whose bytes were corrupted after the fact can decode clean and match the record'
 longer satisfying the pairing. ANY failure wipes the whole directory and proves again — bounded by
 `Config::max_prove_attempts` (each attempt gets a freshly wiped directory) — never halts on a corrupt
 or cryptographically-broken cache; only a run that exhausts every attempt halts, with
-`ProveAttemptsExhausted { attempts }`. A restart after `Relayed` needs no special case: the next
+`ProveAttemptsExhausted { attempts, last }`, where `last` is the last attempt's own failure text. Every failed
+attempt also logs one warning to stderr naming the attempt, the batch and the reason (for a `cargo-zisk` failure,
+the last 40 lines of its output, 8 KiB at most). A restart after `Relayed` needs no special case: the next
 `anchor()` for that same batch id sees `HeadAhead` (the chain head already advanced) and
 `prepare_checked_proof` returns `Outcome::AlreadyPosted` before the work directory is ever touched.
 `poster::build_post_ix` mirrors this same binding one layer down, locally, before every send (see

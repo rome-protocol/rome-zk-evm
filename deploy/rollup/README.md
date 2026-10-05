@@ -17,14 +17,10 @@ one NVIDIA GPU with more than 30 GB of memory, a verification key Rome has regis
 and a guest built for your chain's genesis. See
 [The prover is required for settlement](#the-prover-is-required-for-settlement).
 
-Rome's settlement programs are live on public Solana devnet. Their addresses are in
-[`programs.devnet.json`](programs.devnet.json), the default `PROGRAMS_JSON` in `.env.example`, and `init` and
-`check` read the program addresses from it. The settlement program's global config enables
-permissionless registration, with a 5 SOL registration deposit and a 0.001 SOL fee when a proved root is
-posted. The reclaim window is 6,480,000 slots, about 30 days at 400 ms per slot. After that, anyone
-can reclaim a chain that has never posted a root. Its root, registry and chain
-configuration accounts close. Their SOL, including the deposit, goes to the treasury, and its batcher
-stops. The deposit is refundable to the chain authority after one final root or ten posted roots. `./rollup refund-deposit --confirm` sends it back.
+The [devnet guide](../../docs/RUN-ON-DEVNET.md#what-is-live-on-devnet) has the live settlement settings.
+`init` and `check` read program addresses from [`programs.devnet.json`](programs.devnet.json), the default
+`PROGRAMS_JSON` in `.env.example`. A chain that has posted no root can be reclaimed once the settlement program's reclaim window has passed since its registration. The registration deposit is refundable to the chain authority after one final root or ten posted roots.
+`./rollup refund-deposit --confirm` sends it back.
 
 Set `SOLANA_RPC_URL` in `.env` to any Solana devnet RPC endpoint you use. A provider endpoint is more reliable
 than the public endpoint under load.
@@ -61,8 +57,8 @@ sends the recorded nonce and chain id with the registration, so the program refu
 A new chain's genesis has no balances. Nobody is minted any coins, and the exit portal is the only predeployed
 contract, at balance 0. This is on purpose. A genesis cannot change after you register, and a genesis that mints
 coins could never take deposits safely: its holder could exit coins that other people's deposits paid for. L2 gas
-comes from deposits once they ship, and until then a chain with no balances cannot send a transaction. If you need
-gas sooner, you can declare one backed balance in `[genesis]`:
+comes from deposits once the chain has a proved root and its queue is ready. Until then a chain with no
+balances cannot send a transaction. If you need gas sooner, you can declare one backed balance in `[genesis]`:
 
 ```toml
 backed_address = "0x..."               # an address you control
@@ -76,7 +72,7 @@ Set both keys or neither. You lock the same amount in the vault with the bridge 
 checks that the vault holds it before it registers your verification key. `init` prints the exact lamport amount to
 lock. First create the vault with the bridge program's `InitVault`, signed by your chain authority, which works only
 after `register`; you also need that amount of wrapped SOL, on top of the SOL budget for registration and fees.
-On devnet the bridge program is the shared zk-bridge in `programs.devnet.json`. [Your chain's vault](#your-chains-vault)
+The bridge address comes from `programs.devnet.json`. [Your chain's vault](#your-chains-vault)
 gives the commands.
 
 `init` stops with `FundedAddressRemoved` if `chain.toml` sets `genesis.funded_address`. It also stops with
@@ -113,7 +109,7 @@ API key, that too.
 `register` needs one flag and has no default. `./rollup register --dry-run` prints the commands without running
 anything. `./rollup register --confirm` runs them and writes `rendered/pdas.env`. Your payer keypair signs the
 registration, and registration locks the chain deposit from it. The amount is set in the settlement program's global
-config (5 SOL on devnet), so check it there before you fund the payer. Without a prover, Solana fees and
+config, so check it there before you fund the payer. Without a prover, Solana fees and
 inbox account rent still use the payer's SOL. Watch its balance on a busy chain.
 
 `register --confirm` can be run again if it stopped after the registration was sent (for example the batch cursor
@@ -125,9 +121,11 @@ second time, and finishes the cursor and `rendered/pdas.env`. If it cannot read 
 built for your chain's genesis, [open an issue on this repository](https://github.com/rome-protocol/solana-zk-evm/issues).
 Attach `rendered/genesis.json` and `rendered/guest/vkey.json`, and include your chain id from
 `rendered/chain-id.env` and the guest tag. `vkey.json` holds the ELF's sha256 (`elf_sha256`), the genesis
-file's sha256 (`genesis_sha256`) and the `programVK`. If your genesis declares a balance, include the vault
-that backs it. Rome answers on the issue. Until your key is registered, your chain has no verification key on
-Solana.
+file's sha256 (`genesis_sha256`), the `programVK`, and the ZisK release in `zisk` and `scheme`.
+For this release those fields are `1.3.1-alpha` and `2`. Rome rebuilds the guest and registers the key
+under that release. If your genesis declares a balance, include the vault that backs it. Rome answers on
+the issue. Until your key is registered, your chain has no verification key on Solana.
+For moving a chain to another release, see [ZisK releases](../../docs/ZISK-RELEASES.md).
 
 `up` starts the services. `./rollup up sequencer` starts just that one. `check` tells you, by name, which service is
 missing or unhealthy, then compares the chain id, the heads, the batcher's progress, the inbox and the roots. Its items
@@ -151,12 +149,12 @@ command and is never printed. Run `init` first: the commands read the chain from
 | `./rollup exit-config activate [--confirm]` | activates a proposal once its slot has passed |
 | `./rollup exit-config show` | prints the exit configuration and any pending change |
 | `./rollup vault init\|fund\|show` | creates, funds and reads your chain's vault (see [Your chain's vault](#your-chains-vault)) |
-| `./rollup deposit-queue init [parameter flags] [--confirm]` | creates your chain's deposit queue with the standard parameters (a 12 hour deadline, 256 deposits a batch, 4 a block, a 0.001 SOL minimum, a 0.0001 SOL fee paid to your payer key); the chain must have posted a root first, and the per-block limit is checked against the blocks per batch `init` rendered |
+| `./rollup deposit-queue init [parameter flags] [--confirm]` | creates your chain's deposit queue with the standard parameters (a 12 hour deadline, 256 deposits a batch, 4 a block, a minimum of 1,000,000 raw units (0.001 SOL for wrapped SOL), and a 0.0001 SOL fee paid to your payer key); the chain must have posted a root first, and the per-block limit is checked against the blocks per batch `init` rendered |
 | `./rollup deposit-queue propose [parameter flags] [--activation-slot N \| --activation-delay-slots N] [--confirm]` | proposes new parameters; a new proposal replaces a pending one, and the activation slot must be between one and two challenge windows away |
 | `./rollup deposit-queue activate [--confirm]` | makes the pending parameters live once their slot has passed |
 | `./rollup deposit-queue show` | prints the live and pending parameters, how many deposits the queue holds, how many the chain has taken, and how long the oldest waiting deposit has waited against the deadline |
 | `./rollup deposit --amount N --recipient 0x... --keypair FILE [--wrap-sol] [--confirm]` | deposits `N` raw token units from the depositor's own key, to be credited to the 20-byte address on your chain |
-| `./rollup close-deposit --index N [--confirm]` | gives a deposit record's rent back to its depositor once the batch that credited it is final |
+| `./rollup close-deposit --index N [--confirm]` | gives a deposit record's rent back to its depositor after the crediting batch's root is final and its batch authority has closed that batch with the inbox's `CloseBatch` |
 | `./rollup release-exit --message-hash 0x... [--confirm]` | releases a proved exit from the vault to its recipient |
 | `./rollup migrate --registry-keypair FILE --max-drift-secs N [--confirm]` | brings an older chain's accounts forward; only the registry authority can run it |
 
@@ -179,11 +177,14 @@ is not running is skipped with the reason.
 | payer balance | the payer holds at least the floor | `PayerBelowFloor` |
 | reclaim deadline | the chain has posted a root, or the deadline is further away than the margin | `ReclaimDeadlineNear` inside the margin, `ReclaimDeadlinePassed` once it is over |
 | exit config | the exit configuration reads, and is shown | `ExitConfigUnreadable` |
-| deposit-capable key | before a deposit queue exists, the registry's active key equals the `programVK` in the `vkey.json` that `./rollup guest-build` wrote from a guest at v0.2.0 or later (a `WARN` when `vkey.json` records no guest tag) | `GuestNotDepositCapable`, `DepositKeyNotActive`, `DepositKeyNotRegistered` |
+| exit prover, exits active, stuck exits (`EXITS=on`) | the exit prover answers on its metrics port, it could read the chain's exit configuration and root from Solana, that configuration names a portal and a cap, and no withdrawal is parked as stuck | `ExitProverUnreachable`, `ExitConfigUnreadableByExitProver` (fix the Solana RPC the exit prover uses), `ExitsNotActive`, `ExitsStuck` |
+| exit payer balance (`EXITS=on`) | the exit prover's own payer holds at least `EXIT_PAYER_FLOOR_LAMPORTS` | `ExitPayerBelowFloor`, `ExitPayerBalanceUnreadable` |
+| exit log scan (`EXITS=on`) | the count of failed `eth_getLogs` reads by the exit prover did not grow since the previous `check` (the first run only records a sample) | `ExitLogScanFailing` |
+| deposit-capable key | before a deposit queue exists, the registry's active key equals the `programVK` in the `vkey.json` from a deposit-capable guest (a `WARN` when `vkey.json` records no guest tag) | `GuestNotDepositCapable`, `DepositKeyNotActive`, `DepositKeyNotRegistered` |
 | deposit caps | the per-block limit times the blocks per batch fits the per-batch limit, for the live parameters and for a pending proposal | `DepositCapsExceedBatch`, `BlocksPerBatchUnreadable` |
 | genesis balance | the genesis gives at most one account a balance, and the vault holds it until the chain has a final batch (afterwards the vault's balance is shown, since exits move it); before the deposit queue exists a missing or short vault is a `WARN` | `GenesisFundedAccountLimit`, `GenesisBalanceNotWholeLamports`, `GenesisUnreadable`, `VaultMissing`, `VaultBelowGenesis`, `VaultUnreadable` |
 | exit config bridge | once the deposit queue exists, the exit configuration names the bridge program in `programs.devnet.json` (before it exists a missing exit configuration is skipped; one that names another bridge always fails) | `ExitConfigMissing`, `ExitConfigNamesNoBridge`, `ExitConfigBridgeMismatch` |
-| deposits section | a deposit queue exists only when the sequencer's config has a `[deposits]` section | `DepositsSectionMissing` |
+| deposits section | when a deposit queue exists, the sequencer's config has a `[deposits]` section | `DepositsSectionMissing` |
 | deposit cursor | the batch cursor is in the deposit-aware format once the chain has finalized a batch after the upgrade | `CursorNotV2` |
 | oldest deposit | the oldest waiting deposit has waited less than three quarters of the deadline, the shorter of the live and a pending one (a `WARN` past half) | `DepositNearDeadline` |
 | deposit backlog | shows the deposits the queue holds that no batch has taken yet | `DepositQueueUnreadable` |
@@ -201,6 +202,7 @@ Settings, each in `.env` or the environment:
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `PAYER_FLOOR_LAMPORTS` | 1000000000 (1 SOL) | the payer balance below which `check` fails |
+| `EXIT_PAYER_FLOOR_LAMPORTS` | 100000000 (0.1 SOL) | the exit payer balance below which `check` fails, with `EXITS=on` |
 | `RECLAIM_MARGIN_SLOTS` | 108000 (about 12 hours) | `check` fails when fewer slots than this are left before anyone can reclaim a chain that has not posted a root |
 | `CHECK_FINALIZE_WINDOW_SECS` | the larger of 900 and four times `BATCH_CLOSE_AFTER_SECS` | how long blocks may go without a batch finalizing |
 
@@ -266,20 +268,18 @@ the genesis root written at registration. Withdrawals need a final root, so no w
 Proofs are checked against your chain's verification key. Ask Rome to register it after registering your chain,
 as described above. `VKEY_JSON` must describe that registered key, and `ELF_DIR` must contain the matching guest
 program built for your chain's genesis. The batch guest source is published at
-[`rome-protocol/rome-zk-guest`](https://github.com/rome-protocol/rome-zk-guest), tag `v0.2.0`. From the root of
-this repository, run `git clone --branch v0.2.0 https://github.com/rome-protocol/rome-zk-guest.git .fork`,
+[`rome-protocol/rome-zk-guest`](https://github.com/rome-protocol/rome-zk-guest), tag `v0.3.0`. From the root of
+this repository, run `git clone --branch v0.3.0 https://github.com/rome-protocol/rome-zk-guest.git .fork`,
 then `cd .fork && git submodule update --init --recursive`. The guest uses crates from this repository.
-Build it with `./rollup guest-build`. The command builds the guest-build image (the toolchain of one ZisK release,
-1.2.0-alpha by default, and the default stays that until this guide moves to the newer release, so set `ZISK_RELEASE` in `.env` to build for another, and the image name carries it, and the two public sources, `rome-zk-evm` at `ROME_ZK_TAG` and `rome-zk-guest` at `ROME_ZK_GUEST_TAG`, from
-`.env`; set `ROME_ZK_TAG=v0.2.2` as shown below; the guest tag defaults to `v0.2.0`), builds the guest for `rendered/genesis.json` inside it and
-writes `rendered/guest/<sha256>.elf` and `rendered/guest/vkey.json`. Two machines get the same sha256 for the same
-genesis. The command passes the release to the image as a build argument (`ZISK_RELEASE`) with its toolchain tag, and refuses a release with no pin file (`ZiskReleaseUnknown`); each release's download URLs, sha256 values,
-Rust toolchain tag and key-set root are pinned in `guest-build/zisk/<release>.env`, which has files for 1.2.0-alpha and
-1.3.1-alpha. `vkey.json` names the release (`zisk`) and its scheme number (`scheme`: 1 for 1.2.0-alpha, 2 for
-1.3.1-alpha), and a proving-key directory of another release is refused (`ProvingKeyMismatch`, naming both releases).
-The release is the image's own, so a guest locked to the ZisK crates of another release is refused when the image is built
-(`GuestZiskMismatch`), and a `cargo-zisk` of another release or commit when it runs (`ZiskToolchainMismatch`).
-It takes about 8 minutes the first time and about 6 minutes once the image exists. It refuses by name
+Build it with `./rollup guest-build`. Set `ROME_ZK_TAG=v0.3.0`, `ROME_ZK_GUEST_TAG=v0.3.0` and
+`ZISK_RELEASE=1.3.1-alpha` in `.env` first. The command builds a guest-build image from those two public
+source tags and the pinned ZisK toolchain. It builds your guest for `rendered/genesis.json` and writes
+`rendered/guest/<sha256>.elf` and `rendered/guest/vkey.json`. Two machines get the same sha256 for the same
+genesis. The release pins are in `guest-build/zisk/1.3.1-alpha.env`. `vkey.json` names the release in
+`zisk` and its registry scheme number in `scheme` (`2` for 1.3.1-alpha). A proving-key directory of
+another release is refused (`ProvingKeyMismatch`). The image builds for one ZisK release. A guest locked to ZisK
+crates of another release is refused when the image is built (`GuestZiskMismatch`). A `cargo-zisk` of
+another release or commit is refused when it runs (`ZiskToolchainMismatch`). The command also refuses
 a genesis whose chain id differs from `rendered/chain-id.env` (`ChainIdMismatch`) and a genesis with more than
 one funded account (`GenesisFundedAccountLimit`). The programVK in `vkey.json` is computed with the ZisK proving
 keys, which the command mounts read-only from `ZISK_HOME` (about 36 GB of memory, about 40 seconds); without
@@ -287,8 +287,7 @@ keys, which the command mounts read-only from `ZISK_HOME` (about 36 GB of memory
 and the prover refuses the file until the programVK is added. Set `ELF_DIR` to `rendered/guest` and `VKEY_JSON`
 to `rendered/guest/vkey.json`. Without that guest, your chain cannot post a root.
 
-The prover needs one NVIDIA GPU with more than 30 GB of memory and the ZisK proving keys on the host: about 26 GB to
-download, about 81 GB once installed (measured on a CPU host; a GPU host generates its own files, not measured yet).
+The prover needs one NVIDIA GPU with more than 30 GB of memory and the ZisK 1.3.1-alpha proving keys on the host.
 The final proof step needs about 30 GB of GPU memory; a 24 GB card is not enough.
 [Setting up a prover host](../../docs/PROVER-HOST.md) installs ZisK, its proving keys and the GPU runtime on such a
 machine. To turn the prover on, set `PROVER=on`
@@ -304,8 +303,8 @@ compose file mounts them.
 
 Before every start the prover checks those keys against a manifest of hashes (`prover/keys.sha256`, checked by
 `prover/check-keys.sh`, both mounted into the container). The manifest in this folder is pinned to the keys of
-ZisK 1.3.1-alpha, and a mismatch stops the prover by name (`KeysShaMismatch`). The `*.consttree` files under
-`provingKey` are not part of the hash: ziskup generates them on the host at install. Only to pin a key set of your own,
+ZisK 1.3.1-alpha, and a mismatch stops the prover by name (`KeysShaMismatch`). The `*.consttree`, `*.consttree_gpu` and
+`*.const_gpu` files under both key directories are not part of the hash: the host's setup generates them from the keys. Only to pin a key set of your own,
 on purpose, run this once on the host and keep the result:
 
 ```
@@ -318,8 +317,9 @@ To keep the manifest somewhere else, set `PROVER_KEYS_MANIFEST` in `.env` to its
 
 ## The node image
 
-Set `ROME_ZK_TAG=v0.2.2` in `.env` to run the published node image
-`ghcr.io/rome-protocol/rome-zk-evm:v0.2.2`. Public tags are
+Set `ROME_ZK_TAG=v0.3.0` in `.env` to run the published node image
+`ghcr.io/rome-protocol/rome-zk-evm:v0.3.0`. Set `ROME_ZK_GUEST_TAG=v0.3.0` and
+`ZISK_RELEASE=1.3.1-alpha` for `./rollup guest-build`. Public tags are
 pinned to the commit of the source export they were built from, so a tag names exactly one tree and never
 moves. `./rollup up` stops with `ImageTagNotSet` until you set the tag. To run an
 image you built from this tree yourself, set `ROME_ZK_IMAGE` to its full reference instead.
@@ -333,9 +333,20 @@ can run `./rollup exit-config propose` to set any of the portal (`--exit-portal 
 `--activation-delay-slots N`. It prints what it would send until you add `--confirm`. Once the activation slot has
 passed, which is at least one 172,800-slot challenge window away, `./rollup exit-config activate --confirm` makes it
 current, and `./rollup exit-config show` prints the current values and anything pending. `./rollup check` shows the same
-exit configuration. A final root and a funded vault are also needed to release an exit; once an exit is proved,
-`./rollup release-exit --message-hash 0x... --confirm` pays it out of the vault. On devnet, exits are paid from the shared zk-bridge program
-listed in `programs.devnet.json`, out of your chain's own vault.
+exit configuration. A final root and a funded vault are also needed to release an exit. The exit prover pays each proved withdrawal out of
+the chain's vault on its own; `./rollup release-exit --message-hash 0x... --confirm` does it by hand, for a payout it
+leaves waiting (one below its token-account minimum to a recipient with no wrapped SOL account).
+Withdrawals also need an exit proof. Set `EXITS=on` in `.env`, then run `./rollup init` and `./rollup up`: that starts
+the exit prover from the node image. It needs no GPU, waits quietly until the exit configuration is active, and then
+proves each user's withdrawal against a final root.
+The exit prover signs with a key of its own, `EXIT_PAYER_KEYPAIR_PATH` in `.env` (`./keys/exit-payer.json` by default),
+never the batcher's payer. Anyone can start a withdrawal, even for one wei, and each proof costs its payer a fee and about
+0.002 SOL of rent, so a shared key could be drained by users and would halt the chain. Make the key the way you made the
+payer key, in [Key files](#key-files), and fund it; 0.5 SOL is a sensible start, and `./rollup check` fails
+`ExitPayerBelowFloor` under `EXIT_PAYER_FLOOR_LAMPORTS`. With `EXITS=on`, `./rollup init` stops with `ExitPayerMissing` if
+the file does not exist and with `ExitPayerIsBatcherPayer` if it holds the batcher payer's key, and `./rollup up` stops with
+`ExitPayerMissing` if the file has gone. [Withdrawals](../../docs/WITHDRAWALS.md) walks through what a user
+sends, what you run, how long it takes and every refusal.
 
 ## Your chain's vault
 
@@ -366,6 +377,48 @@ balance, `--amount` is the lamport amount `init` printed. Anyone can fund a vaul
 
 `./rollup vault show` prints the vault and its balance.
 
+## Deposits
+
+Wait for the chain's first proved root and an active verification key built from the deposit-capable guest.
+A chain with no balances seals no blocks while `empty_block_interval_secs` (under `[profile]` in `chain.toml`) is 0, its default, so there is nothing to prove. Set it above 0, for example 60, until the first proved root, then set it back to 0 if you want, running `./rollup init` and `./rollup up` each time. Or declare a backed balance at genesis.
+Create the wrapped SOL vault with `./rollup vault init --confirm`. The exit configuration must name the bridge
+program from `programs.devnet.json`; [Exits](#exits) shows how to propose and activate that setting.
+The bridge refuses to create a queue before the chain has posted a root or before its vault exists.
+
+The chain authority opens the queue with `./rollup deposit-queue init --confirm`. The default inclusion deadline
+is 43,200 seconds (12 hours). The queue can take 256 deposits per batch and 4 per block. Its minimum is
+1,000,000 raw units (0.001 SOL for wrapped SOL), and each deposit pays a 100,000 lamport (0.0001 SOL) fee to
+the authority's payer key. The depositor also pays transaction fees and the deposit record's rent.
+`init` accepts `--deadline-secs`, `--max-per-batch`, `--max-per-block`, `--min-amount`, `--fee-lamports` and
+`--fee-recipient`. The deadline is limited to 1–24 hours, the per-batch cap to 256, the per-block cap to
+1 through the per-batch cap, the minimum to at least one raw unit and the fee to at most 0.01 SOL.
+The fee recipient must hold at least the rent-exempt minimum for an empty account, and cannot be executable or a sysvar. The per-block cap times blocks per batch
+must fit the per-batch cap.
+
+Change a setting with `./rollup deposit-queue propose --min-amount N --confirm`. Other parameter flags work
+the same way. Add `--activation-slot N` or `--activation-delay-slots N` to choose when it takes effect.
+The slot must be between one and two challenge windows away; without either flag, the command chooses one
+window plus a margin. A new proposal replaces a pending one. Once the slot passes, run
+`./rollup deposit-queue activate --confirm`. `./rollup deposit-queue show` prints the live and pending settings,
+queue count, deposit cursor, backlog and oldest waiting record. Before queue creation, `./rollup check`
+compares the active key with the deposit-capable guest. It also checks the caps, vault, bridge setting,
+sequencer setting, cursor, oldest wait and backlog as each becomes relevant.
+
+For wrapped SOL, `--amount` is in lamports. A depositor uses their own Solana keypair, readable by container
+user 999, and an EVM recipient:
+
+```sh
+./rollup deposit --amount 1000000 --recipient 0x0123456789abcdef0123456789abcdef01234567 --keypair keys/depositor.json --wrap-sol --confirm
+```
+
+`--wrap-sol` wraps the SOL in the deposit transaction. The command prints the record index. The record holds
+the depositor, recipient, amount, enqueue time and queue hash. The sequencer reads deposits after Solana
+finality and credits them in order in new L2 blocks. The balance appears at the L2 RPC when the crediting
+block is sealed. The crediting batch still needs a proof for its root to become final on Solana.
+The batch authority, which is the payer key, must then send the inbox's `CloseBatch` instruction. It advances the final deposit
+cursor. After that, `./rollup close-deposit --index N --confirm` returns the record's rent to its depositor.
+Anyone may send that transaction; this wrapper pays its transaction fee with the chain payer key. Nothing in this folder sends `CloseBatch`; the inbox client library's `close_batch_ix` builds it. Until a close service ships, batch, chunk and deposit-record rent stays locked, because `close-deposit` needs the crediting batch closed with `CloseBatch` by its batch authority (the payer key).
+
 ## Key files
 
 Both are paths in `.env`, never the keys themselves. The containers run as uid 999, so the files must be
@@ -378,6 +431,9 @@ openssl rand -hex 32 > keys/sequencer.key
 sudo chgrp 999 keys/payer.json keys/sequencer.key && chmod 640 keys/payer.json keys/sequencer.key
 ```
 
+With `EXITS=on` the exit prover needs a third key, a different one: run `solana-keygen new -o keys/exit-payer.json` the same
+way, give it the same group and mode, and fund it too.
+
 `solana-keygen` asks for an optional passphrase (press Enter for none; `--no-bip39-passphrase` skips the question),
 then prints the new public key and a recovery phrase. Keep the phrase private. It also refuses to overwrite an existing
 file.
@@ -387,6 +443,7 @@ The host also reads the payer key during `init` and `register`. `.gitignore` in 
 
 - `SEQUENCER_KEY_PATH`: the sequencer's signing key, 64 hex characters in a file.
 - `PAYER_KEYPAIR_PATH`: a Solana keypair (JSON) funded with SOL. It pays Solana fees and rent and is the chain authority.
+- `EXIT_PAYER_KEYPAIR_PATH` (with `EXITS=on`): a second Solana keypair (JSON) funded with SOL, used only by the exit prover. It must not be the payer key.
 
 ## Running the tests
 

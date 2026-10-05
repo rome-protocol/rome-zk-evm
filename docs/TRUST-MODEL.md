@@ -38,11 +38,21 @@ other checks in settlement.
 
 The registry authority can register a verification key for a chain, retire it, or change the slot from
 which it can be used, including moving an active key's slot into the future. Each change takes effect
-in the slot it lands, with no notice period. The slot is stored in the chain's on-chain registry, so a
+in the slot its transaction lands, with no notice period: a new key's activation slot may be that same slot. A key can verify only from its recorded activation slot.
+Retirement takes effect when its transaction lands. The slot is stored in the chain's on-chain registry, so a
 change that takes effect later can be seen before it does. If no key is active, the chain cannot
 post another proved root. Roots already final stay final. A retired key cannot be reactivated while
 its entry remains in the registry. After that slot is reused, the registry authority can register
 the same key again if a slot is available. A chain holds at most four keys at a time.
+
+Each registry entry's scheme byte names a ZisK release: `1` is withdrawn 1.2.0-alpha and `2` is
+open 1.3.1-alpha. Settlement links Veritas, which has one row per release with its PLONK verifying
+key, status and pinned `rootCVadcopFinal` recursion root. The withdrawn row has no key in the
+production build. `PostRootProved` takes the release from
+the active entry matching the proof's programVK. It refuses a withdrawn release and a proof whose
+recursion root differs from that release's pinned value before the pairing. Rome can change the
+release table only by upgrading settlement; the registry authority chooses which available keys
+are active for a chain. [ZisK releases](ZISK-RELEASES.md) lists the current rows.
 
 A permissionless chain starts with no registered key and cannot choose one during registration. Until
 Rome registers a key, the chain cannot post a root. If Rome has not registered one when the reclaim
@@ -76,6 +86,14 @@ can activate it then. The window is whatever value the chain authority chose at 
 it before relying on that delay. Registration accepts a window of zero, and a chain registered that way
 can never propose an exit change. Only one exit change can be pending, and it cannot be
 withdrawn. The poster bond is recorded but not collected today.
+
+For a permissionless chain, the chain authority can create its deposit queue after the first
+proved batch has posted. It chooses the queue's initial inclusion deadline, per-batch and per-block
+limits, minimum amount, fee and fee recipient. It can propose new values at an activation slot from
+one to two challenge windows after the proposal; anyone can activate them once that slot arrives.
+A new proposal replaces an earlier pending one. The deadline must be between one and 24 hours, the per-batch limit at most 256, the per-block limit between one and the per-batch limit, the minimum at least one base unit and the fee at most 0.01 SOL. The fee recipient must hold at least the rent-exempt minimum for an empty account and cannot be executable or a sysvar.
+The challenge window is the value the authority fixed at registration. Rome's program upgrade
+authority can change the program rules and these bounds by upgrading the programs.
 
 The deposit is paid from the payer at registration. Once a refund is due, anyone can request it,
 but settlement pays it only to the recorded chain authority. There is no instruction to rotate
@@ -111,10 +129,23 @@ deposit cannot be refunded again.
 
 ## What your users trust you to do
 
-The sequencer chooses transaction order and can refuse transactions. The inbox has no working
-forced-inclusion lane today. Users depend on the operator to keep the sequencer running, publish
+The sequencer chooses transaction order and can refuse transactions. Deposits wait in the bridge's deposit queue under the inclusion rule below, but there is no general forced-inclusion lane for EVM transactions. Users depend on the operator to keep the sequencer running, publish
 batches to Solana, generate proofs and post proved roots. A valid proof does not post itself:
 the chain authority must sign the root-posting transaction.
+
+A depositor can call `Deposit` after the permissionless chain's first proved root and queue setup,
+when its active exit configuration names Rome's zk-bridge. The call locks the chain's vault mint, pays
+the queue fee and appends an ordered record for an L2
+recipient. The operator chooses when to open and finalize batches and must keep proving them for
+the credit to become final. On a batch that finalizes, the next waiting deposit may be left out
+only while it is inside the queue's deadline, or while the batch takes at least its per-block
+limit. The age check uses the batch's opening time, but that reading can be held for at most 24
+hours after the batch opens. The program uses the later of opening time and finalization time
+minus 24 hours. A batch that takes fewer than the per-block limit cannot leave the next deposit
+out past its deadline plus 24 hours. This limits batches that finalize. It does not
+make an operator post. Anyone can close a deposit record after its crediting batch's root is final
+and `CloseBatch` advances the deposit cursor. `CloseDeposit` returns only the record rent to the
+recorded depositor. It does not return the tokens locked in the vault.
 
 Withdrawals need a final root and an activated exit configuration with a portal, a nonzero cap and
 a bridge program. Anyone can prove an exit from a final root. Only the bridge program named in the
@@ -133,19 +164,28 @@ hold, change its mint, choose where its payouts go or withdraw from it without a
 
 The vault holds one SPL Token mint (not Token-2022) chosen by the chain authority. The program accepts
 a mint with up to 18 decimals; it does not require wrapped SOL. Only the chain's native EVM asset can exit. The
-bridge converts its 18-decimal amount into the vault mint's units, rounding down.
+bridge converts its 18-decimal amount into the vault mint's units, rounding down. A deposit queue needs a mint with at most nine decimals.
 
-Deposits into a rollup are not available yet on devnet. A new chain's genesis has no spendable
+Deposits into a permissionless rollup are available on devnet after its first proved root and
+deposit-queue setup. A new chain's genesis has no spendable
 balances unless its `chain.toml` declares one backed balance. The operator must lock the matching
 amount in the chain's vault before Rome registers its verification key. The backed balance is written
 in lamports of wrapped SOL, so this needs a wrapped SOL vault. The node
 does not lock it, and settlement does not check the backing on chain. The registration deposit above
 is only a bond for creating a chain.
 
-The rules above are in [chain registration](../programs/zk-settlement/src/chain.rs),
-[governance](../programs/zk-settlement/src/governance.rs),
-[root settlement](../programs/zk-settlement/src/settle.rs),
-[exits](../programs/zk-settlement/src/exit.rs), the
-[inbox](../programs/zk-inbox/src/batch.rs), and the
-[vault](../programs/zk-bridge/src/release.rs). The other program addresses and current settlement
-settings are listed in the [devnet guide](RUN-ON-DEVNET.md).
+The rules above are in [chain registration](../programs/zk-settlement/src/chain.rs), [governance](../programs/zk-settlement/src/governance.rs), [root settlement](../programs/zk-settlement/src/settle.rs), [ZisK releases](../programs/veritas/src/versions.rs), [exits](../programs/zk-settlement/src/exit.rs), the [inbox](../programs/zk-inbox/src/batch.rs), the [deposit queue](../programs/zk-bridge/src/deposit_queue.rs), [deposits](../programs/zk-bridge/src/deposit.rs), [closing deposit records](../programs/zk-bridge/src/close_deposit.rs) and the [vault](../programs/zk-bridge/src/release.rs). The program addresses are in [`programs.devnet.json`](../deploy/rollup/programs.devnet.json), and the current settlement settings are in the [devnet guide](RUN-ON-DEVNET.md).
+
+## Prover host setup
+
+The [prover host setup script](../deploy/rollup/prover/setup-prover-host.sh) installs the
+ZisK 1.3.1-alpha GPU build and proving keys, sets the locked-memory limit and prepares Docker
+with the GPU runtime. It checks the installer hash before running it, both key archive hashes
+before unpacking them, and the hashes of `cargo-zisk` and `cargo-zisk-dev` after installation
+before the script runs either binary. Its final checks cover the GPU, driver, proving keys,
+locked-memory limit and container runtime.
+
+The installer downloads and unpacks the release's binary archive and runs its toolchain installer
+as root before this script checks either installed binary. The script does not hash-check that
+archive or its other contents, including workers, libraries and sources. A successful setup
+check therefore does not authenticate every executable or source file in the ZisK install.

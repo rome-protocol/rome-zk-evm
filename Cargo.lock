@@ -11334,6 +11334,8 @@ dependencies = [
  "tracing-subscriber",
  "ureq",
  "wincode",
+ "zk-bridge",
+ "zk-bridge-client",
  "zk-settlement-client",
 ]
 

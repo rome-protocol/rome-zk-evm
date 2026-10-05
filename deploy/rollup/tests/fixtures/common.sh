@@ -33,7 +33,7 @@ ENVEOF
 # $WORK/ops_images and the bind mounts to $WORK/ops_mounts. `chain-id` answers with a fixed authority and the nonce in
 # $STUB_NONCE (default 0); the id is 4295391538 + nonce (a stand-in: the real derivation is unit-tested in
 # crates/zk-settlement-client). `register` reports the id of $STUB_REGISTERED_ID when set, otherwise the derived one.
-# $STUB_CHAIN_ID_FAIL makes chain-id fail like an RPC error, $STUB_AUTHORITY changes the payer's public key, and
+# $STUB_CHAIN_ID_FAIL makes chain-id fail like an RPC error, $STUB_AUTHORITY changes the payer's public key (a key file with a `<file>.pub` beside it is that public key instead), and
 # `init-cursor` fails while the file $WORK/init_cursor_fail exists. `pdas`, `chain-status`, `exit-config show`, `deposit-queue show`, `vkey show` and `vault show` answer
 # from the files under $WORK/state when they exist (see check_stubs.sh), `chain-status` and `exit-config show` fail while
 # $WORK/state/chain_status_fail or exit_config_fail exists. Every `docker compose` call is appended to $WORK/docker_calls;
@@ -63,7 +63,12 @@ if [ "\${1:-}" = run ]; then
   case " \${args[*]} " in
     *" chain-id "*)
       [ -z "\${STUB_CHAIN_ID_FAIL:-}" ] || { echo "NonceLookupFailed: stub RPC error" >&2; exit 1; }
-      echo "authority=\${STUB_AUTHORITY:-StubAuthority1111111111111111111111111111111}"
+      # A key file with a sidecar <file>.pub is that public key; any other key is \$STUB_AUTHORITY. A sidecar <file>.fail
+      # makes the lookup for that one key fail like an RPC error.
+      src="\$(sed -n 's/.*source=\([^,]*\),.*/\1/p' <<<"\$mounts" | head -1)"
+      [ -z "\$src" ] || [ ! -f "\$src.fail" ] || { echo "NonceLookupFailed: stub RPC error for this key" >&2; exit 1; }
+      if [ -n "\$src" ] && [ -f "\$src.pub" ]; then auth="\$(cat "\$src.pub")"; else auth="\${STUB_AUTHORITY:-StubAuthority1111111111111111111111111111111}"; fi
+      echo "authority=\$auth"
       echo "nonce=\$nonce"
       echo "chain_id=\${STUB_ID:-\$((4295391538 + nonce))}" ;;
     *" register "*)

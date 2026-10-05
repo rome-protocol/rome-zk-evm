@@ -247,10 +247,22 @@ pub fn require_proving_key(
     }
 }
 
+/// The most bytes a failure tail may hold, however long its lines are.
+const MAX_TAIL_BYTES: usize = 8 * 1024;
+
+/// The last `n` lines of `s`, and never more than [`MAX_TAIL_BYTES`] (the end of the text is kept).
 fn tail_lines(s: &str, n: usize) -> String {
     let lines: Vec<&str> = s.lines().collect();
     let start = lines.len().saturating_sub(n);
-    lines[start..].join("\n")
+    let tail = lines[start..].join("\n");
+    if tail.len() <= MAX_TAIL_BYTES {
+        return tail;
+    }
+    let mut cut = tail.len() - MAX_TAIL_BYTES;
+    while !tail.is_char_boundary(cut) {
+        cut += 1;
+    }
+    tail[cut..].to_string()
 }
 
 fn parse_stage_walls(log: &str) -> StageWalls {
@@ -461,6 +473,7 @@ mod tests {
         let homes = HOMES.get_or_init(|| {
             const SCRIPTS: &[&str] = &[
                 "fails.sh",
+                "fails-with-reason.sh",
                 "hangs.sh",
                 "no-verify.sh",
                 "succeeds.sh",
@@ -524,6 +537,33 @@ mod tests {
             matches!(err, ProveError::ProveFailed { exit: Some(1), .. }),
             "expected ProveFailed{{exit: Some(1)}}, got {err:?}"
         );
+    }
+
+    /// The reason cargo-zisk printed on stderr must travel inside the error, so an operator sees it
+    /// without running the tool by hand.
+    #[test]
+    fn a_failed_run_carries_the_stderr_reason_in_its_error() {
+        let home = fake_home("fails-with-reason.sh");
+        let out_dir = tempfile::tempdir().unwrap();
+        let err = prover(&home, Duration::from_secs(5))
+            .prove(
+                Path::new("elf"),
+                Path::new("input.bin"),
+                &out_dir.path().join("proof"),
+            )
+            .unwrap_err();
+        let shown = err.to_string();
+        assert!(shown.contains("vadcop_final.consttree.gpu"), "got {shown}");
+    }
+
+    #[test]
+    fn the_failure_tail_is_bounded_in_lines_and_in_bytes() {
+        let many_lines: String = (0..100).map(|i| format!("line {i}\n")).collect();
+        let tail = tail_lines(&many_lines, 40);
+        assert_eq!(tail.lines().count(), 40);
+        assert!(tail.ends_with("line 99"));
+        let one_huge_line = "x".repeat(100_000);
+        assert!(tail_lines(&one_huge_line, 40).len() <= MAX_TAIL_BYTES);
     }
 
     #[test]

@@ -15,6 +15,20 @@ echo x >> "$WORK/ctrpath/opt/zisk/provingKey/sub/f3"
 ZISK_HOME="$WORK/ctrpath/opt/zisk" MANIFEST="$M" bash "$V" >/dev/null 2>&1; [[ $? == 12 ]] && pass "a changed byte under the other directory is KeysShaMismatch" || fail "a changed byte is refused" "accepted"
 mk "$WORK/ren/zisk"; mv "$WORK/ren/zisk/provingKey/f1" "$WORK/ren/zisk/provingKey/f9"
 ZISK_HOME="$WORK/ren/zisk" MANIFEST="$M" bash "$V" >/dev/null 2>&1; [[ $? == 12 ]] && pass "a renamed key file is KeysShaMismatch" || fail "a renamed key file is refused" "accepted"
+# A GPU host writes one *.const_gpu file per circuit under provingKey; the pins come from a CPU host, which writes none.
+# The same bytes with such files added (also in a nested directory) must still match, and a changed key file must not.
+mk "$WORK/gpu/zisk"; mkdir -p "$WORK/gpu/zisk/provingKey/zisk/Zisk/airs/Arith/air"
+echo gen > "$WORK/gpu/zisk/provingKey/zisk/Zisk/airs/Arith/air/Arith.const_gpu"; echo gen > "$WORK/gpu/zisk/provingKey/Main.const_gpu"
+ZISK_HOME="$WORK/gpu/zisk" MANIFEST="$M" bash "$V" >/dev/null 2>&1; rc=$?
+[[ $rc == 0 ]] && pass "added *.const_gpu files still match the pins" || fail "added *.const_gpu files still match the pins" "rc=$rc (want 0)"
+# With aggregation and PLONK, check-setup also writes *.const_gpu, *.consttree and *.consttree_gpu files under
+# provingKeySnark (the recursivef circuit). Those are generated too and must not change the hash.
+mkdir -p "$WORK/gpu/zisk/provingKeySnark/recursivef"
+for x in const_gpu consttree consttree_gpu; do echo gen > "$WORK/gpu/zisk/provingKeySnark/recursivef/recursivef.$x"; done
+ZISK_HOME="$WORK/gpu/zisk" MANIFEST="$M" bash "$V" >/dev/null 2>&1; rc=$?
+[[ $rc == 0 ]] && pass "generated files under provingKeySnark (*.const_gpu, *.consttree, *.consttree_gpu) still match the pins" || fail "generated files under provingKeySnark still match the pins" "rc=$rc (want 0)"
+echo x >> "$WORK/gpu/zisk/provingKey/f1"
+ZISK_HOME="$WORK/gpu/zisk" MANIFEST="$M" bash "$V" >/dev/null 2>&1; [[ $? == 12 ]] && pass "a changed key file next to *.const_gpu files is KeysShaMismatch" || fail "a changed key file next to *.const_gpu files is refused" "accepted"
 # The sort order must not depend on the locale: the operator pins on a host that may run en_US.UTF-8 (case-insensitive,
 # punctuation-ignoring), the container sets no LANG (bytewise). Names that sort differently in the two: Zisk, vadcop_final, zisk.
 grep -q 'LC_ALL=C' "$V" && pass "check-keys.sh pins LC_ALL=C itself" || fail "check-keys.sh pins LC_ALL=C itself" "no LC_ALL=C in $V"

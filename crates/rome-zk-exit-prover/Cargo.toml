@@ -11,6 +11,7 @@ description = "Off-chain follower: watches the L2 exit portal for ExitInitiated,
 rome-zk-mpt = { path = "../rome-zk-mpt" }
 rome-zk-layouts = { path = "../rome-zk-layouts" }
 zk-settlement-client = { path = "../zk-settlement-client" }
+zk-bridge-client = { path = "../zk-bridge-client" }
 rome-zk-solana-sender = { path = "../rome-zk-solana-sender" }
 rome-zk-metrics-http = { path = "../rome-zk-metrics-http" }
 solana-program.workspace = true
@@ -41,6 +42,7 @@ hex = "0.4"
 anyhow = "1"
 
 [dev-dependencies]
+zk-bridge = { path = "../../programs/zk-bridge", features = ["no-entrypoint"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
 solana-signature = { workspace = true, features = ["rand"] }
 

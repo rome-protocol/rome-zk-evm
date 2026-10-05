@@ -1,0 +1,18 @@
+# The exit prover's config, rendered only when EXITS=on. `rollup init` fills the marked tokens.
+# The exit portal is not set here: the exit prover reads it from the chain's exit configuration on Solana, and waits until
+# that configuration is active.
+
+chain_id = __CHAIN_ID__
+settlement_program_id = "__SETTLEMENT_PROGRAM_ID__"
+settlement_rpc = "__SOLANA_RPC_URL__"
+# The verifier node on the compose network (loopback-only on the host). It serves eth_getLogs and eth_getProof.
+verifier_rpc = "http://reth-verifier:8547"
+payer_key_path = "/run/rome-zk/payer.json"
+# GET /metrics. The compose file publishes this on 127.0.0.1 only.
+metrics_addr = "0.0.0.0:9005"
+# Pay each proved withdrawal out as soon as it is proved (default true). The exit prover pays the fee and any rent from its
+# own payer. Set false to leave every payout to ./rollup release-exit.
+# auto_release = true
+# A withdrawal of less than this many lamports (0.01 SOL by default) to a recipient with no wrapped SOL token account is not
+# paid out automatically, because creating the account costs the exit payer rent. It waits for ./rollup release-exit.
+# release_create_account_min_lamports = 10000000

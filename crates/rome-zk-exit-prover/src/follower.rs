@@ -11,12 +11,13 @@
 //! `StateUnavailableAtRoot`/`QueuedForWindow` message was then never retried: the next poll's
 //! `eth_getLogs(from_block)` no longer returns a log the cursor has already passed. [`Follower`] fixes
 //! this by separating three concerns the old loop conflated into one mutable local: the log-scan cursor
-//! ([`Follower::scan_from_block`], advanced by [`Follower::ingest`] alone, independent of any outcome),
+//! ([`Follower::scan_from_block`], advanced by [`Follower::ingest`] and [`Follower::mark_scanned_through`] alone, independent of any outcome),
 //! the retry state of every message not yet done ([`Follower::pending`], mutated only by
 //! [`Follower::apply`]), and the terminal-but-not-yet-abandoned messages ([`Follower::stuck`]).
 //!
 //! ## The wire loop (bin becomes wire-only)
-//! `follower.ingest(eth_get_logs(portal, follower.scan_from_block))` → for each hash in
+//! `follower.ingest(eth_get_logs(portal, follower.scan_from_block, chunk_end))` (one bounded chunk at a time, up to
+//! the node's head) → for each hash in
 //! `follower.due(now)` → `attempt_exit(...)` → `follower.apply(hash, now, outcome)`. `--once` is one such
 //! pass.
 //!
@@ -172,6 +173,10 @@ pub struct Now {
 #[derive(Debug, Clone, Default)]
 pub struct Follower {
     pub scan_from_block: u64,
+    /// The block a scan of a new portal starts from (`Config::portal_from_block`).
+    portal_from_block: u64,
+    /// The portal (`0x`-prefixed hex) the cursor and the messages below belong to; `None` until the first poll.
+    portal: Option<String>,
     pub pending: BTreeMap<[u8; 32], Pending>,
     pub stuck: BTreeMap<[u8; 32], Stuck>,
     /// `Config::max_send_attempts`, carried on the follower itself so `apply`
@@ -195,6 +200,8 @@ impl Follower {
     pub fn new(portal_from_block: u64, max_send_attempts: u32, max_window_requeues: u32) -> Self {
         Self {
             scan_from_block: portal_from_block,
+            portal_from_block,
+            portal: None,
             pending: BTreeMap::new(),
             stuck: BTreeMap::new(),
             max_send_attempts,
@@ -209,7 +216,36 @@ impl Follower {
         self.sent_units.get(&window_index).copied().unwrap_or(0)
     }
 
-    /// Ingests every log an `eth_getLogs(portal, scan_from_block)` call returned. `scan_from_block`
+    /// Tells the follower which portal the chain's exit config names right now. The first call only remembers it.
+    /// A later call with a different portal starts over: the cursor goes back to the configured start block and the
+    /// waiting and stuck messages (all from the old portal) are dropped, so the new portal's logs are scanned from the
+    /// start. Returns whether it reset. The record of this process's own sends in each window is kept, since the cap
+    /// is the chain's and does not depend on the portal.
+    pub fn follow_portal(&mut self, portal_hex: &str) -> bool {
+        match &self.portal {
+            Some(current) if current == portal_hex => false,
+            Some(_) => {
+                self.portal = Some(portal_hex.to_string());
+                self.scan_from_block = self.portal_from_block;
+                self.pending.clear();
+                self.stuck.clear();
+                true
+            }
+            None => {
+                self.portal = Some(portal_hex.to_string());
+                false
+            }
+        }
+    }
+
+    /// Records that every block up to and including `to_block` has been scanned, so the next scan starts one
+    /// past it. A chunk with no logs in it still moves the cursor: without this the cursor moved only past the
+    /// last log found, and a quiet stretch was asked for again on every poll.
+    pub fn mark_scanned_through(&mut self, to_block: u64) {
+        self.scan_from_block = self.scan_from_block.max(to_block.saturating_add(1));
+    }
+
+    /// Ingests every log an `eth_getLogs(portal, scan_from_block, ..)` call returned. `scan_from_block`
     /// advances over EVERY log given here (`max(block_number + 1)`) regardless of whether it decoded —
     /// a bad log's own block is still scanned, so the next poll never re-fetches it. A log whose own
     /// `blockNumber` field is not valid hex (never observed from a real node; only a foreign/corrupt

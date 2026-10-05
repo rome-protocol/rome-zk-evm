@@ -5402,6 +5402,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "tracing-subscriber",
  "veritas",
  "wincode",
  "zk-inbox-client",

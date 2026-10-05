@@ -189,8 +189,9 @@ pub enum FollowerError {
     /// Every prove attempt for this batch — each with a freshly wiped work directory —
     /// failed (either the subprocess itself, or the freshly-produced proof's own decode/record/publics
     /// check) `attempts` times in a row, `Config::max_prove_attempts`'s own bound.
-    #[error("prove attempts exhausted: {attempts} consecutive attempts all failed")]
-    ProveAttemptsExhausted { attempts: u32 },
+    /// `last` is the last attempt's own failure text (for a `cargo-zisk` failure, the tail of its output).
+    #[error("prove attempts exhausted: {attempts} consecutive attempts all failed; the last one failed with: {last}")]
+    ProveAttemptsExhausted { attempts: u32, last: String },
     /// A `TransientFetchError` streak for the same job never cleared after `polls`
     /// consecutive retries — a read failure this persistent is no longer "about to recover," same shape
     /// as `VerifierBehindAlarm`/`StaleAnchorAlarm`.
@@ -545,6 +546,7 @@ where
         // in that bounded run fails does this halt, by name.
         let max_attempts = cfg.max_prove_attempts.max(1);
         let mut checked = None;
+        let mut last_failure = String::new();
         let mut winning_attempt: u32 = 0;
         let mut winning_cost_usd: f64 = 0.0;
         for attempt in 1..=max_attempts {
@@ -704,6 +706,8 @@ where
                 // without it, this attempt's row is frozen at whatever the LAST successful transition
                 // was (here, `Proving`), never reflecting that it actually failed.
                 Err(e) => {
+                    last_failure = e.to_string();
+                    warn_attempt_failed(candidate_batch, attempt, max_attempts, &last_failure);
                     record(
                         store,
                         metrics,
@@ -711,7 +715,7 @@ where
                         candidate_batch,
                         attempt,
                         JobEventKind::Failed {
-                            reason: e.to_string(),
+                            reason: last_failure.clone(),
                         },
                     )
                     .await;
@@ -790,6 +794,8 @@ where
                 // Recorded `Failed` at THIS attempt — without it, this attempt's row stays frozen at
                 // `proved`, never showing that it actually failed.
                 Err(reason) => {
+                    last_failure = reason.clone();
+                    warn_attempt_failed(candidate_batch, attempt, max_attempts, &reason);
                     record(
                         store,
                         metrics,
@@ -808,6 +814,7 @@ where
             None => {
                 return Err(FollowerError::ProveAttemptsExhausted {
                     attempts: max_attempts,
+                    last: last_failure,
                 })
             }
         }
@@ -815,6 +822,17 @@ where
 
     metrics.set_state("locally_verified");
     Ok(Ok((anchor1, checked, batch_dir, attempt, cost_usd)))
+}
+
+/// One warn line per failed prove attempt: which attempt, which batch and why (a `cargo-zisk` failure's
+/// reason already carries the tail of its output, bounded by the prover).
+fn warn_attempt_failed(batch: u64, attempt: u32, max_attempts: u32, reason: &str) {
+    tracing::warn!(
+        batch,
+        attempt,
+        max_attempts,
+        "prove attempt {attempt}/{max_attempts} for batch {batch} failed: {reason}"
+    );
 }
 
 /// Extracts `(custom_code, insufficient_funds)` from a failed send (mirrors the CLI's own former
@@ -4599,7 +4617,10 @@ mod tests {
         .await
         .expect_err("must halt once every attempt is exhausted");
         assert!(
-            matches!(err, FollowerError::ProveAttemptsExhausted { attempts: 2 }),
+            matches!(
+                err,
+                FollowerError::ProveAttemptsExhausted { attempts: 2, .. }
+            ),
             "got {err:?}"
         );
         assert_eq!(
@@ -4608,6 +4629,57 @@ mod tests {
             "exactly max_prove_attempts calls"
         );
 
+        let _ = std::fs::remove_dir_all(&work_dir);
+    }
+
+    /// Every attempt fails inside the real `LocalCargoZisk` against a fake `cargo-zisk` that exits 1 and
+    /// names its reason on stderr: the halting error must carry that reason, so the operator sees why
+    /// without running the tool by hand.
+    #[tokio::test]
+    async fn exhausted_attempts_name_the_last_attempts_reason() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("bin")).unwrap();
+        std::os::unix::fs::symlink(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fake-cargo-zisk/fails-with-reason.sh"
+            ),
+            home.path().join("bin").join("cargo-zisk"),
+        )
+        .unwrap();
+        let prover = crate::prover::LocalCargoZisk {
+            zisk_home: home.path().to_path_buf(),
+            zisk: "1.3.1-alpha".to_string(),
+            gpu: false,
+            timeout: Duration::from_secs(10),
+        };
+
+        let chain = FakeChain::new();
+        chain.open_and_finalize_inbox_batch(1);
+        let work_dir = temp_work_dir("exhausted-names-reason");
+        let mut cfg = run_config(&chain, &work_dir);
+        cfg.max_prove_attempts = 2;
+        let metrics = Metrics::new();
+        let mut fetch = chain.clone();
+        let mut verifier = chain.verifier();
+        let store = NoopStore;
+        let err = prepare_checked_proof(
+            &mut fetch,
+            &prover,
+            &mut verifier,
+            &store,
+            &cfg,
+            1,
+            &metrics,
+        )
+        .await
+        .expect_err("a prover that always exits 1 must exhaust its attempts");
+        let shown = err.to_string();
+        assert!(
+            shown.contains("2 consecutive attempts")
+                && shown.contains("vadcop_final.consttree.gpu"),
+            "the halt must name the last attempt's reason, got: {shown}"
+        );
         let _ = std::fs::remove_dir_all(&work_dir);
     }
 
@@ -5054,7 +5126,10 @@ mod tests {
         .await
         .expect_err("must halt once every attempt is exhausted");
         assert!(
-            matches!(err, FollowerError::ProveAttemptsExhausted { attempts: 2 }),
+            matches!(
+                err,
+                FollowerError::ProveAttemptsExhausted { attempts: 2, .. }
+            ),
             "got {err:?}"
         );
 
@@ -5128,7 +5203,10 @@ mod tests {
         .await
         .expect_err("must halt once every attempt is exhausted");
         assert!(
-            matches!(err, FollowerError::ProveAttemptsExhausted { attempts: 2 }),
+            matches!(
+                err,
+                FollowerError::ProveAttemptsExhausted { attempts: 2, .. }
+            ),
             "got {err:?}"
         );
         assert_eq!(prove_calls.load(Ordering::SeqCst), 2);

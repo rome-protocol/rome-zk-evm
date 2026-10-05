@@ -78,6 +78,12 @@ The portable [`deploy/rollup/`](deploy/rollup/) directory is available, with set
 For the available services and their configuration, start with
 [Deployment](docs/ARCHITECTURE.md#deployment) and the [component READMEs](docs/ARCHITECTURE.md#components).
 
+## Support
+
+Ask questions in [Discussions](https://github.com/rome-protocol/solana-zk-evm/discussions). Report a bug, or ask for
+your chain's verification key, with the [issue forms](https://github.com/rome-protocol/solana-zk-evm/issues/new/choose).
+For a security problem, follow [`SECURITY.md`](SECURITY.md) and do not open an issue.
+
 ## License
 
 Copyright © 2024-2026 Coin Vesting Inc. d/b/a Rome Protocol. All rights reserved. You may use this software for

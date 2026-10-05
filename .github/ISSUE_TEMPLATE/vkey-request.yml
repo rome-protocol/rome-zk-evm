@@ -1,0 +1,74 @@
+name: Verification key request
+description: Ask Rome to register the verification key of your chain's guest. Rome answers a complete request within two business days.
+title: "Verification key request: chain "
+labels: ["vkey-request"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Fill in every required field. Rome registers a complete request within two business days and replies on this issue
+        with the transaction signature. Your chain can be reclaimed about 30 days after registration if it has no proved root
+        by then, so please send the request as soon as your guest is built.
+
+        Nothing here is a secret. Never paste a keypair, a seed phrase or the contents of a key file.
+  - type: input
+    id: chain-id
+    attributes:
+      label: Chain id
+      description: The `CHAIN_ID` line of `rendered/chain-id.env`.
+      placeholder: "1234567890123456"
+    validations:
+      required: true
+  - type: input
+    id: authority
+    attributes:
+      label: Chain authority public key
+      description: The `AUTHORITY` line of `rendered/chain-id.env`, the key that registered the chain on Solana. A public key only, never the keypair.
+    validations:
+      required: true
+  - type: input
+    id: registration-signature
+    attributes:
+      label: Registration transaction signature
+      description: The signature of the transaction that registered your chain, in the output of `./rollup register --confirm`.
+    validations:
+      required: true
+  - type: input
+    id: guest-tag
+    attributes:
+      label: Guest tag
+      description: The tag of the guest source you built at, the one the guide names.
+      placeholder: v0.3.0
+    validations:
+      required: true
+  - type: textarea
+    id: vkey-json
+    attributes:
+      label: vkey.json
+      description: The full contents of `rendered/guest/vkey.json`. It holds the ELF's sha256, the genesis file's sha256, the programVK, and the ZisK release and scheme.
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: genesis-json
+    attributes:
+      label: genesis.json
+      description: Paste `rendered/genesis.json`, or drag the file onto this box to attach it. Rome rebuilds the guest from it, so it must be the file you built with.
+    validations:
+      required: true
+  - type: input
+    id: vault
+    attributes:
+      label: Vault that backs the genesis balance
+      description: If your genesis gives an account a balance, the address of your chain's vault, which must already hold that amount. Leave empty if your genesis has no balance.
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you send this
+      options:
+        - label: I built the guest with `./rollup guest-build` at the tag named above.
+          required: true
+        - label: "`./rollup check` passes for everything except the items that wait for the key (verification key, deposit-capable key)."
+          required: true

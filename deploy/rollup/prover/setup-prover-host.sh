@@ -33,7 +33,8 @@
 # Every refusal is a named line on stderr starting with its name, and a non-zero exit:
 #   NotRoot, UnsupportedPlatform, NoGpuDriver, GpuDriverTooOld, GpuMemoryTooSmall, NotEnoughDisk, ZiskupFailed,
 #   ZiskupHashMismatch, ZiskPinMissing, KeysShaMismatch, NotGpuBuild, WrongZiskVersion, MemlockNotUnlimited,
-#   NoNvidiaDockerRuntime, KeyArchiveHashMismatch, KeyArchiveMissing, BinaryHashMismatch, KeysUrlMissing
+#   NoNvidiaDockerRuntime, KeyArchiveHashMismatch, KeyArchiveMissing, BinaryHashMismatch, KeysUrlMissing,
+#   DownloadDirInsideZiskHome, ConstantFilesMissing
 #
 # What it needs from you: an NVIDIA GPU with at least 30,720 MiB (32.2 GB) of memory (a 24 GB card is not enough), an NVIDIA driver
 # at version 525.60.13 or later (install it first, see docs/PROVER-HOST.md; INSTALL_NVIDIA_DRIVER=1 installs the
@@ -57,8 +58,8 @@
 #                         override the matching line of HOST_PIN_FILE
 #   KEYS_URL_BASE         where the key archives are downloaded from (default: the BUCKET_URL line of the checked ziskup, the
 #                         place ziskup itself downloads them from; the script stops by name if neither gives a URL)
-#   DOWNLOAD_DIR          where the key archives are downloaded to (default ZISK_HOME/.downloads); it must be on a disk
-#                         with room for 27 GB
+#   DOWNLOAD_DIR          where the key archives are downloaded to (default ZISK_HOME-downloads, beside ZISK_HOME); it must
+#                         be on a disk with room for 27 GB and outside ZISK_HOME, which ziskup clears when it installs
 #   MANIFEST              the key hashes to check against (default: keys.sha256 next to this script)
 #   MIN_FREE_GB           free disk required at ZISK_HOME before installing, in GB (default 125)
 #   MIN_GPU_MIB           GPU memory required, in MiB, the unit nvidia-smi reports (default 30720, which is 32.2 GB)
@@ -70,6 +71,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ZISK_HOME="${ZISK_HOME:-/opt/zisk}"
 ZISK_VERSION="${ZISK_VERSION:-1.3.1-alpha}"
 MANIFEST="${MANIFEST:-$SCRIPT_DIR/keys.sha256}"
+# Written once check-setup has finished for this release. It sits beside the key directories, not in them, so it is not
+# part of their hash, and its name carries the release so another release's marker does not count.
+SETUP_DONE="$ZISK_HOME/.check-setup-done-$ZISK_VERSION"
 MIN_FREE_GB="${MIN_FREE_GB:-125}"
 MIN_GPU_MIB="${MIN_GPU_MIB:-30720}"
 NVIDIA_MIN_VERSION="525.60.13"
@@ -77,7 +81,7 @@ ZISKUP_BIN="${ZISKUP_BIN:-/usr/local/bin/ziskup}"
 PIN_FILE="${PIN_FILE:-$SCRIPT_DIR/../guest-build/zisk/$ZISK_VERSION.env}"
 HOST_PIN_FILE="${HOST_PIN_FILE:-$SCRIPT_DIR/host-pins/$ZISK_VERSION.env}"
 KEYS_URL_BASE="${KEYS_URL_BASE:-}"
-DOWNLOAD_DIR="${DOWNLOAD_DIR:-$ZISK_HOME/.downloads}"
+DOWNLOAD_DIR="${DOWNLOAD_DIR:-${ZISK_HOME%/}-downloads}"
 LIMITS_CONF="${LIMITS_CONF:-/etc/security/limits.d/90-zisk-memlock.conf}"
 SYSTEMD_CONF="${SYSTEMD_CONF:-/etc/systemd/system.conf.d/90-zisk-memlock.conf}"
 # The prover container runs as this user; it must be able to write the proving cache under ZISK_HOME/cache.
@@ -297,18 +301,13 @@ fetch_archive() { # $1 = the archive's file name, $2 = its pin's name, $3 = the 
 # The proving key, then the PLONK key, unpacked from the archives checked above. This is what ziskup would download and
 # unpack itself (it checks only an md5 that comes from the same bucket as the archive).
 install_keys() {
-  local pk="zisk-provingkey-$ZISK_VERSION.tar.gz" snark="zisk-provingkey-plonk-$ZISK_VERSION.tar.gz" check_bin
+  local pk="zisk-provingkey-$ZISK_VERSION.tar.gz" snark="zisk-provingkey-plonk-$ZISK_VERSION.tar.gz"
+  rm -f "$SETUP_DONE"
   log "unpacking the proving key into $ZISK_HOME"
   rm -rf "$ZISK_HOME/provingKey" "$ZISK_HOME/verifyKey" "$ZISK_HOME/cache"
   tar --no-same-owner --overwrite -xf "$DOWNLOAD_DIR/$pk" -C "$ZISK_HOME" \
     || refuse ZiskupFailed "could not unpack $DOWNLOAD_DIR/$pk"
   rm -f "$DOWNLOAD_DIR/$pk"
-  # The constant trees are generated from the key, by the binary checked above. --proving-key is explicit because the
-  # default is the home directory of whoever runs this, and under sudo that is root's.
-  check_bin="$ZISK_HOME/bin/cargo-zisk-dev"
-  log "generating the constant trees (about 3 minutes on 32 CPU cores)"
-  (cd "$ZISK_HOME" && ZISK_HOME="$ZISK_HOME" "$check_bin" check-setup --proving-key "$ZISK_HOME/provingKey" -a --gpu >/dev/null) \
-    || refuse ZiskupFailed "cargo-zisk-dev check-setup failed on the proving key"
   log "unpacking the PLONK (snark) key into $ZISK_HOME"
   rm -rf "$ZISK_HOME/provingKeySnark"
   tar --no-same-owner --overwrite -xf "$DOWNLOAD_DIR/$snark" -C "$ZISK_HOME" \
@@ -317,11 +316,37 @@ install_keys() {
   rmdir "$DOWNLOAD_DIR" 2>/dev/null || true
 }
 
+# The constant trees, and on a GPU host the *.const_gpu files, are generated from both keys by the binary checked above.
+# The generated files are left out of the key hash, so a run that stopped here would look finished to the key check; the
+# done marker is what says this step ran to the end. Aggregation stays on: in check-setup, -a means --no-aggregation, and
+# without the compressor and recursive files every proof stops at its first aggregation step. The key paths are explicit
+# because the default is the home directory of whoever runs this, and under sudo that is root's.
+run_check_setup() {
+  [[ ! -e "$SETUP_DONE" ]] || return 0
+  log "generating the constant trees and GPU constant files for both keys (several minutes)"
+  (cd "$ZISK_HOME" && ZISK_HOME="$ZISK_HOME" "$ZISK_HOME/bin/cargo-zisk-dev" check-setup --proving-key "$ZISK_HOME/provingKey" \
+    --proving-key-plonk "$ZISK_HOME/provingKeySnark" --plonk --gpu >/dev/null) \
+    || refuse ZiskupFailed "cargo-zisk-dev check-setup failed on the proving keys; run this script again to repeat it"
+  : > "$SETUP_DONE"
+}
+
+# The last check: the step above has finished for this release.
+require_setup_done() {
+  [[ -e "$SETUP_DONE" ]] \
+    || refuse ConstantFilesMissing "the constant files have not been generated for ZisK $ZISK_VERSION ($SETUP_DONE is missing); run this script again, or by hand: cd $ZISK_HOME && ZISK_HOME=$ZISK_HOME $ZISK_HOME/bin/cargo-zisk-dev check-setup --proving-key $ZISK_HOME/provingKey --proving-key-plonk $ZISK_HOME/provingKeySnark --plonk --gpu \&\& touch $SETUP_DONE"
+}
+
 install_zisk() {
+  # ziskup clears ZISK_HOME when it installs, so archives kept inside it would be gone before they are unpacked.
+  case "${DOWNLOAD_DIR%/}/" in
+    "${ZISK_HOME%/}/"*) refuse DownloadDirInsideZiskHome "DOWNLOAD_DIR ($DOWNLOAD_DIR) is inside ZISK_HOME ($ZISK_HOME), which ziskup clears when it installs; set DOWNLOAD_DIR to a directory outside it" ;;
+  esac
   local state
   state="$(keys_state)"
   case "$state" in
-    0) log "the keys under $ZISK_HOME already match $MANIFEST; skipping the download"; return 0 ;;
+    0) log "the keys under $ZISK_HOME already match $MANIFEST; skipping the download"
+       if [[ ! -e "$SETUP_DONE" ]]; then verify_binaries; run_check_setup; fi
+       return 0 ;;
     12) refuse KeysShaMismatch "the keys under $ZISK_HOME do not match $MANIFEST; not touching them. Move the directory away and run this script again to download a fresh set" ;;
     10) ;;
     *) refuse KeysShaMismatch "check-keys.sh exited $state against $MANIFEST; run it by hand to see why" ;;
@@ -330,7 +355,7 @@ install_zisk() {
   local free
   free="$(free_gb_at "$ZISK_HOME")"
   [[ "$free" =~ ^[0-9]+$ && "$free" -ge "$MIN_FREE_GB" ]] \
-    || refuse NotEnoughDisk "$ZISK_HOME has ${free:-unknown} GB free; the keys need about 27 GB to download, about 42 GB unpacked, about 62 GB once the constant trees are generated and about 102 GB after the first proof (set MIN_FREE_GB to override the $MIN_FREE_GB GB check)"
+    || refuse NotEnoughDisk "$ZISK_HOME has ${free:-unknown} GB free; the keys need about 27 GB to download and about 50 GB on disk once the constant files are generated, and the first proof needs room for its cache on top (set MIN_FREE_GB to override the $MIN_FREE_GB GB check)"
 
   if [[ ! -e "$ZISKUP_BIN" ]]; then
     # Fetch to a file of its own and check it there: an installer that fails the check never sits at $ZISKUP_BIN.
@@ -360,6 +385,7 @@ install_zisk() {
   # binaries it has checked.
   verify_binaries
   install_keys
+  run_check_setup
 }
 
 prepare_cache() {
@@ -393,6 +419,7 @@ final_checks() {
     0) log "the proving keys match $MANIFEST" ;;
     *) refuse KeysShaMismatch "check-keys.sh exited $state against $MANIFEST (10 not populated, 11 unpinned, 12 mismatch); run it by hand to see which key directory differs" ;;
   esac
+  require_setup_done
   if [[ "${SKIP_MEMLOCK_CHECK:-0}" != "1" ]]; then check_memlock; fi
   check_docker_runtime
   log "all checks passed"

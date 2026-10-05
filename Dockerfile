@@ -1,13 +1,13 @@
-# Multi-stage build for one image carrying four rome-zk binaries — `rome-zk-sequencer` (the drop-in replacement
+# Multi-stage build for one image carrying five rome-zk binaries — `rome-zk-sequencer` (the drop-in replacement
 # for the stock `ghcr.io/paradigmxyz/reth:v2.5.2` container on Tiber, its `reth` service: same ports — 8545 http,
 # 8546 ws, 9001 metrics — same `--http.api eth,net,web3,debug,txpool,trace,ots` surface, served by an in-process
 # reth via `--executor reth`), `rome-zk-batcher` and `rome-zk-derive` (Tiber's settlement services), and `rome-zk-ops` (the operator CLI:
-# settlement and bridge commands, a dry run unless `--confirm`). ENTRYPOINT stays the sequencer — the
+# settlement and bridge commands, a dry run unless `--confirm`) and `rome-zk-exit-prover` (proves a user's withdrawal on Solana). ENTRYPOINT stays the sequencer — the
 # settlement-services compose file overrides `entrypoint:` to select the others out of the same image.
 #
-# Scoped to `-p rome-zk-sequencer -p rome-zk-batcher -p rome-zk-derive -p rome-zk-ops` (not the whole
+# Scoped to `-p rome-zk-sequencer -p rome-zk-batcher -p rome-zk-derive -p rome-zk-ops -p rome-zk-exit-prover` (not the whole
 # workspace): `programs/*` are Solana BPF crates built with `cargo build-sbf`'s own bundled platform-tools
-# toolchain, not this image's rustc, and are irrelevant to these four binaries.
+# toolchain, not this image's rustc, and are irrelevant to these five binaries.
 
 # Kept in lockstep with rust-toolchain.toml by hand (this image does not read that file — it IS the
 # toolchain): bumped to 1.97.1 for `solana-client = 4.3.0`'s own `rust-version` floor.
@@ -27,7 +27,7 @@ RUN rustup show active-toolchain || rustup toolchain install
 # committed and must be respected (reth pins by tag, resolved once, never re-resolved here).
 COPY . .
 
-# One cargo invocation, four bins (production build; the per-crate lib-only CI step — .github/
+# One cargo invocation, five bins (production build; the per-crate lib-only CI step — .github/
 # workflows/ci.yml's `clippy` job — already guards each crate's own feature masking standalone).
 #
 # Built with the `release-host` profile (Cargo.toml: thin LTO, 16 codegen units), not `release`: the workspace
@@ -36,7 +36,7 @@ COPY . .
 #
 # The Cargo registry, the git checkouts and `target` live in BuildKit cache mounts, so the dependency build (reth and
 # the rest) is kept on the build host between builds and only the workspace crates are rebuilt. A cache mount is not
-# part of the image layer, so the four binaries are copied out of it, inside the same RUN, to /out. `target` is
+# part of the image layer, so the five binaries are copied out of it, inside the same RUN, to /out. `target` is
 # mounted with `sharing=locked` so two builds on the same host never write it at once.
 #
 # Cargo decides whether a workspace crate is up to date by file mtime alone. `target` is now shared by every build on
@@ -51,9 +51,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target,sharing=locked \
     find . -path ./target -prune -o -type f -exec touch {} + \
     && cargo build --profile release-host --locked \
-        -p rome-zk-sequencer -p rome-zk-batcher -p rome-zk-derive -p rome-zk-ops --bins \
+        -p rome-zk-sequencer -p rome-zk-batcher -p rome-zk-derive -p rome-zk-ops -p rome-zk-exit-prover --bins \
     && mkdir -p /out \
-    && cp target/release-host/rome-zk-sequencer target/release-host/rome-zk-batcher target/release-host/rome-zk-derive target/release-host/rome-zk-ops /out/
+    && cp target/release-host/rome-zk-sequencer target/release-host/rome-zk-batcher target/release-host/rome-zk-derive target/release-host/rome-zk-ops target/release-host/rome-zk-exit-prover /out/
 
 FROM debian:bookworm-slim AS runtime
 
@@ -69,6 +69,7 @@ COPY --from=builder /out/rome-zk-sequencer /usr/local/bin/rome-zk-sequencer
 COPY --from=builder /out/rome-zk-batcher /usr/local/bin/rome-zk-batcher
 COPY --from=builder /out/rome-zk-derive /usr/local/bin/rome-zk-derive
 COPY --from=builder /out/rome-zk-ops /usr/local/bin/rome-zk-ops
+COPY --from=builder /out/rome-zk-exit-prover /usr/local/bin/rome-zk-exit-prover
 
 # The runtime user is uid/gid 999, set explicitly above and here: key files on the hosts are owned by uid 999.
 USER 999:999

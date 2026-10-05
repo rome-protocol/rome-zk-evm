@@ -10,6 +10,8 @@
 #   prover         required for settlement; needs one NVIDIA GPU with more than 30 GB of memory.
 #                  `./rollup up` starts it when PROVER=on in .env.
 #   postgres       the prover's history, a local container. Starts with the prover.
+#   exit-prover    proves users' withdrawals on Solana, so the vault can pay them out. Private (9005, metrics only).
+#                  `./rollup up` starts it when EXITS=on in .env. It needs no GPU.
 #
 # Everything except the sequencer's RPC publishes only on 127.0.0.1, and the Engine API (8551) is never published.
 # The host side of every published port can be moved in .env (RPC_PORT, WS_PORT, VERIFIER_RPC_PORT and the four
@@ -19,8 +21,9 @@
 # Files you provide (paths in .env; the container user is uid 999, so the files must be readable by it):
 #   SEQUENCER_KEY_PATH   the sequencer's signing key (64 hex characters)
 #   PAYER_KEYPAIR_PATH   the batcher's Solana keypair (the fee payer and the chain authority)
+#   EXIT_PAYER_KEYPAIR_PATH   with EXITS=on, the exit prover's own Solana keypair; never the batcher's
 # Files `./rollup init` renders into RENDERED_DIR: sequencer-config.toml, genesis.json, batcher.toml, derive.toml,
-# jwt.hex, and with PROVER=on prover.toml and prover-db-password.
+# jwt.hex, with PROVER=on prover.toml and prover-db-password, and with EXITS=on exit-prover.toml.
 
 x-node: &node
   # Public tags match the source tree used to build the image.
@@ -169,6 +172,25 @@ services:
       reth-verifier:
         condition: service_healthy
       postgres:
+        condition: service_healthy
+
+  exit-prover:
+    <<: *node
+    profiles: ["exits"]
+    entrypoint: ["rome-zk-exit-prover"]
+    command: ["--config", "/data/exit-prover.toml"]
+    healthcheck:
+      disable: true
+    volumes:
+      - ${RENDERED_DIR:-./rendered}/exit-prover.toml:/data/exit-prover.toml:ro
+      # Its own key, never the batcher's: anyone can withdraw, and every proof costs this key a fee and rent. ./rollup init
+      # refuses to render this service's settings without one (the default only lets the file load while EXITS is off).
+      - ${EXIT_PAYER_KEYPAIR_PATH:-/dev/null}:/run/rome-zk/payer.json:ro
+    ports:
+      # metrics
+      - "127.0.0.1:${EXIT_PROVER_METRICS_PORT:-9005}:9005"
+    depends_on:
+      reth-verifier:
         condition: service_healthy
 
   postgres:

@@ -263,7 +263,15 @@ impl FakeVerifier {
 }
 
 impl VerifierRpc for FakeVerifier {
-    fn eth_get_logs(&self, _portal: &str, _from: u64) -> Result<Vec<LogEntry>, VerifierError> {
+    fn eth_block_number(&self) -> Result<u64, VerifierError> {
+        Ok(1_000)
+    }
+    fn eth_get_logs(
+        &self,
+        _portal: &str,
+        _from: u64,
+        _to: u64,
+    ) -> Result<Vec<LogEntry>, VerifierError> {
         Ok(vec![])
     }
     fn eth_get_proof(

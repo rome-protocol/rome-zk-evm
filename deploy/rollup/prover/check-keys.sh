@@ -3,9 +3,10 @@
 # before every start; you run it yourself with --write once, right after downloading the keys, to pin your copy.
 #
 # Manifest: one line per directory, `<aggregate-sha256>  <directory-name>`. The aggregate hash is
-#   (cd <dir> && find . -type f ! -name '*.consttree' -exec sha256sum {} + | LC_ALL=C sort -k2 | sha256sum)
-# The *.consttree files are left out: ziskup generates them on the host at install (a GPU install writes them its own
-# way), so they are not part of the download and would not match a pin made on another host. With paths relative to the directory, so the host (where you pin) and the container (where the keys sit under
+#   (cd <dir> && find . -type f ! -name '*.consttree' ! -name '*.consttree_gpu' ! -name '*.const_gpu' -exec sha256sum {} + | LC_ALL=C sort -k2 | sha256sum)
+# The *.consttree, *.consttree_gpu and *.const_gpu files are left out: the host's setup generates them from the keys (a
+# GPU install writes a *.const_gpu file per circuit, and the PLONK step's recursivef.consttree, recursivef.const_gpu and recursivef.consttree_gpu), so they are not part of the
+# download and would not match a pin made on another host. With paths relative to the directory, so the host (where you pin) and the container (where the keys sit under
 # /opt/zisk) agree whatever ZISK_HOME is. The sort is bytewise (LC_ALL=C, which this script sets itself): with another
 # locale, such as en_US.UTF-8 on many hosts, sort ignores case and punctuation and orders the same names differently, so
 # a pin made on the host would not match the container. An added, removed, renamed or changed file shows up as a mismatch. The placeholder UNPINNED_PENDING_FIRST_BOOTSTRAP is
@@ -38,7 +39,7 @@ else echo "NoSha256Tool: neither sha256sum nor shasum is on PATH" >&2; exit 127;
 agg_hash() { # $1 = directory -> its aggregate sha256, or nothing when it is missing or empty
   local dir="$1"
   if [[ ! -d "$dir" ]] || [[ -z "$(find "$dir" -type f -print -quit 2>/dev/null)" ]]; then echo ""; return 0; fi
-  (cd "$dir" && find . -type f ! -name '*.consttree' -exec "${SHA256_CMD[@]}" {} + 2>/dev/null | sort -k2 | "${SHA256_CMD[@]}" | awk '{print $1}')
+  (cd "$dir" && find . -type f ! -name '*.consttree' ! -name '*.consttree_gpu' ! -name '*.const_gpu' -exec "${SHA256_CMD[@]}" {} + 2>/dev/null | sort -k2 | "${SHA256_CMD[@]}" | awk '{print $1}')
 }
 manifest_value() { grep -E "  ${1}\$" "$MANIFEST" 2>/dev/null | tail -1 | awk '{print $1}'; }
 
@@ -46,7 +47,7 @@ if [[ "$WRITE" -eq 1 ]]; then
   tmp="$(mktemp)"
   {
     echo "# Pinned aggregate sha256 of the ZisK proving keys, written by check-keys.sh --write (see check-keys.sh for the recipe)."
-    echo "# The *.consttree files are generated on the host at install and are left out of the hash."
+    echo "# The *.consttree, *.consttree_gpu and *.const_gpu files are generated on the host at install and are left out of the hash."
     for d in "${DIRS[@]}"; do
       h="$(agg_hash "$ZISK_HOME/$d")"
       if [[ -z "$h" ]]; then echo "refusing to write a manifest entry for '$d': $ZISK_HOME/$d is missing or empty" >&2; rm -f "$tmp"; exit 1; fi

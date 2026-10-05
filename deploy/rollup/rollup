@@ -9,7 +9,7 @@
 #   ./rollup register --dry-run         print the registration commands without running anything
 #   ./rollup register --confirm         register the chain on Solana (no verifier keys) and write rendered/pdas.env
 #   ./rollup guest-build [--skip-program-vk]   build the batch guest for rendered/genesis.json into rendered/guest/
-#   ./rollup up [service...]            start the node (the prover too when PROVER=on)
+#   ./rollup up [service...]            start the node (the prover too when PROVER=on, the exit prover when EXITS=on)
 #   ./rollup down                       stop and remove the containers; the data volumes stay
 #   ./rollup logs [-f] [--tail N] [service...]   the services' logs
 #   ./rollup status                     the running services and what Solana says about the chain
@@ -63,7 +63,8 @@ SEQUENCER_METRICS_PORT="$(cfg SEQUENCER_METRICS_PORT 9001)"
 BATCHER_METRICS_PORT="$(cfg BATCHER_METRICS_PORT 9002)"
 DERIVE_METRICS_PORT="$(cfg DERIVE_METRICS_PORT 9003)"
 PROVER_METRICS_PORT="$(cfg PROVER_METRICS_PORT 9004)"
-PORT_VARS=(RPC_PORT WS_PORT VERIFIER_RPC_PORT SEQUENCER_METRICS_PORT BATCHER_METRICS_PORT DERIVE_METRICS_PORT PROVER_METRICS_PORT)
+EXIT_PROVER_METRICS_PORT="$(cfg EXIT_PROVER_METRICS_PORT 9005)"
+PORT_VARS=(RPC_PORT WS_PORT VERIFIER_RPC_PORT SEQUENCER_METRICS_PORT BATCHER_METRICS_PORT DERIVE_METRICS_PORT PROVER_METRICS_PORT EXIT_PROVER_METRICS_PORT)
 for _v in "${PORT_VARS[@]}"; do
   [[ "${!_v}" =~ ^[0-9]+$ && "${!_v}" -ge 1 && "${!_v}" -le 65535 ]] || die PortInvalid "$_v is '${!_v}', expected a port number from 1 to 65535"
 done
@@ -72,6 +73,7 @@ VERIFIER_RPC="http://127.0.0.1:$VERIFIER_RPC_PORT"
 METRICS_SEQUENCER="http://127.0.0.1:$SEQUENCER_METRICS_PORT/metrics"
 METRICS_BATCHER="http://127.0.0.1:$BATCHER_METRICS_PORT/metrics"
 METRICS_PROVER="http://127.0.0.1:$PROVER_METRICS_PORT/metrics"
+METRICS_EXITS="http://127.0.0.1:$EXIT_PROVER_METRICS_PORT/metrics"
 
 load_env() {
   [[ -f "$ENV_FILE" ]] || die EnvMissing "$ENV_FILE does not exist (copy .env.example to .env and edit it)"
@@ -155,6 +157,25 @@ fetch_chain_id() {
   (( D_ID >= 4294967296 )) || die ChainIdInvalid "the derived chain id $D_ID is below 2^32, which a permissionless registration cannot produce"
 }
 
+# The exit prover pays its own fees and proof-account rent, and anyone can start a withdrawal, so it never uses the
+# batcher's payer: that key also pays for every batch and is the chain authority. EXIT_PAYER_KEYPAIR_PATH names a key of its
+# own, funded with SOL, and the check below keeps it apart from the batcher's.
+EXIT_PAYER_DEFAULT=./keys/exit-payer.json
+exit_payer_path() { abs "$(cfg EXIT_PAYER_KEYPAIR_PATH "$EXIT_PAYER_DEFAULT")"; }
+exit_payer_missing() { # $1=path
+  die ExitPayerMissing "$1 does not exist. EXITS=on needs a Solana keypair of its own for the exit prover, not the batcher's payer: from this directory run solana-keygen new -o keys/exit-payer.json, make it readable by uid 999 as the other key files are (sudo chgrp 999 keys/exit-payer.json && chmod 640 keys/exit-payer.json), fund it, and set EXIT_PAYER_KEYPAIR_PATH in $ENV_FILE"
+}
+# The public key of a keypair file, read the way fetch_chain_id reads the payer's.
+keypair_pubkey() { # $1=path -> the public key
+  local out
+  need_image cfg
+  ops_reset; mount_key exit-payer "$1"
+  out="$(ops chain-id --settlement "$SETTLEMENT_ID" --keypair "$REPLY" 2>/dev/null)" || die ChainIdLookupFailed "could not read the public key of $1 from $SOLANA_RPC_URL"
+  out="$(sed -n 's/^authority=//p' <<<"$out" | head -1)"
+  [[ -n "$out" ]] || die ChainIdLookupFailed "unexpected output reading the public key of $1"
+  printf '%s' "$out"
+}
+
 # ---------------------------------------------------------------------------------------------------------- init
 cmd_init() {
   load_env
@@ -236,7 +257,19 @@ cmd_init() {
   # Everything in chain.toml is checked; now the one network call: the chain id.
   local payer_key chain_id rec="$OUT/chain-id.env" rec_auth rec_nonce rec_id
   payer_key="$(abs "$(cfg PAYER_KEYPAIR_PATH ./keys/payer.json)")"
+  local exit_key="" exit_pub=""
+  if [[ "$(cfg EXITS)" == on ]]; then
+    exit_key="$(exit_payer_path)"
+    [[ -f "$exit_key" ]] || exit_payer_missing "$exit_key"
+  fi
   fetch_chain_id "$payer_key" cfg
+  if [[ -n "$exit_key" ]]; then
+    # keypair_pubkey runs in a subshell, where its die ends only the subshell: stop here too, and never go on without
+    # the comparison below.
+    exit_pub="$(keypair_pubkey "$exit_key")" || exit 1
+    [[ -n "$exit_pub" ]] || die ChainIdLookupFailed "could not read the public key of $exit_key"
+    [[ "$exit_pub" != "$D_AUTHORITY" ]] || die ExitPayerIsBatcherPayer "EXIT_PAYER_KEYPAIR_PATH ($exit_key) is the same key as PAYER_KEYPAIR_PATH ($D_AUTHORITY). Anyone can start a withdrawal and each proof costs the exit prover's payer a fee and rent, so the batcher's key would be drained. Make another key with solana-keygen new -o keys/exit-payer.json, fund it, and point EXIT_PAYER_KEYPAIR_PATH at it"
+  fi
   local registered=0 fresh_nonce="$D_NONCE"
   [[ ! -f "$OUT/pdas.env" ]] || registered=1   # register writes pdas.env when it finishes
   if [[ -f "$rec" ]]; then
@@ -329,6 +362,7 @@ cmd_init() {
   local seq_key opt
   seq_key="$(abs "$(cfg SEQUENCER_KEY_PATH ./keys/sequencer.key)")"
   printf 'AUTHORITY=%s\nNONCE=%s\nCHAIN_ID=%s\n' "$D_AUTHORITY" "$D_NONCE" "$D_ID" > "$STAGE/chain-id.env"
+  [[ -z "$exit_pub" ]] || printf 'EXIT_PAYER=%s\n' "$exit_pub" >> "$STAGE/chain-id.env"
   {
     echo "CHAIN_ID=$chain_id"
     echo "BLOCK_GAS_LIMIT=$gas_limit"
@@ -337,6 +371,7 @@ cmd_init() {
     echo "RENDERED_DIR=$OUT"
     echo "SEQUENCER_KEY_PATH=$seq_key"
     echo "PAYER_KEYPAIR_PATH=$payer_key"
+    [[ -z "$exit_key" ]] || echo "EXIT_PAYER_KEYPAIR_PATH=$exit_key"
     echo "RPC_BIND=$(cfg RPC_BIND 127.0.0.1)"
     for opt in "${PORT_VARS[@]}"; do echo "$opt=${!opt}"; done
     echo "PROVER_DB_PASSWORD_FILE=$OUT/prover-db-password"
@@ -358,8 +393,14 @@ cmd_init() {
   else
     rm -f "$OUT/prover.toml"
   fi
+  # The exit prover, when withdrawals are on. It needs nothing the other configs do not already hold.
+  if [[ "$(cfg EXITS)" == on ]]; then
+    rz_render_template "$ROLLUP_DIR/exit-prover.toml.template" "$STAGE/exit-prover.toml" "${common[@]}" || exit 1
+  else
+    rm -f "$OUT/exit-prover.toml"
+  fi
   local f
-  for f in sequencer-config.toml genesis.json batcher.toml derive.toml compose.env chain-id.env prover.toml; do
+  for f in sequencer-config.toml genesis.json batcher.toml derive.toml compose.env chain-id.env prover.toml exit-prover.toml; do
     [[ -f "$STAGE/$f" ]] && cp "$STAGE/$f" "$OUT/$f"
   done
   # 0644 on purpose: derive and the verifier node run as other users than you, and the engine port is never published.
@@ -501,6 +542,7 @@ cmd_register() {
 dc() {
   local profile=()
   [[ "$(cfg PROVER)" == on ]] && profile=(--profile prover)
+  [[ "$(cfg EXITS)" == on ]] && profile+=(--profile exits)
   docker compose --env-file "$OUT/compose.env" -f "$ROLLUP_DIR/docker-compose.yml" ${profile[@]+"${profile[@]}"} "$@"
 }
 
@@ -515,6 +557,12 @@ cmd_up() {
   [[ -f "$seq_key" ]] || die SequencerKeyMissing "$seq_key does not exist (64 hex characters, readable by uid 999)"
   if [[ $# -eq 0 ]] || printf '%s\n' "$@" | grep -qxE 'batcher|prover'; then
     [[ -f "$payer_key" ]] || die PayerKeyMissing "$payer_key does not exist (a funded Solana keypair, readable by uid 999)"
+  fi
+  # The exit prover has a key of its own, never the batcher's.
+  if [[ "$(cfg EXITS)" == on ]] && { [[ $# -eq 0 ]] || printf '%s\n' "$@" | grep -qx 'exit-prover'; }; then
+    local exit_key; exit_key="$(rz_env_get "$OUT/compose.env" EXIT_PAYER_KEYPAIR_PATH)"
+    [[ -n "$exit_key" ]] || die ExitPayerMissing "$OUT/compose.env names no exit payer key; run ./rollup init again with EXIT_PAYER_KEYPAIR_PATH set in $ENV_FILE"
+    [[ -f "$exit_key" ]] || exit_payer_missing "$exit_key"
   fi
   dc up -d "$@"
 }
@@ -885,7 +933,7 @@ cmd_migrate() {
 }
 
 # The services compose knows, for `logs`.
-KNOWN_SERVICES=(sequencer batcher reth-verifier derive prover postgres)
+KNOWN_SERVICES=(sequencer batcher reth-verifier derive prover postgres exit-prover)
 cmd_logs() {
   local follow=() tail="${LOGS_TAIL:-200}" svcs=() s k
   while [[ $# -gt 0 ]]; do
@@ -963,13 +1011,14 @@ cmd_check() {
   load_env
   load_programs
   local env="$OUT/compose.env" sample="${CHECK_SAMPLE_SECS:-3}"
-  local chain_id bpb close_after prover
+  local chain_id bpb close_after prover exits
   chain_id="$(rz_env_get "$env" CHAIN_ID)"; bpb="$(rz_env_get "$env" BLOCKS_PER_BATCH)"
-  close_after="$(rz_env_get "$env" BATCH_CLOSE_AFTER_SECS)"; prover="$(cfg PROVER)"
+  close_after="$(rz_env_get "$env" BATCH_CLOSE_AFTER_SECS)"; prover="$(cfg PROVER)"; exits="$(cfg EXITS)"
 
   # Services. A service that is not running is named once; the items that need it are skipped with the reason.
   local services=(sequencer batcher reth-verifier derive) running svc
   [[ "$prover" == on ]] && services+=(prover postgres)
+  [[ "$exits" == on ]] && services+=(exit-prover)
   running="$(dc ps --services --status running 2>/dev/null)"
   declare -A up_
   for svc in "${services[@]}"; do
@@ -1090,13 +1139,82 @@ cmd_check() {
     if needs prover; then
       local behind secs
       behind="$(metric "$METRICS_PROVER" rome_zk_prover_batches_behind)"; secs="$(metric "$METRICS_PROVER" rome_zk_prover_lag_seconds)"
-      if [[ -n "$behind" ]] && awk -v b="$behind" -v s="${secs:-0}" 'BEGIN{exit !(b<=2 && s<=600)}'; then
-        pass "prover lag" "batches_behind=$behind, oldest unproved batch ${secs:-0}s old"
+      # The age bound counts only while a batch waits: the gauge keeps the age of the last batch proved, so a caught-up
+      # prover on a quiet chain would otherwise fail here until the next batch posts.
+      if [[ -n "$behind" ]] && awk -v b="$behind" -v s="${secs:-0}" 'BEGIN{exit !(b<=2 && (b==0 || s<=600))}'; then
+        if [[ "$behind" == 0 ]]; then pass "prover lag" "batches_behind=0, nothing waiting to be proved"
+        else pass "prover lag" "batches_behind=$behind, oldest unproved batch ${secs:-0}s old"; fi
       else fail "prover lag" "ProverBehind: batches_behind=${behind:-no metric}, lag_seconds=${secs:-no metric} (bounds 2 batches, 600s)"; fi
     else skip "prover lag" "needs the prover, which is not running"; fi
   else
     skip "settlement lag" "no prover configured (PROVER=on in .env turns it on)"
     skip "prover lag" "no prover configured (PROVER=on in .env turns it on)"
+  fi
+
+  # Withdrawals. The exit prover reports through its own metrics; it scans only while the chain's exit config is active.
+  if [[ "$exits" == on ]]; then
+    local em="" ea="" eg="" el="" es=""
+    if needs exit-prover; then
+      em="$(curl -sS --max-time 5 "$METRICS_EXITS" 2>/dev/null)" || em=""
+      if [[ -n "$em" ]]; then pass "exit prover" "answering on 127.0.0.1:$EXIT_PROVER_METRICS_PORT"
+      else fail "exit prover" "ExitProverUnreachable: no answer from $METRICS_EXITS (./rollup logs exit-prover)"; fi
+      ea="$(sed -n 's/^rome_zk_exit_active \(.*\)$/\1/p' <<<"$em" | tail -1)"
+      eg="$(sed -n 's/^rome_zk_exit_gate_read_ok \(.*\)$/\1/p' <<<"$em" | tail -1)"
+      # The scan reads the verifier's head (eth_blockNumber) before each eth_getLogs, and stops when that read fails, so
+      # both counters together say whether withdrawals are being read.
+      local el_logs el_head
+      el_logs="$(sed -n 's/^rome_zk_exit_rpc_errors_total{method="eth_getLogs"} \([0-9]*\)\(\.[0-9]*\)\{0,1\}$/\1/p' <<<"$em" | tail -1)"
+      el_head="$(sed -n 's/^rome_zk_exit_rpc_errors_total{method="eth_blockNumber"} \([0-9]*\)\(\.[0-9]*\)\{0,1\}$/\1/p' <<<"$em" | tail -1)"
+      el=""; [[ -z "$el_logs$el_head" ]] || el=$(( ${el_logs:-0} + ${el_head:-0} ))
+      es="$(sed -n 's/^rome_zk_exit_stuck{reason="\([a-z_]*\)"} \([0-9]*\)$/\1=\2/p' <<<"$em" | grep -v '=0$' | sort | paste -sd ' ' -)"
+      if [[ -z "$em" ]]; then
+        skip "exits active" "the exit prover does not answer (see exit prover above)"
+        skip "stuck exits" "the exit prover does not answer (see exit prover above)"
+        skip "exit log scan" "the exit prover does not answer (see exit prover above)"
+      else
+        if [[ "$eg" == 0 ]]; then fail "exits active" "ExitConfigUnreadableByExitProver: the exit prover could not read the chain's exit config or root from Solana, so it cannot tell whether exits are active; check that SOLANA_RPC_URL in $ENV_FILE answers from this host (curl it), then ./rollup logs exit-prover"
+        elif [[ "$ea" == 1 ]]; then pass "exits active" "the chain's exit config names a portal and a cap, the exit prover is scanning"
+        else fail "exits active" "ExitsNotActive: the chain's exit config names no portal or its exit cap is 0, so the exit prover waits (./rollup exit-config propose, then activate)"; fi
+        if [[ -z "$es" ]]; then pass "stuck exits" "none"
+        else
+          local n=0 kv; for kv in $es; do n=$(( n + ${kv#*=} )); done
+          fail "stuck exits" "ExitsStuck: $n exits are parked as stuck ($es); see ./rollup logs exit-prover"
+        fi
+        # The log scan reads the verifier node's logs. Its error counter only grows, so what counts is growth since the
+        # previous check; a counter below the last sample means the exit prover restarted, and every error is then new.
+        local esamples="$OUT/check-samples.exit-log" eprev="" egrow
+        [[ -f "$esamples" ]] && eprev="$(awk 'NF == 2 && $2 ~ /^[0-9]+$/ { v = $2 } END { print v }' "$esamples" 2>/dev/null)"
+        el="${el:-0}"
+        { [[ -f "$esamples" ]] && tail -n 499 "$esamples"; echo "${CHECK_NOW:-$(date +%s)} $el"; } > "$esamples.new" 2>/dev/null && mv "$esamples.new" "$esamples" 2>/dev/null
+        if [[ -z "$eprev" ]]; then
+          skip "exit log scan" "no earlier sample yet (log scan errors (eth_blockNumber, eth_getLogs) so far: $el); run ./rollup check on a timer and it judges growth from the second run on"
+        else
+          egrow=$(( el >= eprev ? el - eprev : el ))
+          if (( egrow > 0 )); then
+            fail "exit log scan" "ExitLogScanFailing: log scan errors (eth_blockNumber, eth_getLogs) grew by $egrow since the last check ($el in total): the exit prover cannot read withdrawals from the verifier node, so none will be proved; see ./rollup logs exit-prover and ./rollup logs reth-verifier"
+          else pass "exit log scan" "no new log scan errors (eth_blockNumber, eth_getLogs) since the last check ($el in total)"; fi
+        fi
+      fi
+    else
+      skip "exit prover" "needs $MISSING, which is not running"
+      skip "exits active" "needs $MISSING, which is not running"
+      skip "stuck exits" "needs $MISSING, which is not running"
+      skip "exit log scan" "needs $MISSING, which is not running"
+    fi
+    # The exit prover's own payer: it pays a fee and rent for every proof, so a low balance stops withdrawals.
+    local epk efloor="${EXIT_PAYER_FLOOR_LAMPORTS:-$(cfg EXIT_PAYER_FLOOR_LAMPORTS 100000000)}" ebal
+    epk="$(rz_env_get "$OUT/chain-id.env" EXIT_PAYER)"
+    if [[ -z "$epk" ]]; then skip "exit payer balance" "needs EXIT_PAYER in $OUT/chain-id.env, which ./rollup init writes when EXITS=on"
+    elif ebal="$(sol_balance "$epk")" && [[ "$ebal" =~ ^[0-9]+$ ]]; then
+      if (( ebal >= efloor )); then pass "exit payer balance" "$ebal lamports at $epk (floor $efloor)"
+      else fail "exit payer balance" "ExitPayerBelowFloor: $ebal lamports at $epk, floor $efloor (fund the exit payer, or move the floor with EXIT_PAYER_FLOOR_LAMPORTS)"; fi
+    else fail "exit payer balance" "ExitPayerBalanceUnreadable: could not read the balance of $epk from $SOLANA_RPC_URL"; fi
+  else
+    skip "exit prover" "no exit prover configured (EXITS=on in .env turns it on)"
+    skip "exits active" "no exit prover configured (EXITS=on in .env turns it on)"
+    skip "stuck exits" "no exit prover configured (EXITS=on in .env turns it on)"
+    skip "exit log scan" "no exit prover configured (EXITS=on in .env turns it on)"
+    skip "exit payer balance" "no exit prover configured (EXITS=on in .env turns it on)"
   fi
 
   # The payer: it pays every Solana fee and the rent of every batch. Below the floor the batcher stops sending.

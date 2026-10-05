@@ -115,15 +115,18 @@ if tar --version 2>/dev/null | grep -q 'GNU tar'; then
 BUCKET_URL="file://$d/src"
 echo "ziskup \$*" >> "$d/log"
 prefix=""; while [ \$# -gt 0 ]; do [ "\$1" = --prefix ] && prefix="\$2"; shift; done
+# The real installer clears its prefix before it installs, so anything kept under ZISK_HOME is gone afterwards.
+rm -rf "\$prefix"
 mkdir -p "\$prefix/bin"
 printf '#!/bin/sh\necho cargo-zisk\n' > "\$prefix/bin/cargo-zisk"
-printf '#!/bin/sh\necho "cargo-zisk-dev \$*" >> "$d/log"\n' > "\$prefix/bin/cargo-zisk-dev"
+printf '#!/bin/sh\necho "cargo-zisk-dev \$*" >> "$d/log"\nif [ -e "$d/fail-once" ]; then rm -f "$d/fail-once"; exit 1; fi\n' > "\$prefix/bin/cargo-zisk-dev"
 chmod +x "\$prefix/bin/cargo-zisk" "\$prefix/bin/cargo-zisk-dev"
 ZSTUB
     chmod +x "$d/ziskup"
-    # The bytes the stub ziskup writes, to pin: cargo-zisk, and cargo-zisk-dev with the log path in it.
+    # The bytes the stub ziskup writes, to pin: cargo-zisk, and cargo-zisk-dev with the log path in it (it fails once while
+    # $d/fail-once exists).
     printf '#!/bin/sh\necho cargo-zisk\n' > "$d/exp-cz"
-    printf '#!/bin/sh\necho "cargo-zisk-dev $*" >> "%s"\n' "$d/log" > "$d/exp-dev-real"
+    printf '#!/bin/sh\necho "cargo-zisk-dev $*" >> "%s"\nif [ -e "%s" ]; then rm -f "%s"; exit 1; fi\n' "$d/log" "$d/fail-once" "$d/fail-once" > "$d/exp-dev-real"
   }
   run_case() { # $1 = case name, $2 = script, rest = KEY=VALUE overrides; prints the output, sets CASE_RC
     local c="$1" scr="$2" d="$WORK/c/$1"; shift 2
@@ -141,8 +144,48 @@ ZSTUB
   build_case ok;  rc_run ok "$S"
   if [[ $CASE_RC -eq 0 && -d "$WORK/c/ok/zh/provingKey" && -d "$WORK/c/ok/zh/provingKeySnark" ]]; then pass "an install whose every download matches its pin completes and unpacks both key sets"; else fail "a matching install completes" "rc=$CASE_RC out=$out"; fi
   [[ "$(logged ok | head -1)" == "ziskup -v 1.3.1-alpha --gpu --nokey -y --prefix $WORK/c/ok/zh" ]] && pass "ziskup is run with --gpu --nokey --prefix, and runs first" || fail "ziskup is run with --gpu --nokey --prefix" "$(logged ok)"
-  logged ok | sed -n 2p | grep -q 'check-setup --proving-key .*/provingKey -a --gpu' && pass "the constant trees are generated after ziskup, by the checked cargo-zisk-dev" || fail "the constant trees are generated after ziskup" "$(logged ok)"
+  logged ok | sed -n 2p | grep -q -E 'check-setup --proving-key .*/provingKey --proving-key-plonk .*/provingKeySnark --plonk --gpu$' && pass "the constant trees are generated after ziskup, by the checked cargo-zisk-dev, for both key sets with aggregation and PLONK" || fail "the constant trees are generated for both key sets" "$(logged ok)"
+  # -a is --no-aggregation in check-setup: with it, a GPU host gets no compressor or recursive *.const_gpu files and every
+  # proof fails at the first aggregation step.
+  ! logged ok | grep -q -E 'check-setup.* (-a|--no-aggregation)( |$)' && pass "check-setup keeps aggregation on (no -a)" || fail "check-setup keeps aggregation on" "$(logged ok)"
   [[ ! -e "$WORK/c/ok/dl/zisk-provingkey-1.3.1-alpha.tar.gz" && ! -e "$WORK/c/ok/dl/zisk-provingkey-plonk-1.3.1-alpha.tar.gz" ]] && pass "the downloaded archives are deleted after they are unpacked" || fail "the archives are deleted" "$(ls "$WORK/c/ok/dl" 2>&1)"
+
+  # 1b. The key archives are kept outside ZISK_HOME, which ziskup clears: with the default DOWNLOAD_DIR the install still
+  # finds and unpacks them, and a DOWNLOAD_DIR inside ZISK_HOME is refused before anything runs or is downloaded.
+  build_case dldef; rc_run dldef "$S" DOWNLOAD_DIR=
+  [[ $CASE_RC -eq 0 && -d "$WORK/c/dldef/zh/provingKey" && -d "$WORK/c/dldef/zh/provingKeySnark" ]] \
+    && pass "with the default DOWNLOAD_DIR the archives survive ziskup clearing ZISK_HOME and both key sets are unpacked" || fail "the default DOWNLOAD_DIR survives ziskup" "rc=$CASE_RC out=$out"
+  build_case dlin; rc_run dlin "$S" DOWNLOAD_DIR="$WORK/c/dlin/zh/dl"
+  [[ $CASE_RC -ne 0 && "$out" == *"DownloadDirInsideZiskHome:"* && -z "$(logged dlin)" && ! -e "$WORK/c/dlin/zh/dl/zisk-provingkey-1.3.1-alpha.tar.gz" ]] \
+    && pass "a DOWNLOAD_DIR inside ZISK_HOME is refused by name (DownloadDirInsideZiskHome) before ziskup runs or anything is downloaded" || fail "a DOWNLOAD_DIR inside ZISK_HOME is refused" "rc=$CASE_RC out=$out"
+
+  # 1c. check-setup is a step of its own. If it fails or is killed, the keys are already unpacked and match the pins, so a
+  # re-run must run it again; a done marker, written only after it succeeds and kept outside the hashed key directories,
+  # is what says it ran. A marker from another release does not count, and the last check refuses without one.
+  stub_manifest() { # $1 = case name; pins the stub keys of that case in $WORK/c/$1/keys.sha256
+    local d="$WORK/c/$1"; rm -rf "$d/pinsrc"; mkdir -p "$d/pinsrc"; cp -R "$d/src/pk/provingKey" "$d/src/sk/provingKeySnark" "$d/pinsrc/"
+    ZISK_HOME="$d/pinsrc" MANIFEST="$d/keys.sha256" bash "$(dirname "$S")/check-keys.sh" --write >/dev/null 2>&1
+  }
+  count_setup() { logged "$1" | grep -c check-setup; }
+  build_case redo; stub_manifest redo; touch "$WORK/c/redo/fail-once"
+  rc_run redo "$S" MANIFEST="$WORK/c/redo/keys.sha256"
+  [[ $CASE_RC -ne 0 && "$out" == *"ZiskupFailed:"* && "$(count_setup redo)" == 1 && -d "$WORK/c/redo/zh/provingKey" ]] \
+    && pass "a check-setup that fails stops the install by name (ZiskupFailed) with the keys already unpacked" || fail "a failing check-setup stops the install" "rc=$CASE_RC out=$out log=$(logged redo)"
+  ls "$WORK/c/redo/zh"/.check-setup-done* >/dev/null 2>&1 && fail "no done marker after a failed check-setup" "$(ls -a "$WORK/c/redo/zh")" || pass "no done marker is written after a failed check-setup"
+  rc_run redo "$S" MANIFEST="$WORK/c/redo/keys.sha256"
+  [[ $CASE_RC -eq 0 && "$out" == *"already match"* && "$(count_setup redo)" == 2 ]] \
+    && pass "the re-run sees the keys match, runs check-setup again, and completes" || fail "the re-run runs check-setup again" "rc=$CASE_RC out=$out log=$(logged redo)"
+  ls "$WORK/c/redo/zh"/.check-setup-done* >/dev/null 2>&1 && pass "the done marker is written once check-setup succeeds" || fail "the done marker is written" "$(ls -a "$WORK/c/redo/zh")"
+  rc_run redo "$S" MANIFEST="$WORK/c/redo/keys.sha256"
+  [[ $CASE_RC -eq 0 && "$(count_setup redo)" == 2 ]] && pass "with the marker present a further run does not run check-setup again" || fail "a run with the marker skips check-setup" "rc=$CASE_RC log=$(logged redo)"
+  mv "$WORK/c/redo/zh"/.check-setup-done* "$WORK/c/redo/zh/.check-setup-done-0.0.1-other"
+  rc_run redo "$S" MANIFEST="$WORK/c/redo/keys.sha256"
+  [[ $CASE_RC -eq 0 && "$(count_setup redo)" == 3 ]] && pass "a marker left by another release does not count: check-setup runs again" || fail "another release's marker does not count" "rc=$CASE_RC log=$(logged redo)"
+  out="$(env ZISK_HOME="$WORK/c/redo/zh" bash -c 'source "$1"; require_setup_done' _ "$S" 2>&1)"; rc=$?
+  [[ $rc -eq 0 ]] && pass "the last check accepts a host whose check-setup has finished" || fail "the last check accepts a finished host" "rc=$rc out=$out"
+  rm -f "$WORK/c/redo/zh"/.check-setup-done*
+  out="$(env ZISK_HOME="$WORK/c/redo/zh" bash -c 'source "$1"; require_setup_done' _ "$S" 2>&1)"; rc=$?
+  [[ $rc -ne 0 && "$out" == "ConstantFilesMissing:"* && "$out" == *"check-setup"* ]] && pass "the last check refuses a host whose check-setup has not finished (ConstantFilesMissing), naming the command" || fail "the last check refuses without the marker" "rc=$rc out=$out"
 
   # 2. ziskup that is not the pinned one never runs, and nothing is downloaded: the order inside install_zisk itself.
   zup_bad() { # a ziskup that does not have the pinned hash (the pin is the hash of the stub before it was changed)

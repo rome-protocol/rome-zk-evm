@@ -1,0 +1,51 @@
+name: Bug report
+description: Something did not work as the guide or the README says.
+title: "Bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For a question, please start a thread in [Discussions](https://github.com/rome-protocol/solana-zk-evm/discussions).
+        To ask for a verification key, use the verification key request form. For a security problem, follow
+        [SECURITY.md](https://github.com/rome-protocol/solana-zk-evm/blob/main/SECURITY.md) and do not open an issue.
+
+        Never paste a keypair, a seed phrase or the contents of a key file.
+  - type: input
+    id: version
+    attributes:
+      label: Version or tag
+      description: The release tag you run, or the commit if you run `main`.
+      placeholder: v0.3.0
+    validations:
+      required: true
+  - type: textarea
+    id: ran
+    attributes:
+      label: What you ran
+      description: The commands, in order, and anything unusual about your setup.
+    validations:
+      required: true
+  - type: textarea
+    id: saw
+    attributes:
+      label: What you saw
+      description: What happened, and what you expected instead. Include the error name if there is one.
+    validations:
+      required: true
+  - type: textarea
+    id: check-output
+    attributes:
+      label: ./rollup check output
+      description: The full output of `./rollup check`.
+      render: text
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: The last lines of the log of the service that failed (`docker compose logs --tail 100 <service>`).
+      render: text
+    validations:
+      required: false

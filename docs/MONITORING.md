@@ -37,7 +37,7 @@ Until the chain posts its first root, anyone can reclaim it about 30 days after 
 
 When the prover runs, `./rollup check` expects no more than **2** posted batches without a final root. It reads the inbox cursor and settlement root accounts directly. The prover's `rome_zk_prover_head` gauges are its own last reads. They are refreshed once per batch attempt and can be up to 30 minutes old during a proof. The final head is not refreshed while the prover waits for the next inbox batch. A proved root is final when it posts, so `rome_zk_prover_batches_behind` gives the same count from fresher reads. Page if it stays above **2**, and use `./rollup check` for the direct Solana read.
 
-`./rollup check` also uses a **600 second** bound for `rome_zk_prover_lag_seconds`. This gauge keeps the value from the last batch the prover posted. On a quiet chain, one slow batch can leave it above 600 seconds with nothing left to prove, and `./rollup check` then fails until the next batch posts. Page on it only while `rome_zk_prover_batches_behind` is above zero. Without a prover, skip settlement and prover lag alerts. Inbox posting alone cannot settle the chain.
+`./rollup check` also uses a **600 second** bound for `rome_zk_prover_lag_seconds`. This gauge keeps the value from the last batch the prover posted. On a quiet chain, one slow batch can leave it above 600 seconds with nothing left to prove, so `./rollup check` applies the bound only while `rome_zk_prover_batches_behind` is above zero. Page on it the same way. Without a prover, skip settlement and prover lag alerts. Inbox posting alone cannot settle the chain.
 
 ## Disk
 

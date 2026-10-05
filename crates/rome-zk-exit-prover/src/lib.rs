@@ -27,6 +27,8 @@
 //!   pre-send nullifier check), then send-and-classify.
 //! - [`follower`]: [`follower::Follower`] — the stateful, chain-derived retry/stuck cache the bin drives
 //!   (`ingest` → `due` → `attempt_exit` → `apply`).
+//! - [`release`]: pays a proved exit out with `ReleaseExit`, the same instructions the operator's `release-exit`
+//!   command sends, unless the payout is too small to be worth creating the recipient's token account.
 //! - [`config`]: the TOML-rendered runtime `Config`.
 //! - [`metrics`]: Prometheus metrics served on `/metrics`.
 //! - [`run`]: [`run::poll_once`] — the whole poll (`eth_getLogs` → `ingest` → `attempt_exit` on every due
@@ -40,6 +42,7 @@ pub mod follower;
 pub mod logs;
 pub mod metrics;
 pub mod proof;
+pub mod release;
 pub mod rpc;
 pub mod run;
 pub mod settlement;

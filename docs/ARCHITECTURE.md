@@ -21,6 +21,7 @@ the parts; [Deployment](#deployment) says what runs on Solana devnet today.
 | Derive and prove | Derivation node, reth-verifier, prover, guest | Reconstruct the chain and prove batch execution. |
 | Settle and observe | zk-inbox, zk-settlement, proof verifier (Veritas), settlement watcher | Store batch data, verify proofs, expose final roots and record history. |
 | Withdraw | Exit portal, exit prover, zk-bridge | Record a withdrawal, prove its inclusion and release tokens on Solana. |
+| Deposit | zk-bridge, sequencer, batcher, zk-inbox | Lock tokens and queue a credit, credit it in an L2 block, and commit the ordered deposit range in a batch. |
 
 The [detailed component table](#components) gives each component's code and who runs it.
 
@@ -54,8 +55,11 @@ flowchart TB
   USERS -->|RPC reads| SEQ
   SEQ -->|signed pre-confirmations| USERS
   USERS -->|initiateExit| PORTAL
+  USERS -->|deposit| VAULT
   SEQ -->|appends| LOG
   LOG --> BAT
+  BAT -->|reads deposit queue| VAULT
+  SEQ -->|reads finalized deposits| VAULT
   BAT -->|posts frames| INBOX
 
   DER -->|reads finalized batches| INBOX
@@ -77,8 +81,9 @@ flowchart TB
 
 **Proof verifier.** Veritas ([`programs/veritas`](../programs/veritas/README.md)) is Rome's verifier for ZisK's
 PLONK proofs. zk-settlement links it with the `no-entrypoint` feature and runs `verify_zisk` inside
-`PostRootProved`, with no cross-program call. The prover links the same code and checks each proof
-off-chain before posting it.
+`PostRootProved`, with no cross-program call. Settlement selects the verifying key and pinned recursion
+root for the ZisK release named by the active registry entry. It refuses a different recursion root
+before the pairing. The prover links the same code and checks each proof off-chain before posting it.
 
 **reth-verifier** is a separate process: an upstream reth node driven by the derivation node over the
 Engine API. It re-executes blocks derived from Solana and serves RPC, execution witnesses and the state
@@ -95,10 +100,10 @@ Each linked directory has a README with the component's configuration and tests.
 |---|---|---|---|
 | Sequencer | [`crates/rome-zk-sequencer`](../crates/rome-zk-sequencer) | Accepts and orders transactions, executes them, durably logs signed sub-blocks, and returns pre-confirmations. | Chain operator |
 | Execution engine | [`crates/rome-zk-executor-reth`](../crates/rome-zk-executor-reth), [`crates/rome-zk-executor-api`](../crates/rome-zk-executor-api) | Embeds upstream reth v2.5.2 behind the `Executor` trait. Executes the ordered transactions, computes roots and persists state. | Inside the sequencer |
-| Batcher | [`crates/rome-zk-batcher`](../crates/rome-zk-batcher) | Reads the ordered log, compresses blocks into frames, posts them to zk-inbox and finalizes each batch's accumulator. | Chain operator |
+| Batcher | [`crates/rome-zk-batcher`](../crates/rome-zk-batcher) | Reads the ordered log, compresses blocks into frames, posts them to zk-inbox and finalizes each batch's accumulator and deposit range. | Chain operator |
 | Derivation node | [`crates/rome-zk-derive`](../crates/rome-zk-derive) | Reads finalized Solana inbox and settlement data and drives reth over the Engine API to reconstruct the chain. | Chain operator or an independent observer |
 | reth-verifier | Upstream reth v2.5.2; no Rome implementation | Re-executes derived blocks and serves RPC, execution witnesses and state proofs to the prover and exit prover. Its testing API must stay off the public network. | Alongside a derivation node, on a private network |
-| Prover | [`crates/rome-zk-prover`](../crates/rome-zk-prover) | Follows finalized inbox batches, builds inputs, runs `cargo-zisk prove --plonk`, checks the result locally and posts `PostRootProved`. Can record job history in Postgres. | Chain operator |
+| Prover | [`crates/rome-zk-prover`](../crates/rome-zk-prover) | Follows finalized inbox batches, builds inputs, runs `cargo-zisk prove --plonk`, checks the result locally under the release named by the chain's active registry entry and posts `PostRootProved`. Can record job history in Postgres. | Chain operator |
 | Prover input generator | [`crates/rome-zk-prover-input`](../crates/rome-zk-prover-input) | Fetches inbox data, blocks and execution witnesses and writes the guest's two input files. Available as a library and CLI. | Inside the prover, or invoked separately |
 | Batch guest | `rome-protocol/rome-zk-guest`, `crates/clients/rome/guest` (`guest-rome`) | Checks that blocks match inbox data and execute correctly, then commits the batch's public values. The chain's genesis and fee recipient are compiled into the guest. | Executed by ZisK during proving |
 | Settlement watcher | [`crates/rome-zk-settlement-watcher`](../crates/rome-zk-settlement-watcher) | Reads inbox and settlement transaction history into Postgres and derives batch and exit status. Never writes to Solana. | Chain operator or an independent observer |
@@ -106,10 +111,10 @@ Each linked directory has a README with the component's configuration and tests.
 | Rollup runner | [`deploy/rollup`](../deploy/rollup) | `./rollup init`, `register`, `up` and `check`: renders a chain's configuration and genesis, registers the chain, and runs the node image, reth-verifier and, with `PROVER=on`, the prover under Docker Compose. | Chain operator |
 | Exit portal | [`contracts/exit-portal`](../contracts/exit-portal) | `RomeExitPortal` records a native-asset withdrawal message and emits `ExitInitiated`. | Contract deployed on the rollup |
 | Exit prover | [`crates/rome-zk-exit-prover`](../crates/rome-zk-exit-prover) | Watches portal events, obtains and locally checks an Ethereum storage proof, and sends `ProveExit` against a final batch root. | Chain operator |
-| zk-inbox | [`programs/zk-inbox`](../programs/zk-inbox) | Stores transaction chunks and reduces each batch to a Merkle commitment. | Solana validators execute the deployed program |
+| zk-inbox | [`programs/zk-inbox`](../programs/zk-inbox) | Stores transaction chunks and reduces each batch and its ordered deposit range to a Merkle commitment. | Solana validators execute the deployed program |
 | zk-settlement | [`programs/zk-settlement`](../programs/zk-settlement) | Registers chains, accepts roots, tracks finality, serves `RootView`, verifies exit inclusion and manages fees and governance. | Solana validators execute the deployed program |
-| Proof verifier (Veritas) | [`programs/veritas`](../programs/veritas) | The PLONK verifier checks ZisK proofs over BN254. zk-settlement links this code and runs it inside `PostRootProved`; the prover runs the same check off-chain before it posts. | Solana validators inside zk-settlement, using `alt_bn128` syscalls; the prover off-chain |
-| zk-bridge | [`programs/zk-bridge`](../programs/zk-bridge) | Holds the SPL-token vault, consumes a proved exit through zk-settlement and transfers the corresponding amount to its recipient. | Solana validators execute the deployed program |
+| Proof verifier (Veritas) | [`programs/veritas`](../programs/veritas) | The PLONK verifier checks ZisK proofs over BN254 with a release-specific verifying key and pinned recursion root. zk-settlement links this code and runs it inside `PostRootProved`; the prover runs the same check off-chain before it posts. | Solana validators inside zk-settlement, using `alt_bn128` syscalls; the prover off-chain |
+| zk-bridge | [`programs/zk-bridge`](../programs/zk-bridge) | Holds the SPL-token vault, locks deposits and appends them to a chain's queue, consumes a proved exit through zk-settlement and transfers the corresponding amount to its recipient. | Solana validators execute the deployed program |
 
 Three crates are placeholders with no service behavior yet:
 
@@ -148,8 +153,7 @@ keys, fees or registry-controlled configuration.
 The portable [`deploy/rollup/`](../deploy/rollup/) directory is available, with setup and commands in its
 [operator runbook](../deploy/rollup/README.md). The shared programs are live on Solana devnet, at the
 addresses in [`deploy/rollup/programs.devnet.json`](../deploy/rollup/programs.devnet.json), and the node
-image is published as `ghcr.io/rome-protocol/rome-zk-evm`. Building the guest for your chain is not
-automated yet, and no prover image is published. [Run on Solana devnet](RUN-ON-DEVNET.md) walks through
+image is published as `ghcr.io/rome-protocol/rome-zk-evm`. `./rollup guest-build` builds the guest for your chain, and no prover image is published. [Run on Solana devnet](RUN-ON-DEVNET.md) walks through
 starting a chain against those programs.
 
 The node image contains `rome-zk-sequencer`, `rome-zk-batcher` and `rome-zk-derive`, and, from `v0.2.1`,
@@ -199,7 +203,7 @@ configuration stays private.
    transaction format and meeting the wire-format constraints every client
    transaction must satisfy. Up to `batches_in_flight` batches (default 2) post concurrently: the next
    batch's `OpenBatch` follows as soon as the current one confirms, chunk lanes overlap freely, and
-   `FinalizeBatch` alone stays strictly ordered across batches — a bounded window that overlaps the
+   `FinalizeBatchV2` alone stays strictly ordered across batches — a bounded window that overlaps the
    cluster's own inclusion latency with the next batch's work instead of paying it serially. Cadence
    (per-batch open/finalize confirm time, window occupancy, and how far the log's tail runs ahead of the
    last finalized block) is registered as Prometheus metrics and served from the batcher's own
@@ -208,9 +212,10 @@ configuration stays private.
 6. **Accumulation.** Each sealed chunk contributes one leaf (`keccak(chunk index ‖ keccak(chunk body))`)
    to a per-batch Merkle accumulator, tracked in the inbox program's batch account. Seals are
    order-independent, so this step is fully parallel; once every expected chunk is sealed,
-   `FinalizeBatch` reduces the leaves to a single Merkle root and computes the batch's commitment
+   `FinalizeBatchV2` reduces the leaves to a single Merkle root and computes the batch's commitment
    (`acc`) over the chain id, batch id, the batch's opening slot, the expected chunk count, the Merkle
-   root and the (currently always-empty) forced-lane root. `FinalizeBatch` requires the batch's own
+   root and the forced-outcome root of the batch's deposit range. An empty range uses the empty root.
+   `FinalizeBatchV2` requires the batch's own
    `authority` to sign (the same authority `OpenBatch` recorded) — a third party can seal every leaf
    itself (permissionless) but cannot finalize the batch, so it can never finalize a later batch id ahead
    of the real poster's own still-open one.
@@ -224,7 +229,9 @@ configuration stays private.
    block number and inbox commitment. On every chain, both `PostRootProved` layouts also require the
    proof's `parent_hash` to equal `root.block_hash` when `head_pending_batch == 0`, or the predecessor
    pending account's `last_block_hash` otherwise. A mismatch returns `PredecessorHashMismatch` (84)
-   before the pairing check or any write.
+   before the pairing check or any write. `PostRootProved` finds the active entry by the proof's
+   programVK. The entry's scheme chooses the ZisK release and its verifying key; a different
+   recursion root is refused before public-values checks or the pairing.
 8. **Finality.** `PostRootProved` writes a `Final` batch in the same transaction and advances the finality
    head when the batch is next in order. On reserved chains, `FinalizeBatch` can also finalize an
    unproved pending batch once its window elapses with no open dispute and its predecessor is final.
@@ -239,6 +246,30 @@ configuration stays private.
    no final root until its first proved batch. Reserved chains keep their genesis as final. Consumers
    can combine a final-root read with an asset transfer in one Solana transaction without accepting a
    pending root.
+
+## Deposit lifecycle
+
+The chain authority creates a deposit queue in zk-bridge after the permissionless chain has posted its
+first proved batch. The queue is keyed by the chain's settlement program. Its registry must name
+the bridge's configured inbox. `Deposit` transfers the vault mint from the depositor's token account
+into the chain's vault, pays the queue's configured fee and appends a numbered record for the L2 recipient. The vault's mint
+must have at most nine decimals for a queue. A deposit cannot use the zero address or the exit portal
+as its L2 recipient. The chain's active exit configuration must name this bridge.
+
+The batcher gives `FinalizeBatchV2` a deposit range from the cursor's next index up to the chosen end.
+The inbox checks the queue count, the configured per-batch limit and the next waiting record. It commits
+the range and its hash-chain endpoints to the batch, then advances the cursor. A batch opened before the
+deposit-capable header format can take only an empty range. When the range stops before the queue's end,
+the next waiting deposit must still be within its inclusion deadline unless the batch took at least the
+configured per-block number of deposits. The deadline is measured at the batch's opening time. The
+inbox holds that opening-time reading for at most 24 hours after the batch opens. It checks the
+deposit's age at the later of the opening time and finalization time minus 24 hours. This rule
+constrains batches that finalize; it does not
+make the operator produce or prove a batch.
+
+`CloseBatch` moves the cursor's final deposit index only after the batch's root is final. Anyone can
+then call `CloseDeposit` to close a credited record and return its rent to the recorded depositor.
+The deposited tokens stay in the vault as the backing for the L2 credit.
 
 ## Exit lifecycle: prove, release, and how the watcher tracks it
 
@@ -326,7 +357,8 @@ would enforce a penalty are not implemented yet.
 
 **What independent derivation checks.** A derivation node can reconstruct the chain from Solana and
 compare the result with a posted root. That makes an incorrect result detectable. The challenge client
-and forced-inclusion path are still planned, so detection does not yet provide a working dispute or
+and general forced-inclusion path for EVM transactions are still planned, so detection does not
+yet provide a working dispute or
 censorship-recovery mechanism. A sequencer can delay transactions, including withdrawal requests.
 
 **Permissionless chains require proofs.** They reject unproved `PostRoot`, and their registration-time
@@ -380,15 +412,22 @@ fixed size to one that also carries an activation slot per entry, the first time
 every already-registered entry's bytes survive that growth untouched.
 
 **The ZisK release comes from the registry entry, and the recursion root is pinned per release.** An entry's
-`scheme` byte names the ZisK release its key belongs to (`1` is 1.2.0-alpha, `2` is 1.3.1-alpha). The proof does
+`scheme` byte names the ZisK release its key belongs to (`1` is withdrawn 1.2.0-alpha, `2` is open
+1.3.1-alpha). The proof does
 not say which release made it: `PostRootProved` finds the entry for the proof's programVK and takes the release
-from that entry's `scheme`, so the poster cannot pick the key that checks the proof. Veritas holds a table with
-one row per release: its wrapper key, its status (open, closing or withdrawn) and the `rootCVadcopFinal` its
-proofs carry. A proof whose recursion root is not the row's pinned value is refused (`RootCNotOfVersion`) before
+from that entry's `scheme`, so the poster cannot pick the key that checks the proof. Settlement links
+Veritas, which holds one row per release: its status (open, closing or withdrawn), pinned
+`rootCVadcopFinal` recursion root and PLONK verifying key. The withdrawn release has no key in the
+production build. A proof whose
+recursion root is not the row's pinned value is refused (`RootCNotOfVersion`) before
 the layout checks and the pairing, and an entry under a withdrawn release is refused (`ZiskVersionWithdrawn`).
 Registry writes follow the same table: a withdrawn or closing release takes no new entry, and one programVK may
 not be live under two releases. The release list in `rome-zk-layouts` and the one in Veritas are checked against
 each other by a test.
+
+The prover reads the active entry for its vkey from the chain and checks that
+the entry's release matches its vkey of record. It verifies the proof with that release's key before
+posting it.
 
 **Retirement and duplicate keys.** Once a vkey's stored `activation_slot`
 is the tombstone, `SetRegistryEntry` refuses to write any OTHER activation slot against that same vkey
@@ -406,6 +445,11 @@ for a matching vkey in the exact order `registry::find` does (first match wins),
 duplicated vkey lets a "retire" call land on one copy while `find` keeps serving the other — silently
 undoing the one lever retirement is supposed to be.
 
+### ZisK releases
+
+[ZisK releases and verification keys](ZISK-RELEASES.md) lists the scheme bytes, pinned recursion
+roots, release status and the steps for moving a chain to another release.
+
 ## Threat model
 
 The design and the on-chain programs close some attack classes completely (unconstructable — no valid
@@ -419,8 +463,12 @@ Say which is which:
 | **Batch-id reuse.** If an abandoned batch id could be reopened, a party could seal chunks under a batch id whose earlier chunks belonged to a different, already-abandoned batch — mixing unrelated data availability into one commitment. | **Unconstructable.** | Batch ids are minted from a per-chain, program-owned sequential cursor (`InitBatchCursor` / the `batch_cursor` account). `OpenBatch` requires the caller's id to equal the cursor's current value and advances it atomically — an id, once issued, is never issued again, whether or not its batch was ever finalized. |
 | **Sealing bytes that do not match the declared body hash.** | **Rejected.** | `Seal { len, body_hash }` recomputes `keccak256(body[..len])` from the account and requires it to equal `body_hash`. This checks the declared bytes and length; it does not establish that those bytes are valid EVM transactions. |
 | **Sealed-chunk length change (an authority re-`Seal`s a shorter `len` after `SealLeaf` already committed a leaf hash over the longer body).** Solana DA would then no longer reproduce that committed leaf — undetectable at the settlement program's `PostRoot`, since it only reads the accumulator's final `acc`. | **Unconstructable.** | `Seal` reads the chunk's `sealed` flag before touching the account: if already sealed and the new `len` differs from the stored one, it is rejected (`ChunkError::AlreadySealed`) before the hash check ever runs. A re-`Seal` with the *same* `len` (a poster resubmitting after a dropped confirmation) falls through to the ordinary hash check and stays an idempotent `Ok`. `Write` on an already-sealed chunk is rejected outright, so bytes cannot change underneath a stored hash either. |
-| **Out-of-order finalize (a third party finalizes a later batch id while an earlier one from the real poster sits open).** With a bounded posting window (more than one batch open at once), a third party finalizing N+1 ahead of N would strand N: N's blocks would sit before blocks already finalized, so neither finishing N nor abandoning it could keep the log in order (and abandoning an id settlement still needs halts the chain for good). | **Unconstructable.** | `FinalizeBatch` requires the batch's own stored `authority` to sign — the same check shape `CloseBatch`/`AbandonBatch` already use. `SealLeaf` stays permissionless (deterministic given the chunk bytes already on chain), so a third party can still seal every leaf, but cannot finalize. The batcher's `FinalizedAboveOpenBatch` refusal stays as defense-in-depth for a chain still running an older program version. |
+| **Out-of-order finalize (a third party finalizes a later batch id while an earlier one from the real poster sits open).** With a bounded posting window (more than one batch open at once), a third party finalizing N+1 ahead of N would strand N: N's blocks would sit before blocks already finalized, so neither finishing N nor abandoning it could keep the log in order (and abandoning an id settlement still needs halts the chain for good). | **Unconstructable.** | `FinalizeBatchV2` requires the batch's own stored `authority` to sign — the same check shape `CloseBatch`/`AbandonBatch` already use. `SealLeaf` stays permissionless (deterministic given the chunk bytes already on chain), so a third party can still seal every leaf, but cannot finalize. The batcher's `FinalizedAboveOpenBatch` refusal stays as defense-in-depth for a chain still running an older program version. |
 | **Fee bypass on the variable (gas-proportional) protocol fee.** A poster could under-report the batch's gas usage to pay less than the fee schedule intends. | **Unconstructable on the proved path; the unproved path has no gas figure to check, so it charges the fixed fee only.** | `PostRootProved` checks the poster's declared `gas_in_batch` against the proof-bound gas value (the batch public values in layout 1, or the header in layout 2) before charging the variable fee component — a mismatch is rejected before any fee is charged. `PostRoot` (the unproved path) has nothing to check that claim against, so it never charges the variable component at all; only the base per-batch fee applies there. |
+| **Using a proof under the wrong ZisK release or recursion root.** | **Rejected before the pairing.** | `PostRootProved` finds the active registry entry by programVK, takes its scheme byte as the release and refuses a withdrawn release. It compares the proof's recursion root with the root pinned in that release's Veritas row before checking the layout or pairing. A programVK active under two releases is refused. |
+| **A deposit before a permissionless chain can settle a proved root.** | **Rejected.** | `InitDepositQueue` requires a non-reserved chain with a posted batch and the canonical settlement, inbox and vault accounts. Permissionless chains can post only through `PostRootProved`, so the queue cannot exist before the first proved post. `Deposit` requires that queue and the posted root. |
+| **Leaving a waiting deposit out of a finalized batch after its deadline.** | **Bound for batches that finalize; posting liveness still depends on the operator.** | `FinalizeBatchV2` starts at the cursor's next deposit and checks the range against the queue count and per-batch cap. If the range stops short and takes fewer than `max_per_block`, the next deposit must be younger than the active deadline. Age is measured at the later of batch opening and finalization minus 24 hours. An old open batch cannot extend the deadline beyond that grace, but the program cannot make an operator finalize another batch. |
+| **Closing a deposit record before its L2 credit is final, or sending its rent elsewhere.** | **Rejected.** | `CloseDeposit` requires the inbox cursor to have passed the record and its final deposit index to have passed it after `CloseBatch` sees a final root. It sends rent to the sender stored in the record, regardless of who calls. |
 | **Governance capture (an attacker seizes the registry authority, or a single fumbled call locks it out permanently).** | **Bootstrap step unconstructable; ongoing rotation is two-step and reversible mid-flight.** | The one governance instruction with no existing authority to check against — initializing the global configuration — authenticates against the deploying program's own upgrade authority (read from its `ProgramData` account), not an arbitrary argument. Authority rotation afterward is a propose/accept pair: the current authority names a successor, and only that named key can accept — a typo or a wrong address in the proposal cannot lock the current authority out, since nothing changes until the correct key actively accepts. |
 | **A permissionless chain choosing its own verifier key or treating an unproved root as final.** | **Rejected on chain; Rome's guest and genesis checks remain an operating procedure.** | For `chain_id >= 2^32`, `InitChainV2` rejects non-empty `registry_entries` with `RegistryEntriesNotAllowed` (82) before creating accounts, locking the deposit or advancing the nonce. Rome adds the key later with `SetRegistryEntry`. `PostRoot` rejects these chains with `UnprovedRootNotAllowed` (83) before any read, write or fee transfer. Their owner-supplied genesis is also unavailable to `RootView` and `ProveExit`: `final_root_tuple` returns `NotFinal` while `head_final_batch == 0`. On every chain, `PostRootProved` binds the proof's `parent_hash` to `root.block_hash` when `head_pending_batch == 0`, otherwise to the predecessor pending account's `last_block_hash`; a mismatch returns `PredecessorHashMismatch` (84) before the pairing or writes. Before registering a key, Rome must rebuild the chain's guest from source, compare the verifying key, and check the registered genesis number, block hash and state root against the genesis compiled into the guest. `SetRegistryEntry` does not perform these checks; `rome-zk-ops vkey register` does, and Rome registers a key through it only. It reads the chain's root and refuses `ChainIdMismatch` if the genesis's chain id or the given one is not the registered chain's, rebuilds the guest from the operator's `genesis.json` in the pinned guest-build image and refuses `GenesisMismatch` (the genesis is not the one the chain committed to: block 0's hash and state root in the root while it has not moved), `ElfMismatch` (the ELF's sha256 differs), `VkeyMismatch` (the recomputed programVK differs), the vault checks (a genesis balance must be held in the chain's vault as wrapped SOL: `VaultMissing`, `VaultNotWrappedSol`, `VaultUnderfunded`), `GenesisUnanchored` (once the root has moved, the genesis rebuilt at a guest tag that already has a registered key must reproduce that key) and `VkeyAlreadyActive` or `VkeyPending` (a key already registered is not sent again, because that moves its activation slot), and only then builds `SetRegistryEntry`: a dry run by default that prints the instruction and its activation slot, a V1 transaction with `--confirm`. `vkey show` prints the registry entries and when each activates, and `./rollup check` reads the same lines. The reclaim window starts at registration, so Rome's turnaround must fit inside `reclaim_window_slots` and leave time for the first proved post. That post already meets the refund trigger `head_final_batch >= 1`; `posted_batches >= 10` remains defense in depth. Reserved chains still allow initial registry entries with Rome's co-signature and keep their final genesis and unproved posting path. |
 | **Proving under a stale or absent drift bound (layout 1).** A proof's committed `max_drift_secs` could disagree with the chain's actual configured bound, or a chain could have no bound on record at all (still on `chain_config` v1), letting a future-dated batch through un-checked on the settlement side even though derivation would halt on it. | **Unconstructable.** | `PostRootProved`'s layout-1 binding reads `chain_config` fresh on every call and requires `Some(pv.max_drift_secs) == chain_config.max_drift_secs` exactly — a v1 chain_config (`None`) is refused (`DriftBoundUnset`) rather than treated as "no bound" or defaulted to any value; a chain must `MigrateChainV2` (or `InitChainV2` fresh) onto v2 before layout 1 can ever post for it. |
@@ -450,7 +498,8 @@ any starting value, but settlement cannot accept a first batch of 0. On a chain 
 the cursor at `head_pending_batch + 1`, never above it: settlement posts only that id next, so a higher
 cursor halts the chain. `InitBatchCursor` creates the cursor as a 69-byte version-2 account that also holds the
 deposit cursor (`deposit_next`, `deposit_hash`, `deposit_final`), and `CloseBatch` raises `deposit_final` to the
-closed batch's deposit range end when that batch is final. Deposits are built but not deployed on devnet yet.
+closed batch's deposit range end when that batch is final. Deposits are live on devnet for permissionless
+chains after their first proved post and deposit-queue setup.
 
 ## Data formats
 
@@ -467,7 +516,7 @@ sides of every format (on-chain program and off-chain client) can never quietly 
 
 | primitive | owner | consumed by |
 |---|---|---|
-| Account layouts (root, registry, pending, batch, chunk header, batch cursor, chain/global config, nonce, allow marker, exit accounts) | [`rome-zk-layouts`](../crates/rome-zk-layouts) | the inbox, settlement and bridge programs, their clients, the batcher, the derivation node, the prover and its input generator, the exit prover, the settlement watcher and `rome-zk-ops` |
+| Account layouts (root, registry, pending, batch, chunk header, batch cursor, deposit queue and records, chain/global config, nonce, allow marker, exit accounts) | [`rome-zk-layouts`](../crates/rome-zk-layouts) | the inbox, settlement and bridge programs, their clients, the batcher, the derivation node, the prover and its input generator, the exit prover, the settlement watcher and `rome-zk-ops` |
 | PDA seeds and derivation | [`rome-zk-layouts`](../crates/rome-zk-layouts) | the inbox, settlement and bridge programs, their clients, tooling |
 | Ethereum Merkle-Patricia proof verification (bounded RLP, account/storage proofs, exit-proof wire shape) | [`rome-zk-mpt`](../crates/rome-zk-mpt) | `programs/zk-settlement`'s `ProveExit`, [`rome-zk-exit-prover`](../crates/rome-zk-exit-prover) |
 | `exit_consumer` PDA derivation (`["exit_consumer", chain_id]` under the caller-supplied bridge program — the one seed both `ConsumeExit` and `zk-bridge`'s own `ReleaseExit` CPI agree on) | [`rome-zk-layouts`](../crates/rome-zk-layouts) (`exit` module) | `programs/zk-settlement`'s `ConsumeExit`, `zk-settlement-client`, `programs/zk-bridge`'s `ReleaseExit` |

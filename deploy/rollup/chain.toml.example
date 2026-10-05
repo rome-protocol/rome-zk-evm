@@ -33,7 +33,7 @@ sub_block_ms = 50
 sub_blocks_per_block = 20
 sub_block_gas_limit = 2_000_000
 blocks_per_batch = 60
-# 0 means the sequencer seals blocks only when there are transactions.
+# 0 means the sequencer seals blocks only when there are transactions. A chain with no balances needs this above 0 (for example 60) until its first proved root.
 empty_block_interval_secs = 0
 
 [batcher]
